@@ -1,0 +1,13 @@
+[package]
+name = "index-text"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The embedded retrieval engine: analyzer, typo-tolerant term dictionary, BM25F, MaxScore top-k, RRF."
+
+[dependencies]
+# Audited in docs/research/build-or-buy.md. tantivy-fst 4.2M recent downloads,
+# levenshtein_automata 4.4M — the exact stack Meilisearch and Tantivy ship.
+tantivy-fst = "0.5"
+levenshtein_automata = "0.2"

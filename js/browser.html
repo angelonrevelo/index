@@ -1,0 +1,127 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>index — in a real browser</title>
+<style>
+  body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 2rem; max-width: 60rem; }
+  h1 { font-size: 1.1rem; }
+  .pass { color: #0a7f2e; } .fail { color: #b00020; font-weight: 700; }
+  table { border-collapse: collapse; margin: 1rem 0; }
+  td, th { padding: .2rem .8rem .2rem 0; text-align: left; vertical-align: top; }
+  #verdict { font-weight: 700; margin-top: 1rem; }
+</style>
+
+<h1>index — the search engine, running in this browser</h1>
+<p>
+  The same <code>.wasm</code> Node runs, the same index file, no wasm-bindgen. If this page shows
+  PASS, the engine works on the tier profstopick actually ships to — a browser, offline after first
+  load, with no server in the query path.
+</p>
+<div id="meta"></div>
+<div id="out"></div>
+<div id="verdict"></div>
+
+<script type="module">
+  // Deliberately NOT importing js/index.mjs: this page exercises the raw ABI the way a browser
+  // host would, so a failure here cannot be hidden by the Node wrapper.
+  const ABI_VERSION = 2;
+  const HIT_BYTE = 12;
+  const u32 = (n) => n >>> 0;
+
+  const out = document.getElementById('out');
+  let failed = 0;
+  const check = (ok, msg) => {
+    failed += ok ? 0 : 1;
+    const row = document.createElement('div');
+    row.innerHTML = `<span class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</span> ${msg}`;
+    out.append(row);
+  };
+
+  try {
+    // Streaming instantiation is the browser-native path and the one an app would use.
+    const t0 = performance.now();
+    const { instance } = await WebAssembly.instantiateStreaming(fetch('./index_wasm.wasm'), {});
+    const e = instance.exports;
+    const compileMs = performance.now() - t0;
+
+    check(e.idx_abi_version() === ABI_VERSION, `ABI version is ${ABI_VERSION}`);
+
+    const idxBytes = new Uint8Array(await (await fetch('./profstopick.idx')).arrayBuffer());
+    const label = await (await fetch('./profstopick.label.json')).json();
+
+    const t1 = performance.now();
+    const ptr = u32(e.idx_alloc(idxBytes.length));
+    new Uint8Array(e.memory.buffer, ptr, idxBytes.length).set(idxBytes);
+    const handle = u32(e.idx_open(ptr, idxBytes.length));
+    e.idx_free(ptr, idxBytes.length);
+    const openMs = performance.now() - t1;
+    check(handle !== 0, 'a real index opens from a fetched ArrayBuffer');
+
+    const docCount = u32(e.idx_doc_count(handle));
+    document.getElementById('meta').innerHTML = `
+      <table>
+        <tr><th>wasm module</th><td>${(await (await fetch('./index_wasm.wasm')).arrayBuffer()).byteLength.toLocaleString()} bytes</td></tr>
+        <tr><th>index file</th><td>${idxBytes.length.toLocaleString()} bytes</td></tr>
+        <tr><th>documents</th><td>${docCount.toLocaleString()}</td></tr>
+        <tr><th>compile+instantiate</th><td>${compileMs.toFixed(1)} ms</td></tr>
+        <tr><th>open + parse</th><td>${openMs.toFixed(1)} ms</td></tr>
+      </table>`;
+
+    const enc = new TextEncoder();
+    const search = (q, k = 5, prefix = 0) => {
+      const b = enc.encode(q);
+      const p = u32(e.idx_alloc(b.length));
+      new Uint8Array(e.memory.buffer, p, b.length).set(b);
+      const n = u32(e.idx_search(handle, p, b.length, k, prefix));
+      e.idx_free(p, b.length);
+      if (n === 0xffffffff || n === 0) return [];
+      const rp = u32(e.idx_result_ptr(handle));
+      const view = new DataView(e.memory.buffer, rp, n * HIT_BYTE);
+      const hit = [];
+      for (let i = 0; i < n; i++) {
+        const doc = view.getUint32(i * HIT_BYTE, true);
+        hit.push({ doc, label: label[doc], bucket: view.getUint32(i * HIT_BYTE + 8, true) });
+      }
+      return hit;
+    };
+
+    const target = label[0];
+    const swap = (s) => {
+      const c = [...s];
+      if (c.length > 4) [c[2], c[3]] = [c[3], c[2]];
+      return c.join('');
+    };
+    const cases = [
+      ['exact name', target],
+      ['surname only', target.split(',')[0]],
+      ['one deletion', target.slice(0, 3) + target.slice(4)],
+      ['transposition', swap(target)],
+    ];
+    for (const [name, q] of cases) {
+      const t = performance.now();
+      const top = search(q, 3)[0];
+      const ms = performance.now() - t;
+      check(
+        top?.label === target,
+        `${name} <code>${q}</code> &rarr; <b>${top?.label ?? 'NO RESULTS'}</b> (bucket ${top?.bucket ?? '-'}, ${ms.toFixed(2)} ms)`,
+      );
+    }
+    check(search(target.slice(0, 5), 5, 1).some((h) => h.label === target), 'typeahead from a 5-char prefix');
+    check(search('qzxwv unmatched nonsense', 5).length === 0, 'a nonsense query returns nothing');
+
+    // Throughput from the main thread, which is where a search box actually runs.
+    const sample = label.slice(0, 300);
+    const t2 = performance.now();
+    for (const q of sample) search(q, 10);
+    const per = ((performance.now() - t2) / sample.length) * 1000;
+    check(per < 5000, `${sample.length} real name queries: ${per.toFixed(0)} µs each, on the main thread`);
+
+    e.idx_close(handle);
+  } catch (err) {
+    check(false, `threw: ${err && err.message ? err.message : err}`);
+  }
+
+  const v = document.getElementById('verdict');
+  v.textContent = failed === 0 ? 'OVERALL: PASS' : `OVERALL: FAIL (${failed})`;
+  v.className = failed === 0 ? 'pass' : 'fail';
+  document.title = failed === 0 ? 'PASS — index in browser' : 'FAIL — index in browser';
+</script>

@@ -1,0 +1,139 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>index-geo — point-in-polygon in a real browser</title>
+<style>
+  body { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 2rem; }
+  table { border-collapse: collapse; margin-top: .5rem; }
+  th, td { padding: .2rem .8rem .2rem 0; text-align: left; }
+  td.n, th.n { text-align: right; }
+  .ok { color: #0a7d32; } .bad { color: #b00020; }
+</style>
+<h1>index-geo in a real browser</h1>
+<p>
+  Loads the WASM module over HTTP with <code>instantiateStreaming</code>, builds the index from
+  maphy's real polygons, and locates every real POI — on the main thread, the way a page would.
+</p>
+<pre id="log">running…</pre>
+<div id="out"></div>
+
+<script type="module">
+import { GeoIndex, scanLocate, NONE } from './geo.mjs';
+
+const log = document.getElementById('log');
+const say = (s) => { log.textContent += '\n' + s; };
+
+// The verdict object the harness reads back out of the page.
+const verdict = { ok: false, error: null, row: [], ua: navigator.userAgent };
+window.__geo = verdict;
+
+try {
+  log.textContent = 'fetching…';
+
+  const [wasm, poiText, polyText] = await Promise.all([
+    fetch('./index_geo_wasm.wasm').then((r) => {
+      if (!r.ok) throw new Error(`wasm ${r.status}`);
+      // Assert the MIME type explicitly: instantiateStreaming REQUIRES
+      // application/wasm and fails confusingly when a server sends octet-stream.
+      const ct = r.headers.get('content-type') || '';
+      if (!ct.includes('application/wasm')) throw new Error(`bad wasm content-type: ${ct}`);
+      return r.arrayBuffer();
+    }),
+    fetch('./maphy-poi.csv').then((r) => r.text()),
+    fetch('./maphy-municipal.txt').then((r) => r.text()),
+  ]);
+
+  const xy = (() => {
+    const line = poiText.split('\n'), a = [];
+    for (let i = 1; i < line.length; i++) {
+      const c = line[i].split(',');
+      if (c.length < 2) continue;
+      const x = Number(c[0]), y = Number(c[1]);
+      if (Number.isFinite(x) && Number.isFinite(y)) a.push(x, y);
+    }
+    return Float64Array.from(a);
+  })();
+
+  const polygon = (() => {
+    const out = [];
+    for (const line of polyText.split('\n')) {
+      if (line.startsWith('P\t')) { out.push([]); continue; }
+      if (!line.startsWith('R\t')) continue;
+      const part = line.split('\t');
+      const outer = part[1] === '0';
+      const num = part[2].split(' ');
+      const pt = new Float64Array(num.length);
+      for (let i = 0; i < num.length; i++) pt[i] = Number(num[i]);
+      if (pt.length < 8) continue;
+      out[out.length - 1].push({ pt, outer });
+    }
+    return out.filter((p) => p.length);
+  })();
+
+  const bbox = polygon.map((p) => {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const r of p) {
+      const ring = r.pt;
+      for (let i = 0; i < ring.length; i += 2) {
+        if (ring[i] < x0) x0 = ring[i];
+        if (ring[i] > x1) x1 = ring[i];
+        if (ring[i + 1] < y0) y0 = ring[i + 1];
+        if (ring[i + 1] > y1) y1 = ring[i + 1];
+      }
+    }
+    return [x0, y0, x1, y1];
+  });
+
+  const n = xy.length >>> 1;
+  say(`${polygon.length} polygons x ${n} POIs`);
+
+  const median = (a) => { const s = [...a].sort((p, q) => p - q); return s[s.length >> 1]; };
+  const time = (fn, runs = 5) => {
+    fn();
+    const t = [];
+    for (let i = 0; i < runs; i++) { const t0 = performance.now(); fn(); t.push(performance.now() - t0); }
+    return median(t);
+  };
+
+  let truth;
+  const scanMs = time(() => {
+    truth = new Uint32Array(n);
+    for (let i = 0; i < n; i++) truth[i] = scanLocate(polygon, bbox, xy[2 * i], xy[2 * i + 1]);
+  });
+  verdict.row.push({ arm: 'JS scan (bbox + crossing)', ms: scanMs, rate: n / (scanMs / 1000), ratio: 1 });
+  say(`JS scan ${scanMs.toFixed(1)}ms`);
+
+  for (const order of [7, 8]) {
+    const idx = await GeoIndex.build(wasm, polygon, { order });
+    let out;
+    const qMs = time(() => { out = idx.locateMany(xy); });
+    let bad = 0;
+    for (let i = 0; i < n; i++) if (out[i] !== truth[i]) bad++;
+    if (bad) throw new Error(`WASM L=${order} disagrees with the scan on ${bad} of ${n}`);
+    verdict.row.push({
+      arm: `WASM cell index, L=${order}`, ms: qMs, rate: n / (qMs / 1000),
+      ratio: scanMs / qMs, cells: idx.cellCount,
+    });
+    say(`WASM L=${order} ${qMs.toFixed(1)}ms  (agrees on all ${n})`);
+    idx.close();
+  }
+
+  verdict.ok = true;
+  say('OK — every arm agreed on every point.');
+} catch (err) {
+  verdict.error = String(err && err.stack ? err.stack : err);
+  say('FAILED: ' + verdict.error);
+}
+
+const t = document.createElement('table');
+t.innerHTML = '<tr><th>arm</th><th class="n">query</th><th class="n">points/s</th>'
+  + '<th class="n">vs JS scan</th></tr>'
+  + verdict.row.map((r) => `<tr><td>${r.arm}</td><td class="n">${r.ms.toFixed(2)} ms</td>`
+    + `<td class="n">${(r.rate / 1e6).toFixed(2)} M</td>`
+    + `<td class="n">${r.ratio.toFixed(1)}x</td></tr>`).join('');
+document.getElementById('out').appendChild(t);
+const v = document.createElement('p');
+v.className = verdict.ok ? 'ok' : 'bad';
+v.textContent = verdict.ok ? 'VERDICT: ok' : 'VERDICT: failed';
+document.getElementById('out').appendChild(v);
+document.title = verdict.ok ? 'geo ok' : 'geo failed';
+</script>

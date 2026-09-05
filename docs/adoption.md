@@ -1,0 +1,140 @@
+# Adoption — what shipping this would actually take, per app
+
+> The measurements are in [`integration.md`](integration.md). This file is the other half: for each
+> app, exactly what a pull request would contain, what gate it must clear, what it buys, what it
+> costs, and how to undo it.
+>
+> **No PR has been opened.** Four shipping repositories are not mine to change unilaterally. This
+> exists so that "which app?" is the only remaining question, and the answer to it is one command
+> rather than a week.
+
+## The state to build from
+
+| Repo | Branch | Worktree | What is on it |
+|---|---|---|---|
+| profstopick | `index-engine-eval` | `../profstopick-index-eval` | `src/lib/search-match-index.mjs` (adapter), `test/search-name-order-index.test.mjs` (their test, one import line changed) |
+| onegrid | `index-accel-eval` | `../onegrid-index-eval` | `packages/wasm/src/__tests__/differential.real-module.test.ts` (their property test, one line changed) |
+| presyo | `index-engine-eval` | `../presyo-index-eval` | `scripts/compare_index_engine.{sh,ts}` (comparison harness only — no app code touched) |
+
+**Nothing on any `main` branch was modified, and no existing file in any app was edited.** Every
+branch adds files only.
+
+---
+
+## profstopick — the strongest case, and the smallest change
+
+**Why.** Its own production measurement, 2026-08-17: **158 hits against 109 misses, a 40.8 % miss
+rate**, 60 of them name-shaped queries whose professor was already in the corpus. That is not a
+tuning gap; `flatten()` concatenates a label to `rigoradrian`, so a first-name-first query can never
+match a surname-first index, in any order. The engine passes their nine-assertion contract test
+**9/9**, including all three production failures and all six survival checks, and their full suite
+runs **1,922/1,958** with the same four failures their untouched `main` has.
+
+**The PR would contain**
+1. `src/lib/search-match-index.mjs` — the adapter (already written).
+2. A build step emitting `public/search-<school>-<hash>.idx` beside the existing JSON shard, from
+   `script/build-search-index.ts`.
+3. `use-search-index.ts` fetching the `.idx` instead of the JSON, behind an env flag.
+4. `test/search-name-order-index.test.mjs` kept as a permanent second harness.
+
+**Gate.** `npm test` at 1,922/1,958 or better, and their three search tests green.
+
+**Buys.** Typo tolerance where there is none today, and a smaller browser payload — a 380 KB index
+against a 2.5 MB JSON shard that occupies **95.6 % of the 5 MB localStorage quota**.
+
+**Costs.** A WASM artifact in the bundle (244 KB, gzips smaller). The index becomes opaque — no
+longer inspectable in devtools as JSON.
+
+**Rollback.** The env flag. The JSON shard keeps being emitted until the flag is removed.
+
+**Honest caveat.** Their `search-index-hash.test.mjs` and `search-index-cache.test.mjs` pin the
+current shard's shape and would need updating — that is real work this branch has not done.
+
+---
+
+## onegrid — the socket already exists
+
+**Why.** onegrid ratified the ABI, wrote the reference backend, wrote the differential harness, and
+budgeted the artifact. It shipped no module; `packages/wasm/crate/` does not exist and every test
+runs against `createFakeAccelModule()`. `index-accel` is that module — 6,342 bytes of `no_std` WASM
+— and their whole `packages/wasm` suite passes **294/294** against it.
+
+**The PR would contain**
+1. The `index-accel` crate vendored into `packages/wasm/crate/` (it is dependency-free and self-
+   contained), or consumed as a prebuilt `.wasm`.
+2. A build step producing `packages/wasm/accel.wasm`.
+3. `differential.real-module.test.ts` alongside the existing fake-module test.
+
+**Gate.** `packages/wasm` at 294/294, plus `bundle-budget.json` — the artifact must fit the budget
+they already wrote.
+
+**Buys.** The acceleration path they designed for, on the two hot spots they measured: the
+`contains`/`startsWith` scan in `data/src/filter.ts:125-140`, and `enumerateDistinct` at ~500 ms for
+10 M rows.
+
+**Costs.** A Rust toolchain in their build, or a checked-in binary.
+
+**Rollback.** `detect.ts` already probes capability and falls back to the JS backend. Ship it
+disabled and flip it.
+
+**Honest caveat.** The kernels are proven *correct* by their harness. They are **not yet proven
+faster** — `bench.test.ts` exists but no head-to-head JS-vs-WASM timing at 1 M rows has been run.
+**Do not merge this on a speed claim that has not been measured.**
+
+---
+
+## presyo — the largest opportunity, and the one that needs a decision first
+
+**Why.** At 260,000 rows the engine matched their shipped SQL on recall (100 %) and beat it on hit@1
+(100 % vs 99.4 % clean; 99.0 % vs 97.6 % on typos), at sub-millisecond query latency against ~55 ms.
+
+**The decision that comes first.** presyo's architecture question is not "is the engine good" but
+**where the index lives**:
+
+- **In the API process** — build at boot from Postgres, rebuild on a schedule. Simplest, no new
+  infrastructure, and matches the "no second datastore" thesis. Costs process memory (~160 MB at
+  1 M docs) and a rebuild window.
+- **As an artifact** — build in cron, write a `.idx`, API mmaps it. Cheap queries, bounded staleness,
+  one more file to ship.
+- **In Postgres via pgrx** — closest to their current shape, and **not portable**: RDS no, Supabase
+  no, Neon deprecated. Viable only because presyo self-hosts.
+
+**Blocking issue.** The engine has **no incremental update**: adding a document means a rebuild.
+presyo's daily scrape processes 2.08 M raw observations. A boot-time rebuild is ~15 s at 1 M
+documents — acceptable for a nightly cycle, not for continuous ingest. **This is the real gate on
+presyo adoption, and it is unbuilt.**
+
+**Honest caveat.** The 260 K comparison is 1,940 real rows plus recombined distractors. It does not
+populate their `search_text` column or their ~296 K aliases, and their input contract
+(`productSearchToken('Coca-Cola 1.5L') === ['coca','cola','1.5l']`) is deliberately unsatisfied —
+the analyzer produces `1500ml`, which is worth **+4.6 pp recall** by presyo's own measurement.
+
+---
+
+## sisia-app — the smallest, most contained change
+
+**Why.** Out-of-order title words: **91.2 % vs 0.0 %**. Their catalog `LIKE` matches one contiguous
+substring, so a two-word query in the wrong order matches nothing across 2,038 real course titles.
+
+**The PR would contain** an adapter behind `Course.ts`'s existing query functions, built from the
+same SQLite rows at boot.
+
+**Gate.** Their existing course/instructor tests, plus the `sisia-catalog` bench.
+
+**Explicitly NOT proposed.** Replacing the hybrid `driveHybridSearch` path. That is `ts_rank_cd` +
+pgvector + RRF k=60 + a Vertex reranker, and none of it has been measured here — it needs a
+database, a corpus and an API key this machine does not have. **Do not let a catalog-search win
+imply a hybrid-retrieval win.**
+
+---
+
+## What no PR can settle
+
+- **Billion-query scale.** The largest honest corpus available here is 61,467 real rows; everything
+  above is recombination. The 1 M p99 varies **±0.9 ms across identical runs**, so a 5 ms bar is
+  below this harness's resolution. Real scale evidence requires production traffic, and production
+  traffic requires a deployment — which is why this file exists rather than another benchmark.
+- **Whether apps stop optimizing for their data.** That is a claim about a year of operation, not a
+  test result. What can be said today is narrower and true: on four apps' own contracts, on their
+  own data, the engine matched or beat what they ship, and the two defects it did *not* beat are
+  written down.

@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/index-core",
+    "crates/index-text",
+    "crates/index-geo",
+    "crates/index-geo-wasm",
+    "crates/index-wasm",
+    "crates/index-accel",
+    "crates/index-bench",
+]
+# `index-accel` is a `no_std` wasm32-only kernel module: it has a `#[panic_handler]` and uses
+# `core::arch::wasm32`, so it cannot build for the host. Workspace commands skip it by default;
+# CI builds it explicitly with `--target wasm32-unknown-unknown`.
+default-members = [
+    "crates/index-core",
+    "crates/index-text",
+    "crates/index-geo",
+    "crates/index-wasm",
+    "crates/index-bench",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.74"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

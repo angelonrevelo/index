@@ -1,0 +1,9 @@
+[package]
+name = "index-core"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Learned + adaptive ordered-index core (PLA with bounded-error last-mile search)."
+
+[dependencies]

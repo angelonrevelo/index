@@ -1,0 +1,93 @@
+[package]
+name = "index-bench"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Benchmark harness: PLA learned index vs BTreeMap on bytes/key + p50/p99 lookup."
+
+[[bin]]
+name = "beat-btreemap"
+path = "src/beat_btreemap.rs"
+
+[[bin]]
+name = "crack-converge"
+path = "src/crack_converge.rs"
+
+[[bin]]
+name = "fuzzy-decision"
+path = "src/fuzzy_decision.rs"
+
+[[bin]]
+name = "fuzzy-term"
+path = "src/fuzzy_term.rs"
+
+[[bin]]
+name = "real-corpus"
+path = "src/real_corpus.rs"
+
+[[bin]]
+name = "scale"
+path = "src/scale.rs"
+
+[[bin]]
+name = "emit-artifact"
+path = "src/emit_artifact.rs"
+
+[[bin]]
+name = "sisia-catalog"
+path = "src/sisia_catalog.rs"
+
+[[bin]]
+name = "sfc-2d"
+path = "src/sfc_2d.rs"
+
+[[bin]]
+name = "geo-join"
+path = "src/geo_join.rs"
+
+[[bin]]
+name = "maphy-place"
+path = "src/maphy_place.rs"
+
+[[bin]]
+name = "presyo-prior"
+path = "src/presyo_prior.rs"
+
+[[bin]]
+name = "presyo-broad"
+path = "src/presyo_broad.rs"
+
+[[bin]]
+name = "presyo-catalog"
+path = "src/presyo_catalog.rs"
+
+[[bin]]
+name = "biasd-entity"
+path = "src/biasd_entity.rs"
+
+[[bin]]
+name = "presyo-expand"
+path = "src/presyo_expand.rs"
+
+[[bin]]
+name = "blead-industry"
+path = "src/blead_industry.rs"
+
+[[bin]]
+name = "presyo-categorize"
+path = "src/presyo_categorize.rs"
+
+[[bin]]
+name = "profstopick-dept"
+path = "src/profstopick_dept.rs"
+
+[dependencies]
+index-core = { path = "../index-core" }
+index-text = { path = "../index-text" }
+# Spike-only dependencies (bench crate only; `index-core` stays dependency-free).
+# Audited in docs/research/build-or-buy.md.
+tantivy-fst = "0.5"
+levenshtein_automata = "0.2"
+# Bench-only: reads the two production corpora exported by the consumer repos.
+serde_json = "1"

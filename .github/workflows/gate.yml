@@ -1,0 +1,64 @@
+name: gate
+
+# The gate this repo has been claiming since 2026-06-19 and did not have.
+# "Green" previously meant "green on one Windows box"; it now means green on Linux CI too.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --workspace --all-targets
+
+      - name: Doc tests
+        run: cargo test --workspace --doc
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      # The artifact that makes the engine usable outside Rust must keep building, or "works in
+      # any language" silently stops being true.
+      - name: WASM artifacts
+        run: |
+          cargo build -p index-wasm     --release --target wasm32-unknown-unknown
+          cargo build -p index-geo-wasm --release --target wasm32-unknown-unknown
+          cargo build -p index-accel    --release --target wasm32-unknown-unknown
+          ls -l target/wasm32-unknown-unknown/release/index_wasm.wasm
+          ls -l target/wasm32-unknown-unknown/release/index_geo_wasm.wasm
+          ls -l target/wasm32-unknown-unknown/release/index_accel.wasm
+
+      - name: WASM loads and answers a query in Node
+        run: node js/smoke.mjs
+
+      # This one is a correctness gate, not a performance gate. `geo-bench` asserts that the WASM
+      # index and a pure-JS scan return the IDENTICAL polygon for every one of 53,715 real points,
+      # and throws otherwise. The timings it prints are informational here — CI runners are far too
+      # noisy to gate on — but the agreement is not negotiable, and it is what caught every bug in
+      # `bench/roadmap/p10-geo-join.md`.
+      - name: Geo WASM agrees with a scan on every point
+        run: |
+          node js/geo-bench.mjs
+          INDEX_BENCH_PROVINCE=bench/fixture/maphy-province.txt node js/geo-bench.mjs
+
+      # The benchmarks under bench/roadmap/ are DELIBERATELY excluded: they are specs for
+      # not-yet-finished work and are expected red. A roadmap's red tests are a feature; a
+      # roadmap's red gate is a bug. The two that need sibling checkouts (`real-corpus`, `scale`)
+      # cannot run here at all and must not be faked — see bench/README.md.
+      - name: Benchmarks build (not run)
+        run: cargo build --workspace --release --all-targets
