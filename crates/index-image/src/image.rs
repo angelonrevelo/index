@@ -1,17 +1,31 @@
 //! The fusion layer: one index, one scoring pass, one top-k, over text **and** pixels.
 //!
-//! # The claim this module exists to make
+//! # The claim this module was built on, and its retraction
 //!
-//! [`docs/research/image.md`](../../../docs/research/image.md) §3 states it as narrowly as it can
-//! be stated while remaining false of every shipping system:
+//! This module was written to serve a claim that **has since been refuted**, and the correction is
+//! recorded here rather than quietly edited out. The claim was:
 //!
-//! > **No system answers text, facet, numeric-range, vector and perceptual-hash predicates in one
-//! > query plan over one index, selecting top-k once.**
+//! > ~~No system answers text, facet, numeric-range, vector and perceptual-hash predicates in one
+//! > query plan over one index, selecting top-k once.~~
 //!
-//! Immich and LibrePhotos separate pgvector/FAISS from the relational row from a separately
-//! scheduled face-clustering job, and intersect the three in application code. PhotoPrism combines
-//! them in its *query syntax* and fans out underneath — a real partial counterexample, recorded as
-//! one rather than erased.
+//! It was formed by comparing only against self-hosted *photo applications* — Immich, PhotoPrism,
+//! LibrePhotos — which is the wrong comparison class. Tested against actual search engines
+//! (`docs/research/image.md` §3): **Vespa** combines text, filters, ranges and `nearestNeighbor` in
+//! one `rank-profile` with a single top-k, and **Lucene 9+** composes `KnnFloatVectorQuery` into a
+//! `BooleanQuery` under one `IndexSearcher.search(query, k)`. Hamming distance over binary codes is
+//! first-class in Vespa, Elasticsearch and LanceDB, so the perceptual-hash leg is unremarkable too.
+//!
+//! **What survives is narrower and is not about query modelling at all:** Vespa and Elasticsearch
+//! are servers and Lucene is a JVM library, while this runs the same index in a browser through a
+//! hand-written C ABI, dependency-free, under MIT OR Apache-2.0. That is a packaging property.
+//!
+//! # Why this module is still the right design
+//!
+//! The refutation kills the *novelty* claim, not the engineering. Fan-out remains a real defect in
+//! the systems that do it — Weaviate's own documentation calls hybrid *"two searches under-the-hood"*
+//! and over-fetches to 100 before trimming; LanceDB's scanner carries the literal error
+//! `"Cannot have both nearest and full text search"`. Selecting once is still correct here; it is
+//! just also what Vespa does.
 //!
 //! # Why fan-out returns short pages, and this does not
 //!

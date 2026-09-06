@@ -859,15 +859,31 @@ fn main() {
     let cheap_p50 = ms(&cheap, 0.5);
     let cost_ok = cheap_p50 < CHEAP_P50_MS_MAX;
     let byte_ok = byte_mean < CHEAP_BYTE_MAX;
+
+    // A TIMING budget cannot be judged from an unoptimised build, so this refuses to judge it.
+    //
+    // In a debug build the same corpus measures ~25.9 ms against ~2.05 ms in release — a red that
+    // says nothing about the code and everything about the `--release` flag someone forgot. Voting
+    // FAIL on that would train a reader to ignore a failing check, which is worse than not checking
+    // at all. The BYTE budget is unaffected: bytes stored do not depend on optimisation, so it
+    // votes in either build.
+    let optimised = !cfg!(debug_assertions);
     println!("\n  -> p57 budget: p50 < {CHEAP_P50_MS_MAX} ms — measured {cheap_p50:.3} ms: {}",
-        if cost_ok { "HOLDS" } else { "DOES NOT HOLD" });
+        if !optimised { "NOT JUDGED (debug build)" } else if cost_ok { "HOLDS" } else { "DOES NOT HOLD" });
     println!("  -> p57 budget: < {CHEAP_BYTE_MAX} B/image — measured {byte_mean:.1} B: {}",
         if byte_ok { "HOLDS" } else { "DOES NOT HOLD" });
-    check.push((format!("p57 cheap tier p50 {cheap_p50:.3} ms < {CHEAP_P50_MS_MAX} ms"), cost_ok));
-    check.push((format!("p57 cheap tier {byte_mean:.1} B/image < {CHEAP_BYTE_MAX} B"), byte_ok));
-    if !cost_ok {
-        fail += 1;
+    if optimised {
+        check.push((format!("p57 cheap tier p50 {cheap_p50:.3} ms < {CHEAP_P50_MS_MAX} ms"), cost_ok));
+        if !cost_ok {
+            fail += 1;
+        }
+    } else {
+        println!("\n  !! DEBUG BUILD. The timing budget is NOT judged and NOT passed — an");
+        println!("     unoptimised build measures roughly 10x slower, so a red here would be the");
+        println!("     missing --release flag, not the code. Re-run with --release for a verdict.");
+        withheld.push("p57 cheap-tier timing budget (debug build, not judged)".to_string());
     }
+    check.push((format!("p57 cheap tier {byte_mean:.1} B/image < {CHEAP_BYTE_MAX} B"), byte_ok));
     if !byte_ok {
         fail += 1;
     }
@@ -1565,7 +1581,7 @@ fn main() {
         let b = evaluate(&near_label);
         if b.scored < NDCG_QUERY_MIN {
             println!(
-                "      {} scorable quer(ies) — under the {NDCG_QUERY_MIN} this benchmark requires",
+                "      {} scorable query/queries — under the {NDCG_QUERY_MIN} this benchmark requires",
                 b.scored
             );
             println!(
@@ -1580,7 +1596,7 @@ fn main() {
                 println!("\n      (printed for information only — too few queries to mean anything.)");
             }
             withheld.push(format!(
-                "p59 acceptance 3 nDCG@10 verdict (non-degenerate set has {} quer(ies), under {NDCG_QUERY_MIN})",
+                "p59 acceptance 3 nDCG@10 verdict (non-degenerate set has {} query/queries, under {NDCG_QUERY_MIN})",
                 b.scored
             ));
         } else {

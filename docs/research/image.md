@@ -62,7 +62,7 @@ dates with inconsistent dedup ([#24917](https://github.com/immich-app/immich/iss
 third-party tool, [`jmathai/immich-exif`](https://github.com/jmathai/immich-exif), exists purely to
 push DB-side edits back into file EXIF. A bolt-on fix for drift is evidence the drift is real.
 
-## 3. Finding 1 — the gap is fusion, not vectors
+## 3. Finding 1 — RETRACTED: the gap is not what this section first claimed
 
 Immich and LibrePhotos architecturally separate the vector store (pgvector, FAISS) from the
 relational metadata from a separately-scheduled face-clustering job. A compound question —
@@ -74,15 +74,57 @@ really does combine person + date + location + keyword in one query
 ([docs](https://docs.photoprism.app/user-guide/search/filters/)). But that is combination at the
 *UX* layer, resolved underneath by the same fan-out.
 
-So the falsifiable claim is the narrow one:
+### RETRACTED 2026-09-06 — the claim this section originally made was wrong
 
-> **No system answers text, facet, numeric-range, vector and perceptual-hash predicates in one
-> query plan over one index, selecting top-k once.**
+This section originally asserted:
 
-That is precisely the shape `index-text` already has. It carries BM25F, MaxScore top-k, categorical
-facets, numeric ranges (`p31`), sort-by-value (`p32`) and multi-segment live update. Adding a
-quantised vector column and a hash column to *that* is a smaller job than building a photo app, and
-it is the only part of this whole space that is not already solved by someone.
+> ~~No system answers text, facet, numeric-range, vector and perceptual-hash predicates in one
+> query plan over one index, selecting top-k once.~~
+
+**That is refuted.** It was formed by comparing only against self-hosted *photo applications*, which
+is the wrong comparison class. A second, deliberately adversarial sweep against actual search
+engines and vector databases knocked it down:
+
+| System | Verdict against the original claim |
+|---|---|
+| **Vespa** | **Refutes it.** A `rank-profile` combines text, structured filters, numeric ranges and `nearestNeighbor` in one ranking expression with a single top-k selection. |
+| **Lucene 9+** | **Largely refutes it.** `KnnFloatVectorQuery` composes into a `BooleanQuery` and resolves through one `IndexSearcher.search(query, k)`. |
+| Elasticsearch / OpenSearch | Partial — RRF explicitly *merges separately-retrieved ranked lists*, which is the fan-out pattern the claim targeted. |
+| Weaviate | Fan-out. Its own docs: hybrid *"is really two searches under-the-hood"*, and it over-fetches to 100 then trims — three selection steps. |
+| Qdrant, Milvus, LanceDB | Fan-out. LanceDB's scanner literally carries `"Cannot have both nearest and full text search"`, and hybrid raises `NotImplementedError` on `to_query_object` — because it is not one query. |
+
+**The perceptual-hash leg of the claim is also dead.** Hamming distance over binary vectors is
+first-class in **Vespa** (`hamming` distance-metric), **Elasticsearch** (`element_type: bit`) and
+**LanceDB** (packed `uint8`). It is not exotic and it never was.
+
+### What actually survives
+
+Nothing about query *modelling*. Two things about packaging, and one open question:
+
+1. **Embeddability.** Vespa and Elasticsearch are servers. Lucene is a JVM library. The property
+   `index` has that none of them do is running the same index in a browser through a hand-written C
+   ABI with no server and no JVM — §1 and §2 are what make that worth having.
+2. **Licence.** MIT OR Apache-2.0 against five AGPL incumbents in §1.
+3. ~~Exact facet counts beside an active vector arm.~~ **Also dead, checked the same day.** It
+   looked like a discriminator because every *purpose-built vector engine* degrades those counts —
+   Vespa documents *"Grouping counts are not accurate when using nearestNeighbor"*, Elasticsearch
+   aggregations collapse to top-`k`, LanceDB refuses `limit`/`offset` with an aggregate. But that is
+   a property of **that product category**, not a law. The SQL standard computes aggregates before
+   `LIMIT`, and pgvector's HNSW index is consulted only for the `ORDER BY <distance> LIMIT k` branch,
+   so `hnsw.ef_search` truncation never reaches the counts: **Postgres has the property in both exact
+   and HNSW mode.** DuckDB VSS, sqlite-vec and ClickHouse follow structurally, and **Solr has it too**
+   in the rerank configuration. Recorded in
+   [`docs/roadmap-rejected.md`](../roadmap-rejected.md);
+   [`p66`](../../bench/roadmap/p66-facet-under-vector.md) was rejected the day it was written.
+
+**Drop "over one index" from any future phrasing.** Weaviate's inverted index feeding an allow-list
+into HNSW is arguably one plan over two cooperating structures; the phrase invites a cheap rebuttal
+and was never the load-bearing part.
+
+**The lesson is about method, not about Vespa.** A claim of novelty is only as strong as the
+comparison class it was tested against, and this one was scoped to the competitors that made it look
+best. That is how the mistake happened, and it is why the retraction is recorded in place rather
+than quietly edited away.
 
 ## 4. Finding 2 — at this scale, an ANN index is the wrong tool
 

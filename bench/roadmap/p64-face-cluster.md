@@ -1,4 +1,4 @@
-# P55 — face clustering: the primitive, and nothing else
+# P64 — face clustering: the primitive, and nothing else
 
 **Tier:** T3 · **Bin:** `face-cluster` · **API:** `vector::cluster`
 **Status: SPEC — expected RED until built. The blocker is legal, not technical.**

@@ -1,4 +1,4 @@
-# P52 — the 1:1 proof: content address, dedup, and the compression that is not ours to write
+# P61 — the 1:1 proof: content address, dedup, and the compression that is not ours to write
 
 **Tier:** T2 · **Bin:** `image-corpus` · **API:** `ImageDoc::digest`, `ImageIndex::duplicate_of`
 **Status: PARTIAL, 2026-09-06.** `digest.rs` (SHA-256, FIPS 180-4 vectors, cross-checked against

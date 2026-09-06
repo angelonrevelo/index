@@ -1,4 +1,4 @@
-# P50 — one query plan over pixels, metadata and text
+# P59 — one query plan over pixels, metadata and text
 
 **Tier:** T1 · **Bin:** `image-corpus` · **API:** `ImageIndex::search_fused`
 **Status: SHIPPED, 2026-09-06.** Built in `crates/index-image/image.rs`.
@@ -10,18 +10,27 @@ the two leak guards and nothing else.
 **Acceptance 3 (fused nDCG beats both halves) is NOT yet met** — it needs a labelled query set and
 real embeddings, both of which this corpus lacks. Recorded as outstanding, not quietly dropped.
 
-This is the headline row of the image tier, and the only one whose claim is not already solved by
-somebody else. [`docs/research/image.md`](../../docs/research/image.md) §3 states it as narrowly as
-it can be stated while staying false of every shipping system:
+This row was written as the headline of the image tier, on a claim that has since been refuted:
 
-> **No system answers text, facet, numeric-range, vector and perceptual-hash predicates in one
-> query plan over one index, selecting top-k once.**
+> ~~No system answers text, facet, numeric-range, vector and perceptual-hash predicates in one
+> query plan over one index, selecting top-k once.~~
 
-Immich and LibrePhotos separate pgvector/FAISS from the relational row from a separately-scheduled
-face-clustering job, and intersect in application code. PhotoPrism combines them in its *query
-syntax* and fans out underneath — a real partial counterexample, recorded as such.
+**RETRACTED 2026-09-06.** That was tested only against self-hosted photo apps — the wrong comparison
+class. **Vespa** does exactly this in one `rank-profile` with a single top-k; **Lucene 9+** composes
+`KnnFloatVectorQuery` into a `BooleanQuery` under one `IndexSearcher.search(query, k)`; and Hamming
+distance over binary codes is first-class in Vespa, Elasticsearch and LanceDB. Full evidence and the
+per-system verdicts: [`docs/research/image.md`](../../docs/research/image.md) §3.
 
-## Why this repo can make the claim and they cannot
+**What survives is not about query modelling.** Vespa and Elasticsearch are servers, Lucene is a JVM
+library; this runs the same index in a browser through a hand-written C ABI, dependency-free, under
+MIT OR Apache-2.0. That is a packaging property, and it is the honest one.
+
+**The engineering is unaffected.** Fan-out is still a real defect where it happens — Weaviate's own
+docs call hybrid *"two searches under-the-hood"* and over-fetch to 100 before trimming; LanceDB's
+scanner carries `"Cannot have both nearest and full text search"`. Selecting once is still right.
+It is simply also what Vespa does, so it is not a differentiator.
+
+## Why the design is still right, even though the claim was not
 
 `index-text` already carries the hard half: BM25F with exact `u16` field lengths, block-max MaxScore
 top-k, categorical facets (`p30`), numeric ranges (`p31`), sort-by-value (`p32`), phrases (`p45`)

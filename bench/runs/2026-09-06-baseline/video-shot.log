@@ -1,0 +1,414 @@
+p63-video-shot :: video as SHOTS, not frames, on the real video on this machine
+decode path: SYSTEM ffmpeg, out of process — no Rust decoder is linked
+  ffmpeg version 8.1.1-full_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers
+  walking C:\Users\maran\Code (depth <= 5) ...
+
+corpus root: C:\Users\maran\Code
+  49 video file(s) found by extension, sorted walk, depth <= 5, node_modules excluded
+  0 unreadable, 18 exact content duplicate(s) collapsed, 31 unique by sha256
+    dup: blueos-bcg/web/public/mea/steps-loop.mp4
+         == blueos-bcg/web/dist/mea/steps-loop.mp4
+    dup: fourlinq/public/videos/brand-hero-mobile.mp4
+         == fourlinq/dist/videos/brand-hero-mobile.mp4
+    dup: fourlinq/public/videos/brand-hero.mp4
+         == fourlinq/dist/videos/brand-hero.mp4
+    dup: fourlinq/public/videos/hero-loop.mp4
+         == fourlinq/dist/videos/hero-loop.mp4
+    dup: fourlinq/public/videos/reels/reel-1.mp4
+         == fourlinq/dist/videos/reels/reel-1.mp4
+    dup: fourlinq/public/videos/reels/reel-2.mp4
+         == fourlinq/dist/videos/reels/reel-2.mp4
+    dup: fourlinq/public/videos/reels/reel-3.mp4
+         == fourlinq/dist/videos/reels/reel-3.mp4
+    dup: fourlinq/public/videos/why-upvc-hero-mobile.mp4
+         == fourlinq/dist/videos/why-upvc-hero-mobile.mp4
+    ... and 10 more
+  [1/31] blueos-bcg/web/dist/mea/steps-loop.mp4
+  [2/31] felici-gelato/assets/FELICI GELATO TEST.mp4
+  [3/31] felici-gelato/assets/felici-cafe-loc.mp4
+  [4/31] felici-gelato/assets/felici-gelato-loc.mp4
+  [5/31] felici-gelato/assets/gelatomainvid.mp4
+  [6/31] felici-gelato/assets/gelatomainvid2.mp4
+  [7/31] felici-gelato/assets/showcase-1.mov
+  [8/31] felici-gelato/assets/showcase-2.mov
+  [9/31] felici-gelato/assets/showcase-3.mov
+  [10/31] fourlinq/dist/videos/brand-hero-mobile.mp4
+  [11/31] fourlinq/dist/videos/brand-hero.mp4
+  [12/31] fourlinq/dist/videos/hero-loop.mp4
+  [13/31] fourlinq/dist/videos/reels/reel-1.mp4
+  [14/31] fourlinq/dist/videos/reels/reel-2.mp4
+  [15/31] fourlinq/dist/videos/reels/reel-3.mp4
+  [16/31] fourlinq/dist/videos/why-upvc-hero-mobile.mp4
+  [17/31] fourlinq/dist/videos/why-upvc-hero.mp4
+  [18/31] tna/drive-export/For Consultants Impact Nxt Findings/Step 0.1 Additional Context/._The_Quest_for_Ground_Truth.mp4
+  [19/31] tna/drive-export/For Consultants Impact Nxt Findings/Step 0.1 Additional Context/The_Quest_for_Ground_Truth.mp4
+  [20/31] tna/drive-export/For Consultants Impact Nxt Findings/Step 0.2 Project Docs/Step 0.2.1 Glossary.mp4
+  [21/31] tna/drive-export/For Consultants Impact Nxt Findings/Step 0.2 Project Docs/Step 0.2.2 Project_Charter.mp4
+  [22/31] tna/drive-export/For Consultants Impact Nxt Findings/Step 1 Prelim Desk Research/Step 1.6 Competency Framework.mp4
+  [23/31] tna/drive-export/For Consultants Impact Nxt Findings/Step 1 Prelim Desk Research/Step 1.7 WIPO_Toolkit_and_TNA_Manual.mp4
+  [24/31] tna/drive-export/For Consultants Impact Nxt Findings/Step 2 Situational Diagnosis/Step 2.1 Stakeholders.mp4
+  [25/31] tna/drive-export/For Consultants Impact Nxt Findings/Step 2 Situational Diagnosis/Step 2.2 Philippine Tech Legal Environment.mp4
+  [26/31] tna/drive-export/For Consultants Impact Nxt Findings/Step 2 Situational Diagnosis/Step 2.3 Norm Cycle Diagnosis.mp4
+  [27/31] tna/drive-export/For Consultants Impact Nxt Findings/Step 2 Situational Diagnosis/Step 2.4 Institutional_Resistance.mp4
+  [28/31] tna/drive-export/For Consultants Impact Nxt Findings/Step 2 Situational Diagnosis/Step 2.5 PESTLE_Analysis.mp4
+  [29/31] tna/test-audio/real-chunk.webm
+  [30/31] tna/test-audio/session_162/segment_1.webm
+  [31/31] tna/test-audio/session_162/segment_2.webm
+
+=== 1. CORPUS CENSUS ===================================================
+  27 unique video(s) opened, 4 rejected with a reported reason
+    REJECTED tna/drive-export/For Consultants Impact Nxt Findings/Step 0.1 Additional Context/._The_Quest_for_Ground_Truth.mp4
+             [mov,mp4,m4a,3gp,3g2,mj2 @ 00000210d5041a40] moov atom not found
+    REJECTED tna/test-audio/real-chunk.webm
+             no video stream (container holds audio only, or is not decodable)
+    REJECTED tna/test-audio/session_162/segment_1.webm
+             [matroska,webm @ 000001a6feefdc00] EBML header parsing failed
+    REJECTED tna/test-audio/session_162/segment_2.webm
+             [matroska,webm @ 0000025effd8fbc0] EBML header parsing failed
+
+  --- robustness: a file ffmpeg cannot open is a FINDING, not a crash ---
+    0 panic(s) across 31 file(s)
+
+  3943.1 s of video total (65.72 video-minutes), 480.4 MB on disk
+  duration per video: p50 24.0 s   p90 357.3 s   max 456.9 s   min 5.8 s
+
+  --- codec, which is a LICENCE fact as much as a technical one ---
+    h264       25   PATENT-ENCUMBERED — decoded here by the system ffmpeg, not by us
+    hevc        2   PATENT-ENCUMBERED — decoded here by the system ffmpeg, not by us
+
+  --- resolution and frame rate (both drive every cost above) ---
+    1280x720       11
+    1920x1080       5
+    1080x1920       3
+    720x1280        2
+    900x720         2
+    960x520         1
+    960x540         1
+    960x768         1
+    ... and 1 more distinct resolution(s)
+    fps: p50 29.95   min 23.98   max 60.00
+    §9 notes NVDEC buys only ~1.29x over CPU at 1080p and is not worth the
+    complexity below 4K. Nothing in this corpus is above 4K, so CPU decode is the
+    right call here and no GPU path was measured.
+
+  --- what this corpus is NOT ---
+    These are marketing hero loops, product reels and screen-recorded slide decks
+    found on a developer machine. They are mostly short and many contain very few
+    real cuts. That makes this a legitimate test of the PIPELINE — decode strategy,
+    shot detection, cost, storage — and a POOR test of RETRIEVAL: there are no
+    relevance judgements anywhere in it, so p63 acceptance 3 is WITHHELD below rather
+    than answered with a number that would mean nothing.
+
+=== 2. DECODE STRATEGY COST (p63 acceptance 1) =========================
+  Wall clock for a whole ffmpeg process, PROCESS SPAWN INCLUDED. That is the honest
+  figure for a host that shells out, and on a 7-second hero loop the ~0.1-0.2 s of
+  spawn is a large share of it — so the speedup below is UNDERSTATED on short files
+  and the long-file column is the one to read.
+
+  video                                             kf s    fps1 s    full s   frames
+  blueos-bcg/web/dist/mea/steps-loop.mp4           0.117     0.177     0.178      249
+  ...ci-gelato/assets/FELICI GELATO TEST.mp4       0.307     0.972     0.986     1060
+  felici-gelato/assets/felici-cafe-loc.mp4         0.280     1.557     1.564      930
+  felici-gelato/assets/felici-gelato-loc.mp4       0.115     0.319     0.318      251
+  felici-gelato/assets/gelatomainvid.mp4           0.586     1.367     1.329      594
+  felici-gelato/assets/gelatomainvid2.mp4          0.278     0.628     0.606      594
+  felici-gelato/assets/showcase-1.mov              0.140     0.245     0.254      466
+  felici-gelato/assets/showcase-2.mov              0.170     0.422     0.407      402
+  ... and 19 more (aggregates below cover all 27)
+
+  TOTALS over 27 video (65.72 video-minutes):
+    -skip_frame nokey (I-frames only)     23.39 s      0.36 s per video-minute
+    full decode + fps=1                   43.25 s      0.66 s per video-minute
+    full decode, every frame              43.77 s      0.67 s per video-minute
+
+    aggregate speedup, keyframe-only vs full decode: 1.87x
+    aggregate speedup, keyframe-only vs fps=1 pass:   1.85x
+    per-video speedup vs full decode: p50 1.97x  p90 3.22x  min 1.38x  max 5.60x
+
+  -> §9 records a MEASURED 2-3x for `-skip_frame nokey`. Measured HERE: 1.87x.
+     That is BELOW §9's range on this corpus. Process spawn is inside every figure
+     and these files are short, which taxes the cheap pass hardest.
+
+=== 3. SHOT DETECTION ==================================================
+  Detector: ffmpeg `select='gt(scene,T)'` — a frame-difference threshold. It is an
+  UNBENCHMARKED HEURISTIC. §9's measured detector is PySceneDetect AdaptiveDetector
+  (F1 91.59 on BBC vs ContentDetector 86.69), which is not installed on this machine,
+  so NO F1 is claimed here. What is claimed: counts, cost, and how hard the threshold
+  moves the answer.
+
+  threshold  shot total     shot/video   shot/video-min
+  0.20              316          11.70             4.81
+  0.30              265           9.81             4.03
+  0.40              195           7.22             2.97
+  0.50              137           5.07             2.08
+
+  -> The sweep IS the finding: the threshold picks the answer. A single headline
+     shot count would be a methodology choice wearing a fact's clothes.
+
+  primary threshold 0.3: 265 shot across 27 video
+  detection cost 47.69 s total, 0.73 s per video-minute (a FULL decode plus the
+  metadata print — scene scoring cannot run on I-frames alone, which is the honest
+  cost of this pipeline and is NOT covered by the keyframe speedup above).
+  242 raw boundary(ies) fired at this threshold; 4 were below the
+  0.25s minimum-shot floor and were MERGED into the preceding shot, not
+  dropped — a 40 ms span is a detector artefact, and the first run of this benchmark
+  proved it by seeking past the last coded frame of a clip and extracting nothing.
+
+  average shot length: mean 14.88 s   p50 11.67 s   p90 32.88 s   max 102.54 s
+  §9's typical editing pace is ASL 3.5-6 s. See the note in section 4.
+
+  per-video shot count at threshold 0.3 (first 8):
+  video                                           dur s     shot     shot/min
+  blueos-bcg/web/dist/mea/steps-loop.mp4           10.4        9         52.0
+  ...ci-gelato/assets/FELICI GELATO TEST.mp4       17.7       15         50.9
+  felici-gelato/assets/felici-cafe-loc.mp4         31.0        8         15.5
+  felici-gelato/assets/felici-gelato-loc.mp4        8.4        3         21.4
+  felici-gelato/assets/gelatomainvid.mp4           19.8        7         21.2
+  felici-gelato/assets/gelatomainvid2.mp4          19.8        7         21.2
+  felici-gelato/assets/showcase-1.mov              15.5       17         65.6
+  felici-gelato/assets/showcase-2.mov              16.8        6         21.5
+
+=== 4. FRAMES PER VIDEO-MINUTE =========================================
+  strategy                                 frames    per video-min
+  every frame (full decode)                 97026           1476.4
+  uniform 1 fps (the baseline)               3939             59.9
+  I-frame only (-skip_frame nokey)           2186             33.3
+  one per detected shot                       265              4.0
+
+  reduction vs every frame: I-frame 44.4x, shot 366.1x
+  reduction vs uniform 1 fps: shot 14.86x
+
+  -> §9 expects ~120-170 shots in a 10-minute video at typical editing pace.
+     Scaled from this corpus: 40 shots per 10 minutes.
+     These short loops do NOT look like §9's expectation, and that is a PROPERTY OF
+     THIS CORPUS, not a refutation of §9: a 7-second hero loop and a screen-recorded
+     slide deck are not edited at broadcast pace. Nothing about a 10-minute film is
+     claimed from these numbers.
+
+     NOTE the ordering surfaced above: on THIS corpus the I-frame count and the shot
+     count are not the same quantity and need not be ordered the way §9's example
+     implies. An encoder emits an I-frame on a fixed GOP cadence whether or not the
+     picture changed, so on low-cut footage there are MORE I-frames than shots — the
+     I-frame is a cheap CANDIDATE SET, and shot detection is what turns it into a
+     semantic unit. That is exactly why the pipeline has both stages.
+
+=== 5. STORAGE PER VIDEO-MINUTE (p63 acceptance 2) =====================
+  Measured from index_image::vector::VectorColumn::byte_len at dim 512, 64 vectors:
+  tier                             full B/vec compact B/vec
+  binary prefilter                       64.0         64.0
+  int8 rerank                           512.0        512.0
+  dequant scale                           4.0          4.0
+  retained f32                         2048.0          0.0
+  + dHash (64-bit)                        8.0          8.0
+  TOTAL per stored frame               2636.0        588.0
+
+  strategy                          frame/vid-min  full KB/vid-min compact KB/vid-min
+  uniform 1 fps (baseline)                   60.0            154.5             34.5
+  I-frame only                               33.3             85.6             19.1
+  one per detected shot                       4.0             10.4              2.3
+
+  -> shot sampling stores 14.88x less than the 1-fps baseline it replaces,
+     on this corpus. On §9's 10-minute-at-editing-pace video the ratio would be ~4-5x
+     (600 frames vs 120-170 shots); this corpus cannot show that and does not claim it.
+
+=== 6. KEYFRAME EXTRACTION (middle frame of each shot) =================
+  temp dir: C:\Users\maran\AppData\Local\Temp\index-p63-video-shot
+  The MIDDLE of each shot, not the first frame: §9's point is that a shot's opening
+  frame is often still mid-transition and motion-blurred, so it is the worst frame in
+  the shot to hand an encoder.
+
+  265 keyframe extracted, 0 failed, 35312918 bytes total (35.31 MB)
+  mean 130.1 KB per keyframe (JPEG q2 at source resolution — this is the DECODED
+  intermediate handed to an encoder, NOT what the index stores; section 5 is what
+  the index stores)
+  extraction wall clock 47.88 s (0.181 s per keyframe, one ffmpeg process each
+  with an input `-ss` seek — process spawn dominates and is inside the figure)
+
+  manifest: 265 line(s) -> C:\Users\maran\AppData\Local\Temp\index-p63-video-shot\manifest.tsv
+    `<path>\t<video>\t<shot_index>\t<start_ms>\t<end_ms>`, in walk order.
+    scripts/embed-corpus.py embeds column 1; columns 2-5 are what makes the
+    result a SHOT rather than a picture — the video it came from and the span
+    it covers. A search result is then a shot, which is what a user wanted.
+
+=== 7. NEAR-DUPLICATE VIDEO (p63 acceptance 4) =========================
+  A SECOND PASS over the manifest section 6 just wrote, in the shape of Meta's vPDQ:
+  hash every extracted keyframe, keep the hashes as a per-video SEQUENCE in shot
+  order, and compare two videos by how much of one sequence is found in the other.
+  Nothing in index-image changed to make this possible — Hash64::dhash and
+  Hash256::pdq were already there, and a shot hash is the same hash column an image
+  document already carries.
+
+  BOTH code lengths are computed, because a Hamming threshold is meaningless without
+  the code length beside it: 31 bits is 12 % of a PDQ code and 48 % of a 64-bit one.
+    dHash  64-bit,  crate default radius HASH64_NEAR_MAX  = 4  (6.2 % of the code)
+    PDQ   256-bit,  crate default radius HASH256_NEAR_MAX = 31 (12.1 % of the code)
+
+  ORDER-INSENSITIVE, and that is the honest limit. Similarity(A,B) is the fraction of
+  A's shots that find a match ANYWHERE in B — B is searched as a BAG of shot hashes,
+  not as a sequence. So this detects a re-upload, a re-encode, a resize and a trimmed
+  cut, and it does NOT detect a re-ordered edit as anything other than a duplicate.
+  A true vPDQ that scored the ORDER as well would need an alignment step this does
+  not have; what is built here is a bag-of-shot-hashes and is reported as one.
+
+  --- the hash pass ---
+    265 keyframe hashed, 0 failed, 3.63 s (13.68 ms per keyframe,
+    JPEG decode INCLUDED — the decode is the host's cost, both hashes together are a
+    small fraction of it)
+
+    0 keyframe(s) produced an ALL-ZERO PDQ code. Hash256::pdq returns zero
+    for a frame with no two-dimensional structure — a solid colour, a fade to black.
+    Two such frames sit at distance 0 BY CONSTRUCTION, so they match each other and
+    everything else that is flat. That is a property of the code, not a duplicate, and
+    it is stated here rather than left to inflate a similarity quietly.
+
+  --- per-video sequence length (first 8, walk order) ---
+  video                                                 shot hash
+  blueos-bcg/web/dist/mea/steps-loop.mp4                        9
+  felici-gelato/assets/FELICI GELATO TEST.mp4                  15
+  felici-gelato/assets/felici-cafe-loc.mp4                      8
+  felici-gelato/assets/felici-gelato-loc.mp4                    3
+  felici-gelato/assets/gelatomainvid.mp4                        7
+  felici-gelato/assets/gelatomainvid2.mp4                       7
+  felici-gelato/assets/showcase-1.mov                          17
+  felici-gelato/assets/showcase-2.mov                           6
+  ... and 19 more
+  27 of 27 video(s) carry a non-empty sequence
+
+  --- SANITY: a video must be a perfect near-duplicate of ITSELF ---
+    Every video is compared against its OWN sequence at every threshold INCLUDING 0.
+    All of them must score exactly 1.0. If one does not, the comparison is broken and
+    nothing else in this section means anything.
+    216 self-comparison(s) over 27 video x 8 threshold; worst score 1.0000
+
+  --- pair sweep: the THRESHOLD is printed beside EVERY count ---
+    A pair is a CANDIDATE at 0.50 (half of one video's shots matched) and a
+    CONTAINMENT at 1.00 (all of one video's shots matched). Direction is kept: a
+    trimmed cut of a longer video scores 1.0 one way and less the other, and that
+    asymmetry is the signal, so it is never averaged away.
+
+  code         radius candidate >=0.50 containment ==1.00
+  dhash64           0                3                  2
+  dhash64           2                3                  3
+  dhash64           4                3                  3
+  dhash64           8                3                  3
+  pdq256            0                1                  1
+  pdq256           16                3                  3
+  pdq256           31                3                  3
+  pdq256           62                3                  3
+
+  351 unordered pair(s) over 27 video with a sequence.
+
+  --- top 20 pair(s), ranked by the strongest direction over either code ---
+  (at the crate defaults: dhash radius 4 of 64, pdq radius 31 of 256)
+
+    d A>B   d B>A   p A>B   p B>A  pair
+    1.000   1.000   1.000   1.000  A felici-gelato/assets/gelatomainvid.mp4
+                                   B felici-gelato/assets/gelatomainvid2.mp4
+    1.000   1.000   1.000   1.000  A fourlinq/dist/videos/brand-hero-mobile.mp4
+                                   B fourlinq/dist/videos/brand-hero.mp4
+    1.000   1.000   1.000   1.000  A fourlinq/dist/videos/why-upvc-hero-mobile.mp4
+                                   B fourlinq/dist/videos/why-upvc-hero.mp4
+    0.067   0.143   0.000   0.000  A felici-gelato/assets/FELICI GELATO TEST.mp4
+                                   B felici-gelato/assets/gelatomainvid.mp4
+    0.067   0.143   0.000   0.000  A felici-gelato/assets/FELICI GELATO TEST.mp4
+                                   B felici-gelato/assets/gelatomainvid2.mp4
+    0.000   0.000   0.000   0.000  A blueos-bcg/web/dist/mea/steps-loop.mp4
+                                   B felici-gelato/assets/FELICI GELATO TEST.mp4
+    0.000   0.000   0.000   0.000  A blueos-bcg/web/dist/mea/steps-loop.mp4
+                                   B felici-gelato/assets/felici-cafe-loc.mp4
+    0.000   0.000   0.000   0.000  A blueos-bcg/web/dist/mea/steps-loop.mp4
+                                   B felici-gelato/assets/felici-gelato-loc.mp4
+    0.000   0.000   0.000   0.000  A blueos-bcg/web/dist/mea/steps-loop.mp4
+                                   B felici-gelato/assets/gelatomainvid.mp4
+    0.000   0.000   0.000   0.000  A blueos-bcg/web/dist/mea/steps-loop.mp4
+                                   B felici-gelato/assets/gelatomainvid2.mp4
+    0.000   0.000   0.000   0.000  A blueos-bcg/web/dist/mea/steps-loop.mp4
+                                   B felici-gelato/assets/showcase-1.mov
+    0.000   0.000   0.000   0.000  A blueos-bcg/web/dist/mea/steps-loop.mp4
+                                   B felici-gelato/assets/showcase-2.mov
+    0.000   0.000   0.000   0.000  A blueos-bcg/web/dist/mea/steps-loop.mp4
+                                   B felici-gelato/assets/showcase-3.mov
+    0.000   0.000   0.000   0.000  A blueos-bcg/web/dist/mea/steps-loop.mp4
+                                   B fourlinq/dist/videos/brand-hero-mobile.mp4
+    0.000   0.000   0.000   0.000  A blueos-bcg/web/dist/mea/steps-loop.mp4
+                                   B fourlinq/dist/videos/brand-hero.mp4
+    0.000   0.000   0.000   0.000  A blueos-bcg/web/dist/mea/steps-loop.mp4
+                                   B fourlinq/dist/videos/hero-loop.mp4
+    0.000   0.000   0.000   0.000  A blueos-bcg/web/dist/mea/steps-loop.mp4
+                                   B fourlinq/dist/videos/reels/reel-1.mp4
+    0.000   0.000   0.000   0.000  A blueos-bcg/web/dist/mea/steps-loop.mp4
+                                   B fourlinq/dist/videos/reels/reel-2.mp4
+    0.000   0.000   0.000   0.000  A blueos-bcg/web/dist/mea/steps-loop.mp4
+                                   B fourlinq/dist/videos/reels/reel-3.mp4
+    0.000   0.000   0.000   0.000  A blueos-bcg/web/dist/mea/steps-loop.mp4
+                                   B fourlinq/dist/videos/why-upvc-hero-mobile.mp4
+  ... and 331 more pair(s), all scoring at or below the last row above
+
+  --- what this corpus CAN and CANNOT show ---
+    Section 1 already collapsed exact content duplicates by sha256, so EXACT duplicate
+    video is gone BY CONSTRUCTION and cannot appear below. Anything scoring high here
+    is therefore a genuine near-duplicate — a re-encode, a different resolution, a
+    trimmed cut — and is worth naming.
+
+    RESULT: 3 near-duplicate candidate pair(s) at the crate default radii.
+      1.000/1.000 dhash, 1.000/1.000 pdq
+        A felici-gelato/assets/gelatomainvid.mp4
+        B felici-gelato/assets/gelatomainvid2.mp4
+      1.000/1.000 dhash, 1.000/1.000 pdq
+        A fourlinq/dist/videos/brand-hero-mobile.mp4
+        B fourlinq/dist/videos/brand-hero.mp4
+      1.000/1.000 dhash, 1.000/1.000 pdq
+        A fourlinq/dist/videos/why-upvc-hero-mobile.mp4
+        B fourlinq/dist/videos/why-upvc-hero.mp4
+
+  --- SANITY: determinism ---
+    The whole pass re-run over the same keyframe file(s): decode, hash, sequence, pair
+    table. Nothing in it reads a clock or a random number.
+      run 1: 351 pair, 0 hash failure, digest c03803bf3c312cb6
+      run 2: 351 pair, 0 hash failure, digest c03803bf3c312cb6
+
+=== WHAT THIS RUN SURFACED =============================================
+  1. VIDEO NEEDED NO NEW INDEX TYPE, AND THAT IS THE HEADLINE.
+     Everything this benchmark built is HOST-SIDE: decode, shot-detect, pick the
+     middle frame, emit a manifest. Not one line of `index-image` or `index-text`
+     changed, and none needed to. A shot is an ImageDoc with a (video, start_ms,
+     end_ms) and an embedding; the fusion layer, the vector column and the hash
+     column already index it. p63 names that asymmetry as the strongest available
+     evidence that the p59 architecture is right, and this run is that evidence.
+
+  2. THE CHEAP DECODE DOES NOT PAY FOR THE SHOT DETECTION.
+     `-skip_frame nokey` is 1.87x faster than a full decode here, but the scene
+     scorer needs every frame and costs 0.73 s per video-minute — more than the full
+     decode it rides on. The keyframe speedup is real and it is NOT the pipeline's
+     total cost. A production build would run detection once at ingest and keep the
+     shot list, which is precisely what the manifest is for.
+
+  3. THE CORPUS IS THE LIMIT, NOT THE CODE.
+     27 unique video, 65.72 video-minutes, no relevance judgements. Every count above
+     is exact and reproducible; every claim about 10-minute broadcast-paced footage
+     belongs to §9 and is cited, not re-derived. p63's acceptance 3 stays open until
+     a labelled clip set exists on this machine.
+
+  4. NEAR-DUPLICATE VIDEO IS A SECOND PASS, AND IT NEEDED NO NEW ENGINE CODE EITHER.
+     Section 7 hashes the 265 extracted keyframe(s) with Hash64::dhash and
+     Hash256::pdq — both already in index-image — and compares two videos by how much
+     of one shot-hash sequence is found in the other. The manifest was the whole seam.
+     The limit is stated there rather than hidden: the comparison is ORDER-INSENSITIVE,
+     which is the honest ceiling of a bag of shot hashes, and this corpus was already
+     deduplicated by sha256, so an exact duplicate cannot appear in it by construction.
+
+=== CHECK LIST =========================================================
+  [PASS] no panic on any of 31 video file(s)
+  [PASS] keyframe-only decode is faster than full decode (1.87x)
+  [PASS] shot sampling stores less than uniform 1 fps (14.88x)
+  [PASS] one keyframe extracted per detected shot (265 of 265)
+  [PASS] manifest line count == extracted keyframe count (265 == 265)
+  [PASS] hashing every one of 265 keyframe(s) panics on none of them
+  [PASS] every video is a perfect near-duplicate of itself: 216 self-comparison(s) all 1.0
+  [PASS] pair table is identical across two runs (sha256 c03803bf3c312cb6)
+  [HELD] p63 acceptance 3: shot-sampled recall >= uniform 1 fps — needs a LABELLED clip set; this corpus has no relevance judgements
+
+  1 verdict(s) WITHHELD. This run does not answer all of p63 — it declines to,
+  and says which parts and why.
+
+OVERALL: PASS

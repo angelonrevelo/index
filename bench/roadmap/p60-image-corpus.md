@@ -1,4 +1,4 @@
-# P51 — the real corpus: 17,311 scraped web images
+# P60 — the real corpus: 17,311 scraped web images
 
 **Tier:** T1 · **Bin:** `image-corpus` · **API:** the whole image tier, end to end
 **Status: BUILT AND RUN, 2026-09-06.** `crates/index-bench/src/image_corpus.rs`, run to completion

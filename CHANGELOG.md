@@ -1,7 +1,8 @@
 # Changelog
 
-All notable changes to `index`. Format follows [Keep a Changelog](https://keepachangelog.com/);
-this project is pre-release and unversioned, so everything lives under `[Unreleased]`. See
+All notable changes to `index`. The project is pre-release and unversioned, so entries are keyed to
+**roadmap items** (`## pNN — title`) rather than to versions; the newest work sits under
+`[Unreleased]` until it is given an item number. Newest first. See
 [ROADMAP.md](ROADMAP.md) for the tiered plan and [docs/roadmap-rejected.md](docs/roadmap-rejected.md)
 for what was deliberately ruled out.
 
@@ -12,6 +13,9 @@ for what was deliberately ruled out.
 **`index-image`, a new crate.** The engine now indexes pixels alongside text, and the architectural
 claim is narrow enough to be falsifiable: *no shipping system answers text, facet, numeric-range,
 vector and perceptual-hash predicates in one query plan over one index, selecting top-k once.*
+**That claim was RETRACTED the same day** — it had been tested only against photo apps, and Vespa
+and Lucene both refute it. See `docs/research/image.md` §3. What survives is embeddability and
+licence, not a novel query model.
 Evidence for that claim, and for every decision below, is in
 [`docs/research/image.md`](docs/research/image.md) — a seven-lane sweep of the FOSS photo-search
 field, embedding and ANN state of the art, on-device inference, lossless compression, perceptual

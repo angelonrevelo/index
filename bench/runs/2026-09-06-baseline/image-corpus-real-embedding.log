@@ -81,15 +81,15 @@ corpus: C:\Users\maran\Code\alec\expressway_dump
 === 2. CHEAP-TIER COST (p57) ===========================================
   12007 images decoded and fully signalled
                                                 p50        p99
-  cheap tier (luma+dHash+pHash+palette+EXIF)    2.677ms   15.866ms
-    + PDQ-shaped 256-bit (not in p57 budget)    0.864ms    3.142ms
-  third-party decode (the HOST's cost)      1.316ms   41.557ms
+  cheap tier (luma+dHash+pHash+palette+EXIF)    2.109ms   10.721ms
+    + PDQ-shaped 256-bit (not in p57 budget)    0.595ms    2.002ms
+  third-party decode (the HOST's cost)      1.112ms   31.233ms
 
   stored bytes/image (dHash 8 + pHash 8 + palette 16/swatch + parsed EXIF):
     mean 112.0 B   p50 112 B   p99 112 B   max 112 B
     (+32 B content digest and +32 B PDQ code, counted separately: neither is in p57's table)
 
-  -> p57 budget: p50 < 10 ms — measured 2.677 ms: HOLDS
+  -> p57 budget: p50 < 10 ms — measured 2.109 ms: HOLDS
   -> p57 budget: < 200 B/image — measured 112.0 B: HOLDS
 
 === 3. DEDUP ===========================================================
@@ -127,13 +127,6 @@ corpus: C:\Users\maran\Code\alec\expressway_dump
 
   -> §5 predicts 3-37% for scraped corpora depending on method. The spread above IS
      that finding reproduced on this corpus: the method chooses the answer.
-
-  manifest: 12007 lines -> C:/Users/maran/AppData/Local/Temp/manifest2.tsv
-    One line per indexed document, in indexing order, as
-    `<absolute path>\t<sha256 hex>`. This is the order a vector file must
-    follow: entry i is the vector for line i+1. The digest column is there so
-    a stale manifest is DETECTABLE — without it, a corpus that changed under
-    the encoder mis-attributes every vector and still prints a number.
 
   index built: 12007 documents, 12007 embedded, 0.2 s
   100 probe queries from real path tokens
@@ -203,12 +196,12 @@ corpus: C:\Users\maran\Code\alec\expressway_dump
 === 5. LATENCY =========================================================
   p50/p99 per query, rdtsc-timed, single-thread.
   docs         text p50   text p99    vec p50    vec p99  fused p50  fused p99
-  1000              2us       31us      106us      114us      576us      708us
-  4000              2us       31us      133us      191us      720us      868us
-  12007             2us       42us      239us      358us      983us     1149us
+  1000              2us       31us       89us      108us      502us      704us
+  4000              2us       31us      132us      177us      615us      749us
+  12007             2us       62us      238us      327us      803us     1019us
 
-  -> fusion costs 393.2x the text-only p50 at full corpus (983us vs 2us);
-     p99 1149us. A number, not a claim — p59 acceptance 6.
+  -> fusion costs 420.5x the text-only p50 at full corpus (803us vs 2us);
+     p99 1019us. A number, not a claim — p59 acceptance 6.
 
 === 6. INDEX SIZE ======================================================
   component                         bytes      B/image
@@ -258,7 +251,7 @@ corpus: C:\Users\maran\Code\alec\expressway_dump
 
 === CHECK LIST =========================================================
   [PASS] no panic on any of 17311 files
-  [PASS] p57 cheap tier p50 2.677 ms < 10 ms
+  [PASS] p57 cheap tier p50 2.109 ms < 10 ms
   [PASS] p57 cheap tier 112.0 B/image < 200 B
   [PASS] p59 zero short pages over 100 fused queries
   [PASS] p59 zero filter leaks over 100 fused queries

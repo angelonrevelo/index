@@ -1,4 +1,4 @@
-# P53 — the image tier through the C ABI
+# P62 — the image tier through the C ABI
 
 **Tier:** T2 · **Bin:** `js/image-smoke.mjs` · **API:** `index-wasm` v12
 **Status: SHIPPED, 2026-09-06.** ABI 11 -> **12**, 49 -> **61 symbols**, no `wasm-bindgen`, zero

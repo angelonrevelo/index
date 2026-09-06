@@ -220,3 +220,32 @@ forensics, not a cheap tier.
 → REJECTED as a reporting practice. Published methods span **3% to 37%** on comparable web corpora
 — a 12x spread — so any single headline number is a methodology choice wearing the costume of a
 fact. `p52` prints the count at every threshold, with the threshold beside it.
+
+**Exact facet counts beside an active vector arm, as a differentiator (`p66`).**
+→ **REJECTED 2026-09-06, the same day the row was written.** The row was created after retracting
+`p59`'s novelty claim, as the one property that appeared to survive: every purpose-built vector
+engine degrades facet counts when a vector arm is active (Vespa documents *"Grouping counts are not
+accurate when using nearestNeighbor"*; Elasticsearch aggregations collapse to top-`k`; LanceDB
+refuses `limit`/`offset` with an aggregate). It was written with an acceptance item requiring the
+comparison class be verified against SQL engines **before** any claim. That check killed it.
+
+**Plain SQL has the property for free.** The standard computes aggregates at step 4 and `LIMIT` at
+step 9, so a `GROUP BY` is already exact over the full `WHERE`-filtered set. And pgvector's HNSW
+index is consulted *only* for an `ORDER BY <distance> LIMIT k` branch, so an aggregate branch is
+never routed through it — **`hnsw.ef_search` truncation cannot reach the counts.** Postgres
+satisfies it in both exact and HNSW mode; DuckDB VSS, sqlite-vec and ClickHouse follow structurally.
+**Solr satisfies it as well**, in the rerank configuration, and that is a search engine rather than a
+database.
+
+The engines that degrade do so because their faceting is defined over the **ANN result set** instead
+of a predicate match set — a product-category design choice, not a law. Only a *performance* claim
+survives (one fused pass vs a two-branch plan), and it is not worth a row until measured against
+Postgres in both modes; `WITH ... AS MATERIALIZED` arguably makes the SQL plan one pass too.
+
+**The pattern is the finding, and it is recorded here deliberately.** Three separate novelty claims
+in the image tier were probed against the right comparison class, and all three collapsed to the
+same residue — **embeddable, dependency-free, MIT/Apache, browser-capable**. The fusion query model
+(`p59`) fell to Vespa and Lucene. The perceptual-hash predicate fell to Vespa, Elasticsearch and
+LanceDB, which all ship Hamming distance on binary vectors. Facet counts under a vector arm (`p66`)
+fell to Postgres and Solr. **The engineering in this tier is sound; the novelty was not there, and
+this file is where that is written down rather than discovered later by a reviewer.**

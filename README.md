@@ -332,6 +332,7 @@ refuted hypothesis: [`bench/roadmap/p5-fuzzy-term-feasibility.md`](bench/roadmap
 
 ```sh
 cargo test --workspace              # engine + learned-index invariants + image tier + CLI
+bash scripts/cli-smoke.sh           # the `index` CLI end to end: build, apply, search, over a pipe
 
 cargo run -p index-bench --release --bin real-corpus       # THE ENGINE vs production corpora
 

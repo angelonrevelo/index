@@ -1,7 +1,47 @@
-# P54 — video as shots, not frames
+# P63 — video as shots, not frames
 
 **Tier:** T3 · **Bin:** `video-shot` · **API:** host-side ingest + `ImageIndex`
-**Status: SPEC — expected RED until built. Deferred deliberately; see the gate at the bottom.**
+**Status: BUILT AND RUN, 2026-09-06. `OVERALL: PASS`, one verdict withheld.**
+27 real videos (49 files, 18 exact duplicates collapsed), 65.7 video-minutes, via the system
+`ffmpeg 8.1.1` out of process — no Rust decoder linked, so the H.264/HEVC patent question stays
+where it already is.
+
+| Measured | |
+|---|---|
+| Keyframe-only vs full decode | **1.87x** — does NOT reproduce §9's 2–3x, and says so |
+| Shots at threshold 0.3 | **265 over 27 video — 4.03 per video-minute** |
+| Frames per video-minute | every frame 1476 · 1 fps 59.9 · I-frame 33.3 · **shot 4.0** |
+| Storage per video-minute | 1 fps 154.5 KB → **shot 10.4 KB — 14.9x less** |
+| **Acceptance 4**, near-duplicate video | **CLOSED** — see below |
+| **Acceptance 3**, recall vs 1 fps | **WITHHELD** — needs relevance judgements this corpus lacks |
+
+**Acceptance 4 found three real near-duplicate pairs that SHA-256 could not.** Hashing each keyframe
+and comparing videos as a bag of shot hashes scores `gelatomainvid` ↔ `gelatomainvid2`,
+`brand-hero-mobile` ↔ `brand-hero`, and `why-upvc-hero-mobile` ↔ `why-upvc-hero` at **1.000 in both
+directions under both code lengths**, with the next pair down at **0.067**.
+
+**Weight those three unequally.** Only the gelato pair is strong evidence: both 1920x1080, both
+19.8 s, **7 of 7 shots matched**, 33.70 MB against 15.40 MB — a lower-bitrate re-encode that exact
+dedup is structurally blind to. The two `fourlinq` pairs are 2x downscales carrying **one shot
+each**, so a score of 1.000 there is a single hash comparison wearing a fraction's clothes. Three
+pairs at 1.000 reads like three equivalent results and is not one; the run prints the resolution,
+duration and shot count beside each pair precisely so the difference cannot be skimmed past. Self-comparison is 1.0 across all 216
+checks and the pair table is byte-stable across runs.
+
+Two limits are stated rather than discovered later. It is **order-insensitive** — a bag of shot
+hashes, not a true vPDQ alignment — so it detects re-uploads, re-encodes, resizes and trims, but
+scores a re-ordered edit as a duplicate. And `Hash256::pdq` returns an **all-zero code for a frame
+with no 2-D structure** (a fade to black), which would make every flat frame match every other; the
+run counts them, and reports **0** here.
+
+**Two findings worth keeping.** The cheap decode does **not** pay for the shot detection: scene
+scoring needs every frame and costs 0.74 s per video-minute, more than the full decode it rides on.
+And this corpus yields ~40 shots per 10 minutes against §9's 120–170, because hero loops and
+screen-recorded decks have a 14.9 s mean shot length — a property of the corpus, not a refutation.
+
+**Nothing in `index-image` or `index-text` changed to make any of this work.** A shot is an ordinary
+`ImageDoc` with a timestamp, and its hash is the hash column an image document already carries.
+Video needed **no new index type**, which is this row's own strongest evidence for `p59`.
 
 The ask was "frame-by-frame image search on videos". The research says frame-by-frame is both more
 expensive and *worse*, so this row rejects the framing and keeps the goal.

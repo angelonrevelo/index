@@ -1,4 +1,4 @@
-# P48 — the cheap tier: what every image gets, for under 10 ms and ~150 bytes
+# P57 — the cheap tier: what every image gets, for under 10 ms and ~150 bytes
 
 **Tier:** T1 · **Bin:** `image-corpus` · **API:** `hash`, `color`, `meta`
 **Status: SHIPPED, 2026-09-06.** Built in `crates/index-image/{hash,color,meta}.rs`.

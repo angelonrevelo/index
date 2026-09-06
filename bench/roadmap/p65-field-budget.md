@@ -1,4 +1,4 @@
-# P56 — an image document is column-hungrier than the engine allows
+# P65 — an image document is column-hungrier than the engine allows
 
 **Tier:** T2 · **Bin:** `image-corpus` · **API:** `Schema`, `MAX_FIELD`
 **Status: SHIPPED, 2026-09-06. Format `IDXTEXT7` -> `IDXTEXT8`. No ABI change.

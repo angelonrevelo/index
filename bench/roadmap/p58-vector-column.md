@@ -1,4 +1,4 @@
-# P49 — the vector column: brute force, and why that is the right answer
+# P58 — the vector column: brute force, and why that is the right answer
 
 **Tier:** T1 · **Bin:** `image-corpus` · **API:** `VectorColumn`
 **Status: SHIPPED, 2026-09-06. Acceptance 1 is MET — recall@10 = 0.9870 on REAL embeddings.**

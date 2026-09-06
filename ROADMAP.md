@@ -329,13 +329,30 @@ digiKam admits a ~100 k ceiling on its default store; PhotoPrism's face recognit
 Immich and LibrePhotos separate pgvector/FAISS from the relational row from a separate
 face-clustering job and intersect in application code. PhotoPrism combines them in its *query
 syntax* and fans out underneath — a genuine partial counterexample, recorded rather than erased. So
-the claim this part makes is the narrow one:
+the claim this part originally made was:
 
-> **No system answers text, facet, numeric-range, vector and perceptual-hash predicates in one query
-> plan over one index, selecting top-k once.**
+> ~~No system answers text, facet, numeric-range, vector and perceptual-hash predicates in one
+> query plan over one index, selecting top-k once.~~
 
-That is `index-text`'s existing shape plus two column types — a smaller job than building a photo
-app, and the only ground in this space not already occupied.
+**RETRACTED 2026-09-06.** That was tested only against self-hosted photo apps — the wrong comparison
+class. **Vespa** does exactly this in one `rank-profile` with a single top-k; **Lucene 9+** composes
+`KnnFloatVectorQuery` into a `BooleanQuery` under one `IndexSearcher.search(query, k)`; and Hamming
+distance over binary codes is first-class in Vespa, Elasticsearch and LanceDB. Full evidence and the
+per-system verdicts: [`docs/research/image.md`](../../docs/research/image.md) §3.
+
+**What survives is not about query modelling.** Vespa and Elasticsearch are servers, Lucene is a JVM
+library; this runs the same index in a browser through a hand-written C ABI, dependency-free, under
+MIT OR Apache-2.0. That is a packaging property, and it is the honest one.
+
+**The engineering is unaffected.** Fan-out is still a real defect where it happens — Weaviate's own
+docs call hybrid *"two searches under-the-hood"* and over-fetch to 100 before trimming; LanceDB's
+scanner carries `"Cannot have both nearest and full text search"`. Selecting once is still right.
+It is simply also what Vespa does, so it is not a differentiator.
+
+So this part's honest positioning is **embeddability and licence**, not a novel query model. The
+one genuinely open discriminator found while checking — exact facet counts beside an active vector
+arm, which every system checked degrades — is neither built nor verified, and is therefore a
+roadmap row ([`p66`](bench/roadmap/p66-facet-under-vector.md)), not a boast.
 
 ### The rows
 
@@ -347,8 +364,9 @@ app, and the only ground in this space not already occupied.
 | **`p60` real corpus** — 17,311 scraped web images | Every number above, on data nobody curated for it | M | [`p60`](bench/roadmap/p60-image-corpus.md) → census first, then cost, dedup, recall, latency | **built and run** |
 | **`p61` content address** — SHA-256 dedup key and 1:1 transcode proof | "Compress to fewest bytes, still byte-exact" — reduced to one comparison | S | [`p61`](bench/roadmap/p61-content-address.md) → duplicate rate, byte accounting, round-trip proof | **shipped — 2,000/2,000 byte-exact** |
 | **`p62` image ABI** — the tier through the C ABI, v11 → v12 | An image tier only Rust can call forfeits the whole portability thesis | M | [`p62`](bench/roadmap/p62-image-abi.md) → Node + headless Chromium match Rust exactly; linear-memory high-water mark | **shipped** |
-| **`p63` video as shots** | "Frame-by-frame video search" — rejected as framing, kept as goal | L | [`p63`](bench/roadmap/p63-video-keyframe.md) → shot-sampled recall >= uniform 1 fps at far fewer frames | **built and run** — 27 real videos |
+| **`p63` video as shots** | "Frame-by-frame video search" — rejected as framing, kept as goal | L | [`p63`](bench/roadmap/p63-video-keyframe.md) → shot-sampled recall >= uniform 1 fps at far fewer frames | **built and run** — 27 real videos, acceptance 4 closed |
 | **`p64` face clustering primitive** | The vector arithmetic, and deliberately nothing else | S | [`p64`](bench/roadmap/p64-face-cluster.md) → false-MERGE rate reported separately from accuracy | **built** — no weights, by design |
+| **`p66` facet counts under a vector arm** | ~~The last candidate differentiator after `p59` was retracted~~ | — | [`p66`](bench/roadmap/p66-facet-under-vector.md) → its own acceptance 4 killed it the same day | **REJECTED** — plain SQL and Solr both have the property |
 | **`p65` field budget** | **Surfaced by `p60`, not planned.** An image document wants 7 columns; `MAX_FIELD` is 4, and an unscored facet column should not occupy a scoring slot at all | M | [`p65`](bench/roadmap/p65-field-budget.md) → zero bytes/document regression on presyo's 241,677 products | **shipped** — `IDXTEXT8`, seven columns restored |
 
 ### Measured, 2026-09-06 — the full 17,311-file corpus
