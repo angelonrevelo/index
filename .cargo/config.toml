@@ -1,0 +1,22 @@
+# Build flags that apply to WebAssembly only.
+#
+# `strip` is a `[profile]` key, and a profile applies to every target — so setting it in the root
+# `Cargo.toml` would also strip the native test and bench binaries, costing symbolised backtraces
+# on a failing `cargo test --workspace --release` for no size benefit (a native `.dll`/`.exe` does
+# not carry a wasm `name` section). Scoping it to the wasm triple keeps the native build
+# byte-for-byte unchanged.
+#
+# What it removes is the `name` custom section: 46,513 bytes of Rust symbol names that only a
+# profiler reads. Measured with `scripts/wasm-section.mjs`:
+#
+#   index_wasm.wasm       604,184 -> 557,441 raw   (216,877 -> 202,456 gzipped)
+#   index_geo_wasm.wasm    57,037 ->  48,992 raw   ( 22,494 ->  19,840 gzipped)
+#   index_accel.wasm        6,342 ->   5,946 raw   (  3,086 ->   2,802 gzipped)
+#
+# Not one of the 84 exports moves and not one answer changes: the section holds debug metadata, not
+# code. `js/demo.mjs` measures 45.4 us/query before and 45.1 us/query after.
+#
+# NOTE: a `RUSTFLAGS` environment variable REPLACES this list rather than appending to it, so the
+# `+simd128` build in `scripts/build-wasm.sh` still ships its name section.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "strip=symbols"]

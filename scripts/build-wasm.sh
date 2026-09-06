@@ -57,7 +57,7 @@ done
 cat <<'NOTE'
 
   index.wasm            search: build, query, typo-correct, facet, range, sort, clauses,
-                        paging, phrases, live segments, the IMAGE tier. C ABI v13, 69 symbols.
+                        paging, phrases, live segments, the IMAGE tier. C ABI v14, 81 idx_* symbols.
   index-geo.wasm        point-in-polygon over a cell index.
   index-accel.wasm      analytics kernels, baseline. What onegrid's ABI ships today.
   index-accel.simd.wasm same kernels with simd128: 9-16x on `bitmap_op`, unchanged elsewhere,

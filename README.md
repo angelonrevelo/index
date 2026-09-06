@@ -153,7 +153,7 @@ crates/
                 the browser, Node, edge workers, and native FFI (Go/Python/PHP/Ruby).
                 `include/index.h` is that ABI as a real C header; `host/python/` is a
                 second-language host proving it, in the standard library alone.
-  index-geo-wasm/  Same ABI, for index-geo. 86,903 bytes raw / 34,035 gzipped.
+  index-geo-wasm/  Same ABI, for index-geo. 77,065 bytes raw / 31,072 gzipped.
   index-accel/  onegrid's ratified AccelModule ABI, implemented: 7 analytics kernels
                 verified differentially by `accel-kernel` (2,400 trials, 0 wrong)
                 (sort/filter/group/aggregate/bitmap/topK) in 6.3 KB of no_std wasm.
@@ -327,39 +327,39 @@ $ node js/demo.mjs
 
   index-text in Node, through WASM — no wasm-bindgen, no native build
 
-    wasm module   604,184 bytes
+    wasm module   559,970 bytes
     index file    220,470 bytes
     documents     1,322
     terms         4,564
-    open + parse  23.1 ms
+    open + parse  20.3 ms
 
   querying for: "ABACAN, RAPHAEL"
 
     exact name     "ABACAN, RAPHAEL"
-                   -> "ABACAN, RAPHAEL" (bucket 0, 4.07 ms)
+                   -> "ABACAN, RAPHAEL" (bucket 0, 2.49 ms)
     PASS  exact name finds the right professor
 
     surname only   "ABACAN"
-                   -> "ABACAN, RAPHAEL" (bucket 0, 0.07 ms)
+                   -> "ABACAN, RAPHAEL" (bucket 0, 0.06 ms)
     PASS  surname only finds the right professor
 
     lowercase      "abacan, raphael"
-                   -> "ABACAN, RAPHAEL" (bucket 0, 0.07 ms)
+                   -> "ABACAN, RAPHAEL" (bucket 0, 0.05 ms)
     PASS  lowercase finds the right professor
 
     one deletion   "ABAAN, RAPHAEL"
-                   -> "ABACAN, RAPHAEL" (bucket 1, 2.11 ms)
+                   -> "ABACAN, RAPHAEL" (bucket 1, 3.10 ms)
     PASS  one deletion finds the right professor
 
     transposition  "ABCAAN, RAPHAEL"
-                   -> "ABACAN, RAPHAEL" (bucket 1, 0.28 ms)
+                   -> "ABACAN, RAPHAEL" (bucket 1, 0.33 ms)
     PASS  transposition finds the right professor
 
     typeahead      "ABACA" -> 5 hit(s)
     PASS  typeahead reaches the professor from a 5-char prefix
     PASS  a nonsense query returns nothing
 
-    500 real name queries: 27 us each, called from JS
+    500 real name queries: 38 us each, called from JS
     PASS  mean query under 5 ms from JavaScript
 
   OVERALL: PASS
