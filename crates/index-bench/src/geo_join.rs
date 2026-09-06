@@ -217,19 +217,22 @@ fn load_poi(path: &str) -> std::io::Result<Vec<(f64, f64)>> {
     Ok(out)
 }
 
-/// What a cell resolves to.
-#[derive(Clone)]
-enum Cell {
-    /// Wholly inside this province. No geometry test needed.
-    Interior(u16),
-    /// A ring passes through; only these provinces need testing.
-    Boundary(Vec<u16>),
-}
+/// Set on a cell's single candidate to mean *"interior — answer with this id, test nothing"*.
+///
+/// Folding the flag into the id, and narrowing the Hilbert key from `u64` to `u32` (a key at
+/// `order <= 16` needs at most 32 bits), is what makes the cell table **eight bytes per cell**
+/// against the thirteen the tagged-enum layout cost. The binary search is the cache-missing part of
+/// a lookup, so halving the array it walks is worth more than the bytes it saves — which is
+/// visible in the L=12 row, where the lookup was 44 ms of a 49 ms query.
+const INTERIOR_BIT: u32 = 1 << 31;
 
 struct CellIndex {
     order: u32,
-    /// Sorted by Hilbert key, so a point lookup is a binary search and a viewport is a range scan.
-    entry: Vec<(u64, Cell)>,
+    /// Sorted Hilbert keys, so a point lookup is a binary search and a viewport is a range scan.
+    key: Vec<u32>,
+    /// `cand[start[i]..start[i + 1]]` are cell `i`'s candidate provinces, ascending.
+    start: Vec<u32>,
+    cand: Vec<u32>,
     interior_count: usize,
     boundary_count: usize,
 }
@@ -248,27 +251,31 @@ impl CellIndex {
         Some((cx, cy))
     }
 
+    /// Slot of the cell holding the point, or `None` for out of bounds or an absent cell.
+    #[inline]
+    fn slot_of(&self, x: f64, y: f64) -> Option<usize> {
+        let (cx, cy) = self.cell_of(x, y)?;
+        let k = hilbert_2d(self.order, cx, cy) as u32;
+        let i = self.key.partition_point(|&e| e < k);
+        (i < self.key.len() && self.key[i] == k).then_some(i)
+    }
+
     /// Returns the province and the number of point-in-polygon tests it cost.
     fn locate(&self, x: f64, y: f64, prov: &[Province]) -> (Option<u16>, usize) {
-        let Some((cx, cy)) = self.cell_of(x, y) else { return (None, 0) };
-        let k = hilbert_2d(self.order, cx, cy);
-        let i = self.entry.partition_point(|e| e.0 < k);
-        if i >= self.entry.len() || self.entry[i].0 != k {
-            return (None, 0); // ocean — answered with no geometry at all
+        let Some(i) = self.slot_of(x, y) else { return (None, 0) };
+        let (s, e) = (self.start[i] as usize, self.start[i + 1] as usize);
+        let first = self.cand[s];
+        if first & INTERIOR_BIT != 0 {
+            return (Some((first & !INTERIOR_BIT) as u16), 0);
         }
-        match &self.entry[i].1 {
-            Cell::Interior(p) => (Some(*p), 0),
-            Cell::Boundary(list) => {
-                let mut tested = 0;
-                for &p in list {
-                    tested += 1;
-                    if point_in_province(x, y, &prov[p as usize]) {
-                        return (Some(p), tested);
-                    }
-                }
-                (None, tested)
+        let mut tested = 0;
+        for &p in &self.cand[s..e] {
+            tested += 1;
+            if point_in_province(x, y, &prov[p as usize]) {
+                return (Some(p as u16), tested);
             }
         }
+        (None, tested)
     }
 }
 
@@ -310,19 +317,42 @@ fn segment_cell(x0: f64, y0: f64, x1: f64, y1: f64, n: i64, out: &mut Vec<(u32, 
     }
 }
 
+/// One horizontal crossing of a ring with a grid row's centre line.
+struct Crossing {
+    row: u32,
+    x: f64,
+    ring: u32,
+}
+
+/// Build the cell index in **one row sweep** instead of three nested loops.
+///
+/// The version this replaced did the two classification rules as separate passes: for each
+/// province, test the centre of every cell in its box (`O(cell x ring_len)`); then, for each
+/// boundary cell, test every province (`O(boundary_cell x province)`). Instrumenting this bin
+/// showed those two to be **94 % of build time on the province set and 75 % on the municipal one**
+/// — 6,015 ms and 3,010 ms of a 6,425 ms / 4,030 ms build at L=12.
+///
+/// Both fall out of one sweep. Every ring edge is turned into the horizontal crossings it makes
+/// with the row centre lines, bucketed by row; a row is then swept left to right carrying a
+/// per-ring parity, so the set of provinces containing a cell centre is known in `O(1)` per cell —
+/// for every province at once, in ascending id, which is also the tie-break rule. Cost falls to the
+/// total edge-row span plus one visit per cell, and the two rules stop being separate passes that
+/// can disagree.
+///
+/// The crossing predicate and the x it solves for are written exactly as `point_in_ring` writes
+/// them, so the sweep and a direct point test cannot disagree about a tie. That the answers are
+/// unchanged is not an argument — it is asserted against the scan arm over all 53,715 POIs below.
 fn build(prov: &[Province], order: u32) -> CellIndex {
-    use std::collections::HashMap;
     let n = 1i64 << order;
     let nf = n as f64;
-    let to_cellf = |x: f64, y: f64| -> (f64, f64) {
-        (
-            (x - LON_MIN) / (LON_MAX - LON_MIN) * nf,
-            (y - LAT_MIN) / (LAT_MAX - LAT_MIN) * nf,
-        )
-    };
+    let (bw, bh) = (LON_MAX - LON_MIN, LAT_MAX - LAT_MIN);
+    let to_cellf =
+        |x: f64, y: f64| -> (f64, f64) { ((x - LON_MIN) / bw * nf, (y - LAT_MIN) / bh * nf) };
+    let row_y = |cy: u32| -> f64 { LAT_MIN + (cy as f64 + 0.5) / nf * bh };
+    let col_x = |cx: u32| -> f64 { LON_MIN + (cx as f64 + 0.5) / nf * bw };
 
     // 1. Boundary cells: every cell any ring segment passes through.
-    let mut boundary: HashMap<(u32, u32), Vec<u16>> = HashMap::new();
+    let mut raw: Vec<(u32, u32, u32)> = Vec::new(); // (row, column, province)
     let mut buf = Vec::new();
     for (pi, p) in prov.iter().enumerate() {
         for r in &p.ring {
@@ -332,84 +362,186 @@ fn build(prov: &[Province], order: u32) -> CellIndex {
                 let (bx, by) = to_cellf(b.0, b.1);
                 buf.clear();
                 segment_cell(ax, ay, bx, by, n, &mut buf);
-                for &c in &buf {
-                    let e = boundary.entry(c).or_default();
-                    if !e.contains(&(pi as u16)) {
-                        e.push(pi as u16);
+                for &(cx, cy) in &buf {
+                    raw.push((cy, cx, pi as u32));
+                }
+            }
+        }
+    }
+    raw.sort_unstable();
+    raw.dedup();
+
+    let mut bcell: Vec<(u32, u32, u32)> = Vec::new(); // (row, column, candidate start)
+    let mut bcand: Vec<u32> = Vec::with_capacity(raw.len());
+    for &(row, col, pid) in &raw {
+        if bcell.last().map(|c| (c.0, c.1)) != Some((row, col)) {
+            bcell.push((row, col, bcand.len() as u32));
+        }
+        bcand.push(pid);
+    }
+    drop(raw);
+    // Row directory into `bcell`, so the sweep finds a row's boundary cells without a hash map.
+    let mut brow: Vec<u32> = vec![0; n as usize + 1];
+    for c in &bcell {
+        brow[c.0 as usize + 1] += 1;
+    }
+    for i in 0..n as usize {
+        brow[i + 1] += brow[i];
+    }
+
+    // 2. Every crossing of a ring with a row's centre line, bucketed by row.
+    let mut ring_poly: Vec<u32> = Vec::new();
+    let mut ring_hole: Vec<bool> = Vec::new();
+    let mut cross: Vec<Crossing> = Vec::new();
+    for (pi, p) in prov.iter().enumerate() {
+        for r in &p.ring {
+            let gr = ring_poly.len() as u32;
+            ring_poly.push(pi as u32);
+            ring_hole.push(!r.outer);
+            let mut j = r.pt.len() - 1;
+            for i in 0..r.pt.len() {
+                let (xi, yi) = r.pt[i];
+                let (xj, yj) = r.pt[j];
+                j = i;
+                // Row centres sit at `LAT_MIN + (cy + 0.5) / n * bh`; inverting that bounds the
+                // rows this edge can reach, and the exact half-open test decides each one.
+                let flo = (yi.min(yj) - LAT_MIN) / bh * nf - 0.5;
+                let fhi = (yi.max(yj) - LAT_MIN) / bh * nf - 0.5;
+                let r0 = flo.floor().max(0.0) as i64;
+                let r1 = (fhi.ceil() as i64).min(n - 1);
+                for cy in r0..=r1 {
+                    let y = row_y(cy as u32);
+                    if (yi > y) == (yj > y) {
+                        continue;
+                    }
+                    cross.push(Crossing {
+                        row: cy as u32,
+                        x: (xj - xi) * (y - yi) / (yj - yi) + xi,
+                        ring: gr,
+                    });
+                }
+            }
+        }
+    }
+    cross.sort_unstable_by(|a, b| (a.row, a.x).partial_cmp(&(b.row, b.x)).unwrap());
+
+    // 3. Sweep each row. `active` holds, ascending, every province containing the cell centre the
+    //    sweep is standing on — which is both the interior answer and the centre augmentation a
+    //    boundary cell needs, computed once instead of twice.
+    //
+    //    The augmentation is not a theoretical nicety, it is a property of the real data and it
+    //    produced 28 wrong answers at L=8 before it was handled. Neighbouring provinces in maphy's
+    //    file were simplified independently, so their shared borders do not coincide: there are
+    //    slivers a few metres wide between them, and a cell can be crossed by province A's
+    //    coastline while lying inside province B whose own ring never enters the cell.
+    let mut parity = vec![false; ring_poly.len()];
+    let mut outer_odd = vec![0i32; prov.len()];
+    let mut hole_odd = vec![0i32; prov.len()];
+    let mut inside = vec![false; prov.len()];
+    let mut active: Vec<u32> = Vec::new();
+    let mut interior: Vec<(u32, u32, u32)> = Vec::new(); // (row, column, province)
+    let mut extra: Vec<Vec<u32>> = vec![Vec::new(); bcell.len()];
+    let mut at = 0usize;
+    while at < cross.len() {
+        let row = cross[at].row;
+        let mut end = at;
+        while end < cross.len() && cross[end].row == row {
+            end += 1;
+        }
+        let ev = &cross[at..end];
+        // Only cells whose centre lies between the first and last crossing can be inside anything:
+        // a closed ring crosses any line an even number of times, so parity is back to zero once
+        // the last crossing is passed.
+        let lo = ((ev[0].x - LON_MIN) / bw * nf - 0.5).floor().max(0.0) as i64;
+        let hi = (((ev[ev.len() - 1].x - LON_MIN) / bw * nf - 0.5).ceil() as i64).min(n - 1);
+        let mut k = 0usize;
+        let mut bi = brow[row as usize] as usize;
+        let brow_end = brow[row as usize + 1] as usize;
+        for cx in lo..=hi {
+            let mx = col_x(cx as u32);
+            while k < ev.len() && ev[k].x <= mx {
+                let gr = ev[k].ring as usize;
+                let p = ring_poly[gr] as usize;
+                parity[gr] = !parity[gr];
+                let step = if parity[gr] { 1 } else { -1 };
+                if ring_hole[gr] {
+                    hole_odd[p] += step;
+                } else {
+                    outer_odd[p] += step;
+                }
+                let now = outer_odd[p] > 0 && hole_odd[p] == 0;
+                if now != inside[p] {
+                    inside[p] = now;
+                    match active.binary_search(&(p as u32)) {
+                        Ok(idx) => {
+                            active.remove(idx);
+                        }
+                        Err(idx) => active.insert(idx, p as u32),
                     }
                 }
+                k += 1;
+            }
+            if active.is_empty() {
+                continue;
+            }
+            while bi < brow_end && bcell[bi].1 < cx as u32 {
+                bi += 1;
+            }
+            if bi < brow_end && bcell[bi].1 == cx as u32 {
+                extra[bi].extend_from_slice(&active);
+            } else {
+                interior.push((row, cx as u32, active[0]));
             }
         }
-    }
-
-    // 2. Interior cells: a cell with no boundary through it is uniformly inside or outside, so its
-    //    centre decides. Only cells within a province's bbox are worth testing.
-    let mut interior: HashMap<(u32, u32), u16> = HashMap::new();
-    for (pi, p) in prov.iter().enumerate() {
-        let (lx, ly) = to_cellf(p.bbox.x0, p.bbox.y0);
-        let (hx, hy) = to_cellf(p.bbox.x1, p.bbox.y1);
-        let (lx, ly) = (lx.floor().max(0.0) as i64, ly.floor().max(0.0) as i64);
-        let (hx, hy) = ((hx.ceil() as i64).min(n - 1), (hy.ceil() as i64).min(n - 1));
-        for cx in lx..=hx {
-            for cy in ly..=hy {
-                let c = (cx as u32, cy as u32);
-                if boundary.contains_key(&c) || interior.contains_key(&c) {
-                    continue;
-                }
-                let mx = LON_MIN + (cx as f64 + 0.5) / nf * (LON_MAX - LON_MIN);
-                let my = LAT_MIN + (cy as f64 + 0.5) / nf * (LAT_MAX - LAT_MIN);
-                if point_in_province(mx, my, p) {
-                    interior.insert(c, pi as u16);
-                }
-            }
+        // Reset only what this row touched.
+        for e in ev {
+            let gr = e.ring as usize;
+            parity[gr] = false;
+            let p = ring_poly[gr] as usize;
+            outer_odd[p] = 0;
+            hole_odd[p] = 0;
+            inside[p] = false;
         }
+        active.clear();
+        at = end;
     }
 
-    // 3. A boundary cell also needs every province whose INTERIOR covers it.
-    //
-    //    This is not a theoretical nicety, it is a property of the real data and it produced 28
-    //    wrong answers at L=8 before it was handled. Neighbouring provinces in maphy's file were
-    //    simplified independently, so their shared borders do not coincide: there are slivers and
-    //    gaps a few metres wide between them. A cell can therefore be crossed by province A's
-    //    coastline while lying inside province B, whose own ring never enters the cell. Treating
-    //    "boundary" and "interior" as mutually exclusive loses B, and the query returns ocean for a
-    //    point that is plainly on land.
-    //
-    //    The completed rule is exact. If any point of a cell lies inside P while the cell centre
-    //    does not, then P's boundary must cross the cell, so P is already in the list from step 1.
-    //    Adding the centre's containing province closes the remaining case, and the union is
-    //    therefore a superset of every province any point of the cell can fall in.
-    for (c, list) in boundary.iter_mut() {
-        let mx = LON_MIN + (c.0 as f64 + 0.5) / nf * (LON_MAX - LON_MIN);
-        let my = LAT_MIN + (c.1 as f64 + 0.5) / nf * (LAT_MAX - LAT_MIN);
-        for (pi, p) in prov.iter().enumerate() {
-            if !list.contains(&(pi as u16)) && point_in_province(mx, my, p) {
-                list.push(pi as u16);
-            }
+    // 4. Pack, ordered by Hilbert key. Candidate lists are ascending so that a point inside two
+    //    overlapping polygons resolves to the same one the scan arm picks — "first match" has to
+    //    mean the same thing in every arm or the comparison is between two different questions.
+    let (interior_count, boundary_count) = (interior.len(), bcell.len());
+    let mut slot: Vec<(u32, u32, bool)> = Vec::with_capacity(boundary_count + interior_count);
+    for (i, c) in bcell.iter().enumerate() {
+        slot.push((hilbert_2d(order, c.1, c.0) as u32, i as u32, false));
+    }
+    for (i, c) in interior.iter().enumerate() {
+        slot.push((hilbert_2d(order, c.1, c.0) as u32, i as u32, true));
+    }
+    slot.sort_unstable_by_key(|e| e.0);
+
+    let mut key = Vec::with_capacity(slot.len());
+    let mut start = Vec::with_capacity(slot.len() + 1);
+    let mut cand: Vec<u32> = Vec::with_capacity(bcand.len() + interior_count);
+    start.push(0u32);
+    for &(k, i, is_interior) in &slot {
+        if is_interior {
+            cand.push(interior[i as usize].2 | INTERIOR_BIT);
+        } else {
+            let i = i as usize;
+            let s = bcell[i].2 as usize;
+            let e = bcell.get(i + 1).map_or(bcand.len(), |c| c.2 as usize);
+            let mut list: Vec<u32> = bcand[s..e].to_vec();
+            list.extend_from_slice(&extra[i]);
+            list.sort_unstable();
+            list.dedup();
+            cand.extend_from_slice(&list);
         }
+        key.push(k);
+        start.push(cand.len() as u32);
     }
 
-    // Candidate lists are tested in ascending id order so that a point inside two overlapping
-    // polygons resolves to the same one the scan arm picks. Tile-clipped fragments genuinely do
-    // overlap, so "first match" has to mean the same thing in every arm or the comparison is
-    // between two different questions.
-    for list in boundary.values_mut() {
-        list.sort_unstable();
-    }
-
-    let interior_count = interior.len();
-    let boundary_count = boundary.len();
-    let mut entry: Vec<(u64, Cell)> = Vec::with_capacity(interior_count + boundary_count);
-    for (c, p) in interior {
-        entry.push((hilbert_2d(order, c.0, c.1), Cell::Interior(p)));
-    }
-    for (c, list) in boundary {
-        entry.push((hilbert_2d(order, c.0, c.1), Cell::Boundary(list)));
-    }
-    entry.sort_unstable_by_key(|e| e.0);
-    CellIndex { order, entry, interior_count, boundary_count }
+    CellIndex { order, key, start, cand, interior_count, boundary_count }
 }
-
 
 /// Segment crossing, three-valued.
 ///
@@ -781,14 +913,19 @@ fn main() {
                     .filter(|(_, p)| point_in_province(x, y, p)).map(|(k, _)| k).collect();
                 let idx2 = &idx;
                 let cell = idx2.cell_of(x, y);
-                let kind = cell.map(|c| {
-                    let k = hilbert_2d(order, c.0, c.1);
-                    let j = idx2.entry.partition_point(|e| e.0 < k);
-                    if j >= idx2.entry.len() || idx2.entry[j].0 != k { "absent".to_string() }
-                    else { match &idx2.entry[j].1 {
-                        Cell::Interior(p) => format!("interior({})", prov[*p as usize].name),
-                        Cell::Boundary(l) => format!("boundary({})", l.len()) } }
-                }).unwrap_or("oob".into());
+                let kind = match idx2.slot_of(x, y) {
+                    None if cell.is_none() => "oob".to_string(),
+                    None => "absent".to_string(),
+                    Some(j) => {
+                        let (s, e) = (idx2.start[j] as usize, idx2.start[j + 1] as usize);
+                        let first = idx2.cand[s];
+                        if first & INTERIOR_BIT != 0 {
+                            format!("interior({})", prov[(first & !INTERIOR_BIT) as usize].name)
+                        } else {
+                            format!("boundary({})", e - s)
+                        }
+                    }
+                };
                 eprintln!("MISMATCH L={order} poi={i} ({x},{y}) idx={:?} truth={:?} cell={:?} {kind} in_all={:?}",
                     a.map(|v| &prov[v as usize].name), b.map(|v| &prov[v as usize].name), cell, 
                     inall.iter().map(|k| &prov[*k].name).collect::<Vec<_>>());
@@ -800,16 +937,10 @@ fn main() {
             std::process::exit(1);
         }
 
-        // One (u64 key, u16 id) pair per cell, plus one u16 per boundary membership.
-        let member: usize = idx
-            .entry
-            .iter()
-            .map(|e| match &e.1 {
-                Cell::Interior(_) => 1,
-                Cell::Boundary(l) => l.len(),
-            })
-            .sum();
-        let bytes = idx.entry.len() * 10 + member * 2;
+        // One u32 key and one u32 candidate offset per cell, one trailing offset, one u32 per
+        // membership. The tagged-enum layout this replaced cost 13 bytes a cell plus a heap
+        // allocation for every boundary list.
+        let bytes = (idx.key.len() + idx.start.len() + idx.cand.len()) * 4;
         println!(
             "  {:<26} {:>9.0}ms {:>11.2}ms {:>14} {:>9.1}x   L={} cells={} (int {} / bnd {}) {:.0}KB",
             format!("cell index, L={order}"),
@@ -818,7 +949,7 @@ fn main() {
             tests,
             scan_ms / q_ms,
             order,
-            idx.entry.len(),
+            idx.key.len(),
             idx.interior_count,
             idx.boundary_count,
             bytes as f64 / 1024.0

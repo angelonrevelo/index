@@ -3,6 +3,13 @@
 **Tier:** T1 · **Bin:** `cargo run -p index-bench --release --bin geo-join`
 **Status: MEASURED, 2026-09-05. Answer: yes — 28.2× over the naive scan, 9.1× over a competent one.**
 
+> **The `build` column below is superseded by `bench/roadmap/p77-geo-tier.md` §3.** Profiling this
+> bin found the two classification passes to be 94 % of build time on the province set and 75 % on
+> the municipal one; replacing them with one row sweep made the build **up to 24.6× faster** while
+> producing a byte-identical index — same cell counts, same interior/boundary split, same `pip
+> tests`. The `query`, `tests` and `vs scan` columns stand. §2 of that file also records a NaN-vertex
+> bug in `index-geo` that made the index disagree with the scan.
+
 ## Why this one
 
 `p9-sfc-2d.md` closed "is a viewport a range scan over an ordered key?" for **points** and recorded

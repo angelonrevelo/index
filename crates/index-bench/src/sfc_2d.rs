@@ -216,6 +216,78 @@ fn cover(c: &Curve, x0: u32, y0: u32, x1: u32, y1: u32, budget: usize) -> Vec<(u
     merged
 }
 
+/// The same cover, but splitting the **worst** cell first instead of the last one pushed.
+///
+/// The LIFO version above stops on `out.len() + stack.len() >= budget`, and what is on the stack at
+/// that moment is an accident of the descent order — so the budget is spent on whichever cells
+/// happened to be there, not on the ones costing the most over-fetch. This arm spends it
+/// deliberately: keep a max-heap of straddling cells keyed by the area they cover *outside* the
+/// rectangle, and always split the worst offender. Same budget, same recall by construction, and
+/// the only question is whether the over-fetch column moves.
+///
+/// This is the "is the range query issuing more segments than it needs?" question, asked as an
+/// experiment rather than asserted. The answer is in `p9-sfc-2d.md`.
+fn cover_best_first(
+    c: &Curve,
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+    budget: usize,
+) -> Vec<(u64, u64)> {
+    use std::collections::BinaryHeap;
+    // (excess area outside the rectangle, level, cell x, cell y). `Reverse` is not needed: a
+    // BinaryHeap is a max-heap and the largest excess is exactly what should be split next.
+    let mut heap: BinaryHeap<(u64, u32, u32, u32)> = BinaryHeap::new();
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    let excess = |lvl: u32, cx: u32, cy: u32| -> u64 {
+        let below = ORDER - lvl;
+        let size = 1u64 << below;
+        let (ax0, ay0) = ((cx as u64) << below, (cy as u64) << below);
+        let (ax1, ay1) = (ax0 + size - 1, ay0 + size - 1);
+        let ox = (ax1.min(x1 as u64) + 1).saturating_sub(ax0.max(x0 as u64));
+        let oy = (ay1.min(y1 as u64) + 1).saturating_sub(ay0.max(y0 as u64));
+        size * size - ox * oy
+    };
+    let push = |heap: &mut BinaryHeap<(u64, u32, u32, u32)>,
+                out: &mut Vec<(u64, u64)>,
+                lvl: u32,
+                cx: u32,
+                cy: u32| {
+        let below = ORDER - lvl;
+        let size = 1u32 << below;
+        let (ax0, ay0) = (cx << below, cy << below);
+        let (ax1, ay1) = (ax0.saturating_add(size - 1), ay0.saturating_add(size - 1));
+        if ax1 < x0 || ax0 > x1 || ay1 < y0 || ay0 > y1 {
+            return; // disjoint
+        }
+        if (ax0 >= x0 && ax1 <= x1 && ay0 >= y0 && ay1 <= y1) || below == 0 {
+            out.push(cell_range(c, lvl, cx, cy)); // exact, never worth splitting
+            return;
+        }
+        heap.push((excess(lvl, cx, cy), lvl, cx, cy));
+    };
+    push(&mut heap, &mut out, 0, 0, 0);
+    while out.len() + heap.len() < budget {
+        let Some((_, lvl, cx, cy)) = heap.pop() else { break };
+        for (dx, dy) in [(0u32, 0u32), (1, 0), (0, 1), (1, 1)] {
+            push(&mut heap, &mut out, lvl + 1, cx * 2 + dx, cy * 2 + dy);
+        }
+    }
+    for (_, lvl, cx, cy) in heap {
+        out.push(cell_range(c, lvl, cx, cy));
+    }
+    out.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(out.len());
+    for r in out {
+        match merged.last_mut() {
+            Some(last) if r.0 <= last.1.saturating_add(1) => last.1 = last.1.max(r.1),
+            _ => merged.push(r),
+        }
+    }
+    merged
+}
+
 /// Load real coordinates from a `lon,lat,layer` CSV.
 ///
 /// The fixture in `bench/fixture/maphy-poi.csv` is extracted verbatim from maphy's own
@@ -345,8 +417,8 @@ fn main() {
     // curves are defined recursively by quadrant.
     println!("\n  --- viewport: a rectangle, answered by contiguous key ranges ---");
     println!(
-        "  {:<16} {:>9} {:>9} {:>8} {:>12} {:>10}",
-        "curve", "viewport", "recall", "ranges", "over-fetch", "us/query"
+        "  {:<16} {:<16} {:>9} {:>9} {:>8} {:>12} {:>10}",
+        "curve", "split order", "viewport", "recall", "ranges", "over-fetch", "us/query"
     );
     for c in &curve {
         let mut keyed: Vec<(u64, usize)> =
@@ -356,8 +428,10 @@ fn main() {
             }).collect();
         keyed.sort_unstable();
 
+        type Cover = fn(&Curve, u32, u32, u32, u32, usize) -> Vec<(u64, u64)>;
+        let arm: [(&str, Cover); 2] = [("descent (LIFO)", cover), ("best-first", cover_best_first)];
+        for (name, cover_fn) in arm {
         for &frac in &[0.01f64, 0.05] {
-            let _ = MAX_COVER_CELL;
             let wx = (LON_MAX - LON_MIN) * frac;
             let wy = (LAT_MAX - LAT_MIN) * frac;
             let mut recall_sum = 0.0;
@@ -386,7 +460,7 @@ fn main() {
                 let (gx1, gy1) = quantize(x1, y1);
 
                 let t0 = std::time::Instant::now();
-                let range = cover(c, gx0, gy0, gx1, gy1, MAX_COVER_CELL);
+                let range = cover_fn(c, gx0, gy0, gx1, gy1, MAX_COVER_CELL);
                 let mut got = 0usize;
                 for (a, b) in &range {
                     let lo = keyed.partition_point(|&(k, _)| k < *a);
@@ -404,8 +478,9 @@ fn main() {
                 recall_sum += got as f64 / truth.len() as f64;
             }
             println!(
-                "  {:<16} {:>8.0}% {:>8.1}% {:>8.0} {:>11.2}x {:>10.0}",
+                "  {:<16} {:<16} {:>8.0}% {:>8.1}% {:>8.0} {:>11.2}x {:>10.0}",
                 c.name,
+                name,
                 frac * 100.0,
                 100.0 * recall_sum / probes.max(1) as f64,
                 range_sum as f64 / probes.max(1) as f64,
@@ -413,12 +488,16 @@ fn main() {
                 nanos / probes.max(1) as f64 / 1000.0
             );
         }
+        }
     }
 
     // The cover budget is a real knob: fewer cells means fewer scans but coarser cells and more
     // over-fetch. Swept so the trade is a measured curve rather than one point chosen by taste.
     println!("\n  --- cover budget sweep (hilbert, 1% viewport) ---");
-    println!("  {:>8} {:>9} {:>8} {:>12}", "budget", "recall", "ranges", "over-fetch");
+    println!(
+        "  {:<16} {:>8} {:>9} {:>8} {:>12}",
+        "split order", "budget", "recall", "ranges", "over-fetch"
+    );
     {
         let c = &curve[1];
         let mut keyed: Vec<(u64, usize)> = point
@@ -433,6 +512,9 @@ fn main() {
         let frac = 0.01f64;
         let wx = (LON_MAX - LON_MIN) * frac;
         let wy = (LAT_MAX - LAT_MIN) * frac;
+        type Cover = fn(&Curve, u32, u32, u32, u32, usize) -> Vec<(u64, u64)>;
+        let arm: [(&str, Cover); 2] = [("descent (LIFO)", cover), ("best-first", cover_best_first)];
+        for (name, cover_fn) in arm {
         for &budget in BUDGET_SWEEP {
             let mut recall_sum = 0.0;
             let mut range_sum = 0usize;
@@ -453,7 +535,7 @@ fn main() {
                 truth_sum += truth;
                 let (gx0, gy0) = quantize(x0, y0);
                 let (gx1, gy1) = quantize(x1, y1);
-                let range = cover(c, gx0, gy0, gx1, gy1, budget);
+                let range = cover_fn(c, gx0, gy0, gx1, gy1, budget);
                 range_sum += range.len();
                 let mut got = 0usize;
                 for (a, b) in &range {
@@ -470,12 +552,14 @@ fn main() {
                 recall_sum += got as f64 / truth as f64;
             }
             println!(
-                "  {:>8} {:>8.1}% {:>8.0} {:>11.2}x",
+                "  {:<16} {:>8} {:>8.1}% {:>8.0} {:>11.2}x",
+                name,
                 budget,
                 100.0 * recall_sum / probes.max(1) as f64,
                 range_sum as f64 / probes.max(1) as f64,
                 fetched as f64 / truth_sum.max(1) as f64
             );
+        }
         }
     }
 

@@ -4,6 +4,14 @@
 **Status: MEASURED, 2026-09-05. Answer: yes, at 100 % recall.**
 **Re-run on REAL maphy coordinates the same day — the synthetic result held.**
 
+> **The over-fetch conclusion in this file is WRONG and is superseded by
+> `bench/roadmap/p77-geo-tier.md` §5.** Every "over-fetch" figure below was produced by a cover that
+> kept its pending cells on a stack and emitted whatever happened to be on it when the budget ran
+> out. Splitting the cell with the largest area outside the rectangle first takes the same 1 %
+> viewport from **16.5× to 1.14×** at 100 % recall with **fewer** ranges. The claim below that
+> "over-fetch is dominated by point clustering rather than by cover coarseness" is the sentence that
+> was wrong, and the recall and range-count columns are the ones that stand.
+
 ## Why this reopens a closed question
 
 `docs/roadmap-rejected.md` rejected "vectors as a physical ordered-key range scan", and it was right

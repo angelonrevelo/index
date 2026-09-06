@@ -153,7 +153,7 @@ crates/
                 the browser, Node, edge workers, and native FFI (Go/Python/PHP/Ruby).
                 `include/index.h` is that ABI as a real C header; `host/python/` is a
                 second-language host proving it, in the standard library alone.
-  index-geo-wasm/  Same ABI, for index-geo. 56,796 bytes raw / 22,334 gzipped.
+  index-geo-wasm/  Same ABI, for index-geo. 86,903 bytes raw / 34,035 gzipped.
   index-accel/  onegrid's ratified AccelModule ABI, implemented: 7 analytics kernels
                 verified differentially by `accel-kernel` (2,400 trials, 0 wrong)
                 (sort/filter/group/aggregate/bitmap/topK) in 6.3 KB of no_std wasm.

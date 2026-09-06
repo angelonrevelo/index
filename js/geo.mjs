@@ -15,7 +15,7 @@
 // the cost of crossing the JS↔WASM boundary is comparable to a single point location. Calling
 // `locate` in a loop measures the boundary, not the index.
 
-const ABI_VERSION = 1;
+const ABI_VERSION = 2;
 
 const u32 = (n) => n >>> 0;
 export const NONE = 0xffffffff;
