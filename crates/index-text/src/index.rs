@@ -26,6 +26,163 @@ use crate::analyze::{apply_alias, tokenize, AliasTable, Token};
 use crate::dict::TermDict;
 use std::collections::BTreeMap;
 
+/// Smallest amount of work — postings, documents or terms, whichever the caller is iterating —
+/// that justifies starting threads at all.
+///
+/// **Measured on this machine, not guessed.** `std::thread::scope` costs ~87 us per thread here
+/// (2 threads 175 us, 16 threads 922 us, best of twenty), and `build()` has six parallel regions,
+/// so a build that spawns unconditionally pays ~5 ms before it computes anything. The cheapest
+/// unit of work in those regions — one posting in the saturation pass — costs ~35 ns serially.
+///
+/// A region only reaches two threads at `2 * PARALLEL_MIN_WORK` units, where it can save at best
+/// half of `2 * 25_000 * 35 ns` = 1.75 ms against 175 us of startup: a 5x margin at the *trigger*,
+/// on the *cheapest* region, which is where a threshold has to be safe. Below it the serial loop
+/// runs, so the 60-document indexes the unit tests build - three orders of magnitude under the
+/// trigger on both documents and postings — never leave the calling thread.
+const PARALLEL_MIN_WORK: usize = 25_000;
+
+/// Chunks handed out per thread. More than one because the work per index is wildly uneven — one
+/// term can carry 400 000 postings while its neighbours carry three — so a static split by index
+/// leaves one thread finishing long after the rest. Chunks are claimed from a queue, which costs
+/// one uncontended lock per chunk and removes that tail.
+const PARALLEL_CHUNK_PER_THREAD: usize = 8;
+
+/// How many threads a region of `work` units should use: one below the threshold, and above it one
+/// thread per [`PARALLEL_MIN_WORK`] units, up to the machine's parallelism.
+///
+/// Returning 1 is the whole safety story for `wasm32`, where `available_parallelism` reports
+/// `Unsupported` and `thread::spawn` cannot run: a single-threaded plan never reaches a spawn.
+fn parallel_thread(work: usize) -> usize {
+    // Test-only: lets one test build the same corpus both ways and compare the bytes. Thread-local
+    // rather than global, so it cannot leak into another test running concurrently — the worker
+    // threads never read it, only the thread planning the region does.
+    #[cfg(test)]
+    if FORCE_SERIAL.with(std::cell::Cell::get) {
+        return 1;
+    }
+    if work < 2 * PARALLEL_MIN_WORK {
+        return 1;
+    }
+    let cpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    cpu.min(work / PARALLEL_MIN_WORK).max(1)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// See [`parallel_thread`].
+    static FORCE_SERIAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Evaluate `f` at every index in `0..n`, spreading the indices over threads when `work` says it
+/// is worth it, and return the results **in index order**.
+///
+/// The determinism the whole build depends on comes from the shape rather than from discipline:
+/// every output slot is written by exactly one `f(i)`, `f` reads only shared immutable state, and
+/// nothing is accumulated across slots. A parallel run therefore produces the identical `Vec` a
+/// serial one does, bit for bit, whatever order the chunks are claimed in.
+fn par_index_map<R, F>(n: usize, work: usize, f: F) -> Vec<R>
+where
+    R: Send + Default,
+    F: Fn(usize) -> R + Sync,
+{
+    let mut out: Vec<R> = Vec::new();
+    out.resize_with(n, R::default);
+    par_slice_mut(&mut out, work, |i, slot| *slot = f(i));
+    out
+}
+
+/// Apply `f` to every element of `out` **in place**, spreading the elements over threads when
+/// `work` says it is worth it. `f` receives the element's index and a mutable reference to it.
+///
+/// Same determinism argument as [`par_index_map`], and the same threshold: each element is visited
+/// exactly once by exactly one thread, `f` sees only that element and shared immutable state, so
+/// the result does not depend on how the chunks were claimed.
+fn par_slice_mut<T, F>(out: &mut [T], work: usize, f: F)
+where
+    T: Send,
+    F: Fn(usize, &mut T) + Sync,
+{
+    let n = out.len();
+    let thread = parallel_thread(work).min(n);
+    if thread <= 1 {
+        for (i, slot) in out.iter_mut().enumerate() {
+            f(i, slot);
+        }
+        return;
+    }
+    let chunk = n.div_ceil(thread * PARALLEL_CHUNK_PER_THREAD).max(1);
+    let queue: std::sync::Mutex<Vec<(usize, &mut [T])>> =
+        std::sync::Mutex::new(out.chunks_mut(chunk).enumerate().collect());
+    std::thread::scope(|scope| {
+        for _ in 0..thread {
+            let queue = &queue;
+            let f = &f;
+            scope.spawn(move || loop {
+                // `into_inner` on poison: `f` runs with the lock released, so a poisoned queue
+                // means another worker panicked and the chunks left in it are still sound to
+                // claim. The panic itself propagates out of `scope`.
+                let next = queue.lock().unwrap_or_else(|e| e.into_inner()).pop();
+                let Some((at, part)) = next else { return };
+                let base = at * chunk;
+                for (i, slot) in part.iter_mut().enumerate() {
+                    f(base + i, slot);
+                }
+            });
+        }
+    });
+}
+
+/// Everything `rebuild_meta` derives for one term, computed from that term's postings alone.
+///
+/// Grouped into one struct so the whole derivation is a single parallel pass per term rather than
+/// four, and so each pass reads the term's postings once instead of once per output.
+#[derive(Default)]
+struct TermMeta {
+    max_sat: f32,
+    block_last: Vec<u32>,
+    block_max: Vec<f32>,
+    champion: Vec<u32>,
+}
+
+/// One term's postings as the builder accumulates them: document ids and per-field frequencies in
+/// two parallel columns, in ascending document order.
+///
+/// # Why this is not a map
+///
+/// It was `BTreeMap<u32, [u16; MAX_FIELD]>` per term, and that inner map was **the single most
+/// expensive thing in the engine**: at a million documents it cost 13.2 s of a 24.3 s build — more
+/// than tokenizing, and more than everything `build()` does put together. Every new
+/// (term, document) pair allocated a node and walked a tree, fifteen million times over.
+///
+/// Documents are added in ascending id order and a term's postings are needed in exactly that
+/// order, so the map was sorting data that arrived sorted. Appending to a `Vec` — and bumping the
+/// last entry when the same document mentions the term again, in another field or at another
+/// position — produces the identical sequence with no per-posting allocation and no comparisons.
+#[derive(Default)]
+struct TermPost {
+    doc: Vec<Posting>,
+    tf: Vec<[u16; MAX_FIELD]>,
+}
+
+impl TermPost {
+    /// Record one occurrence of the term in `field` of `doc`. `doc` must be >= the last recorded.
+    #[inline]
+    fn hit(&mut self, doc: u32, field: usize) {
+        match self.doc.last() {
+            Some(p) if p.doc == doc => {
+                let tf = &mut self.tf[self.doc.len() - 1][field];
+                *tf = tf.saturating_add(1);
+            }
+            _ => {
+                self.doc.push(Posting { doc, sat: 0.0 });
+                let mut tf = [0u16; MAX_FIELD];
+                tf[field] = 1;
+                self.tf.push(tf);
+            }
+        }
+    }
+}
+
 /// Maximum number of **scored** fields. Four covers `{brand, title, category, description}`, the
 /// shape `docs/research/relevance.md` recommends, and keeps a posting one cache-friendly struct.
 ///
@@ -332,8 +489,10 @@ impl Doc {
 pub struct IndexBuilder {
     schema: Schema,
     alias: AliasTable,
-    /// term text -> doc -> per-field tf
-    term_post: BTreeMap<String, BTreeMap<u32, [u16; MAX_FIELD]>>,
+    /// term text -> that term's postings. A hash map, not a `BTreeMap`: the sorted term order the
+    /// dictionary needs is established once in [`IndexBuilder::build`], not maintained across the
+    /// fifteen million insertions a million-document corpus performs.
+    term_post: std::collections::HashMap<String, TermPost>,
     /// per-doc, per-field exact token count. `u16` on purpose — see the module docs.
     doc_len: Vec<[u16; MAX_FIELD]>,
     /// Per-document static prior, as supplied. Normalized at build time; see [`Index::prior_of`].
@@ -360,8 +519,10 @@ pub struct IndexBuilder {
     key_store: Vec<String>,
     /// Whether to record token positions. See [`IndexBuilder::with_position`].
     position_on: bool,
-    /// term text -> doc -> packed positions. Empty unless `position_on`.
-    term_pos: BTreeMap<String, BTreeMap<u32, Vec<u32>>>,
+    /// term text -> per document, that document's packed positions for the term, in ascending
+    /// document order — the same order and the same reasoning as `term_post`. Empty unless
+    /// `position_on`.
+    term_pos: std::collections::HashMap<String, Vec<(u32, Vec<u32>)>>,
 }
 
 impl IndexBuilder {
@@ -369,7 +530,7 @@ impl IndexBuilder {
         IndexBuilder {
             schema,
             alias: AliasTable::new(),
-            term_post: BTreeMap::new(),
+            term_post: std::collections::HashMap::new(),
             doc_len: Vec::new(),
             raw_prior: Vec::new(),
             first_text: Vec::new(),
@@ -382,7 +543,7 @@ impl IndexBuilder {
             key_field: None,
             key_store: Vec::new(),
             position_on: false,
-            term_pos: BTreeMap::new(),
+            term_pos: std::collections::HashMap::new(),
         }
     }
 
@@ -641,16 +802,14 @@ impl IndexBuilder {
                     // already `u16`, so a field that long is truncated everywhere else too, and a
                     // wrapped position would place a token at a phrase offset it does not occupy.
                     if let Ok(at) = u16::try_from(at) {
-                        self.term_pos
-                            .entry(t.text.clone())
-                            .or_default()
-                            .entry(id)
-                            .or_default()
-                            .push(pack_position(fi, at));
+                        let per_doc = self.term_pos.entry(t.text.clone()).or_default();
+                        match per_doc.last_mut() {
+                            Some((d, p)) if *d == id => p.push(pack_position(fi, at)),
+                            _ => per_doc.push((id, vec![pack_position(fi, at)])),
+                        }
                     }
                 }
-                let e = self.term_post.entry(t.text).or_default().entry(id).or_insert([0; MAX_FIELD]);
-                e[fi] = e[fi].saturating_add(1);
+                self.term_post.entry(t.text).or_default().hit(id, fi);
             }
         }
         self.doc_len.push(len);
@@ -772,40 +931,58 @@ impl IndexBuilder {
     }
 
     pub fn build(self) -> Result<Index, String> {
-        let term: Vec<String> = self.term_post.keys().cloned().collect();
+        // The term order every term id in the index refers to. Sorting once here replaces the
+        // ordering a `BTreeMap` used to maintain on every insertion, and produces the identical
+        // sequence: the keys are distinct, so `sort_unstable_by` over them is a total order.
+        let mut entry: Vec<(String, TermPost)> = self.term_post.into_iter().collect();
+        entry.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        // Moves only — the two posting columns were accumulated in their final layout, so what was
+        // a full re-materialization of every posting list is now a pointer per term.
+        let mut term: Vec<String> = Vec::with_capacity(entry.len());
+        let mut posting: Vec<Vec<Posting>> = Vec::with_capacity(entry.len());
+        let mut posting_tf: Vec<Vec<[u16; MAX_FIELD]>> = Vec::with_capacity(entry.len());
+        for (text, post) in entry {
+            term.push(text);
+            posting.push(post.doc);
+            posting_tf.push(post.tf);
+        }
         let dict = TermDict::build(&term)?;
 
         let doc_count = self.doc_len.len();
 
-        let mut posting: Vec<Vec<Posting>> = Vec::with_capacity(self.term_post.len());
-        let mut posting_tf: Vec<Vec<[u16; MAX_FIELD]>> = Vec::with_capacity(self.term_post.len());
         // Positions are flattened into ONE array indexed by global posting slot, rather than a
         // `Vec<Vec<u32>>` per term: at a million documents the per-posting `Vec` headers cost more
         // than the positions they point at, and the flat form serializes as two spans.
+        //
+        // Serial on purpose: the array is defined by the order it is appended in, so a threaded
+        // version would have to concatenate its parts in that same order anyway.
         let mut term_pos = self.term_pos;
         let mut position: Vec<u32> = Vec::new();
         let mut position_at: Vec<u64> = match self.position_on {
             true => vec![0],
             false => Vec::new(),
         };
-        for (text, per_doc) in self.term_post {
-            let mut pos_of = term_pos.remove(&text).unwrap_or_default();
-            let mut pl = Vec::with_capacity(per_doc.len());
-            let mut tl = Vec::with_capacity(per_doc.len());
-            for (doc, tf) in per_doc {
-                pl.push(Posting { doc, sat: 0.0 });
-                tl.push(tf);
-                if self.position_on {
+        if self.position_on {
+            for (text, list) in term.iter().zip(posting.iter()) {
+                let per_doc = term_pos.remove(text).unwrap_or_default();
+                // Both columns are in ascending document order, so one cursor aligns them. A
+                // document can be missing from `per_doc` while present in the postings: a token
+                // beyond `u16::MAX` is counted but has no recordable position.
+                let mut at = 0usize;
+                for p in list {
+                    let start = position.len();
+                    if per_doc.get(at).is_some_and(|(d, _)| *d == p.doc) {
+                        position.extend_from_slice(&per_doc[at].1);
+                        at += 1;
+                    }
                     // Ascending, so the phrase verifier can binary-search for `start + i`.
-                    let mut p = pos_of.remove(&doc).unwrap_or_default();
-                    p.sort_unstable();
-                    position.extend_from_slice(&p);
+                    position[start..].sort_unstable();
                     position_at.push(position.len() as u64);
                 }
             }
-            posting.push(pl);
-            posting_tf.push(tl);
         }
+        drop(term_pos);
 
         let mut avg_len = [1.0f32; MAX_FIELD];
         for fi in 0..self.schema.field_count() {
@@ -835,16 +1012,13 @@ impl IndexBuilder {
                 .collect();
             label.sort_unstable();
             label.dedup();
-            let id = self
-                .facet_store
-                .iter()
-                .map(|v| match v.get(slot) {
-                    Some(x) if !x.is_empty() => {
-                        label.binary_search(x).map(|i| i as u32).unwrap_or(u32::MAX)
-                    }
-                    _ => u32::MAX,
-                })
-                .collect();
+            let store = &self.facet_store;
+            let id = par_index_map(store.len(), store.len(), |d| match store[d].get(slot) {
+                Some(x) if !x.is_empty() => {
+                    label.binary_search(x).map(|i| i as u32).unwrap_or(u32::MAX)
+                }
+                _ => u32::MAX,
+            });
             facet_label.push(label);
             facet_id.push(id);
         }
@@ -853,12 +1027,10 @@ impl IndexBuilder {
         // Numeric columns, transposed to slot-major so a range scan walks one contiguous column.
         let mut numeric_value: Vec<Vec<f64>> = Vec::new();
         for slot in 0..self.numeric_field.len() {
-            numeric_value.push(
-                self.numeric_store
-                    .iter()
-                    .map(|v| v.get(slot).copied().unwrap_or(f64::NAN))
-                    .collect(),
-            );
+            let store = &self.numeric_store;
+            numeric_value.push(par_index_map(store.len(), store.len(), |d| {
+                store[d].get(slot).copied().unwrap_or(f64::NAN)
+            }));
         }
         let numeric_field = self.numeric_field;
 
@@ -878,14 +1050,17 @@ impl IndexBuilder {
             deleted_count: 0,
             first_term: {
                 // `term` is the sorted list the dictionary was built from, so a binary search over
-                // it gives the same ids the postings use.
-                self.first_text
-                    .iter()
-                    .map(|t| match t.is_empty() {
+                // it gives the same ids the postings use. One independent search per document, so
+                // it parallelizes exactly.
+                let first_text = &self.first_text;
+                par_index_map(first_text.len(), first_text.len(), |d| {
+                    match first_text[d].is_empty() {
                         true => u32::MAX,
-                        false => term.binary_search(t).map(|i| i as u32).unwrap_or(u32::MAX),
-                    })
-                    .collect()
+                        false => {
+                            term.binary_search(&first_text[d]).map(|i| i as u32).unwrap_or(u32::MAX)
+                        }
+                    }
+                })
             },
             facet_field,
             facet_label,
@@ -1796,80 +1971,87 @@ impl Index {
         //
         // `total_cmp` because `sort_by` requires a total order and `f64` does not provide one;
         // NaN cannot reach here (it is filtered above) but `total_cmp` is total regardless.
-        self.numeric_order = self
-            .numeric_value
-            .iter()
-            .map(|column| {
-                let mut order: Vec<u32> = (0..column.len() as u32)
-                    .filter(|&d| column[d as usize].is_finite())
-                    .collect();
-                order.sort_by(|&a, &b| column[a as usize].total_cmp(&column[b as usize]));
-                order
-            })
-            .collect();
+        // One column per thread: the columns are independent, and a corpus rarely declares enough
+        // of them for a finer split to be worth the machinery.
+        let value = &self.numeric_value;
+        let numeric_work = value.iter().map(Vec::len).sum::<usize>();
+        let numeric_order = par_index_map(value.len(), numeric_work, |slot| {
+            let column = &value[slot];
+            let mut order: Vec<u32> =
+                (0..column.len() as u32).filter(|&d| column[d as usize].is_finite()).collect();
+            order.sort_by(|&a, &b| column[a as usize].total_cmp(&column[b as usize]));
+            order
+        });
+        self.numeric_order = numeric_order;
 
         // Fill each posting's saturated contribution first; everything else derives from it.
-        let sat: Vec<Vec<f32>> = self
-            .posting
-            .iter()
-            .zip(self.posting_tf.iter())
-            .map(|(list, tfs)| {
-                list.iter()
-                    .zip(tfs.iter())
-                    .map(|(p, tf)| self.saturate(self.pseudo_tf(tf, p.doc)))
-                    .collect()
-            })
-            .collect();
-        for (list, s) in self.posting.iter_mut().zip(sat.iter()) {
-            for (p, v) in list.iter_mut().zip(s.iter()) {
-                p.sat = *v;
-            }
-        }
-
-        let mut max_sat = Vec::with_capacity(self.posting.len());
-        let mut block_last = Vec::with_capacity(self.posting.len());
-        let mut block_max = Vec::with_capacity(self.posting.len());
-        for list in &self.posting {
-            let mut term_max = 0.0f32;
-            let mut last = Vec::with_capacity(list.len().div_ceil(BLOCK));
-            let mut bmax = Vec::with_capacity(list.len().div_ceil(BLOCK));
-            for chunk in list.chunks(BLOCK) {
-                let mut m = 0.0f32;
-                for p in chunk {
-                    m = m.max(p.sat);
+        //
+        // `acc` — the total posting count — is the work estimate for every parallel region below:
+        // term count alone is a bad proxy, because a corpus can have few terms carrying enormous
+        // lists or a million terms carrying three postings each.
+        //
+        // The lists are moved out of `self` for the duration so the closure can hold `&self` for
+        // `pseudo_tf`, which needs `doc_len`, `avg_len`, `schema` and `posting_tf`.
+        let mut posting = std::mem::take(&mut self.posting);
+        {
+            let this = &*self;
+            par_slice_mut(&mut posting, acc as usize, |t, list| {
+                for (p, tf) in list.iter_mut().zip(this.posting_tf[t].iter()) {
+                    p.sat = this.saturate(this.pseudo_tf(tf, p.doc));
                 }
-                term_max = term_max.max(m);
-                last.push(chunk[chunk.len() - 1].doc);
-                bmax.push(m);
-            }
-            max_sat.push(term_max);
-            block_last.push(last);
-            block_max.push(bmax);
+            });
         }
-        self.max_sat = max_sat;
-        self.block_last = block_last;
-        self.block_max = block_max;
+        self.posting = posting;
 
-        self.champion = self
-            .posting
-            .iter()
-            .map(|list| {
-                if list.len() < CHAMPION_MIN_DF {
-                    return Vec::new();
+        // Block maxima, per-term maxima and champion lists in one pass: each depends only on its
+        // own term's postings, which is what makes the whole derivation embarrassingly parallel.
+        let meta: Vec<TermMeta> = {
+            let posting = &self.posting;
+            par_index_map(posting.len(), acc as usize, |t| {
+                let list = &posting[t];
+                let mut term_max = 0.0f32;
+                let mut last = Vec::with_capacity(list.len().div_ceil(BLOCK));
+                let mut bmax = Vec::with_capacity(list.len().div_ceil(BLOCK));
+                for chunk in list.chunks(BLOCK) {
+                    let mut m = 0.0f32;
+                    for p in chunk {
+                        m = m.max(p.sat);
+                    }
+                    term_max = term_max.max(m);
+                    last.push(chunk[chunk.len() - 1].doc);
+                    bmax.push(m);
                 }
-                let mut idx: Vec<u32> = (0..list.len() as u32).collect();
-                // Highest saturated contribution first; document id breaks ties so the build is
-                // deterministic.
-                idx.sort_unstable_by(|&a, &b| {
-                    list[b as usize]
-                        .sat
-                        .total_cmp(&list[a as usize].sat)
-                        .then(list[a as usize].doc.cmp(&list[b as usize].doc))
-                });
-                idx.truncate(CHAMPION_SIZE);
-                idx
+                let champion = match list.len() < CHAMPION_MIN_DF {
+                    true => Vec::new(),
+                    false => {
+                        let mut idx: Vec<u32> = (0..list.len() as u32).collect();
+                        // Highest saturated contribution first; document id breaks ties so the
+                        // build is deterministic.
+                        idx.sort_unstable_by(|&a, &b| {
+                            list[b as usize]
+                                .sat
+                                .total_cmp(&list[a as usize].sat)
+                                .then(list[a as usize].doc.cmp(&list[b as usize].doc))
+                        });
+                        idx.truncate(CHAMPION_SIZE);
+                        idx
+                    }
+                };
+                TermMeta { max_sat: term_max, block_last: last, block_max: bmax, champion }
             })
-            .collect();
+        };
+
+        // Moves only.
+        self.max_sat = Vec::with_capacity(meta.len());
+        self.block_last = Vec::with_capacity(meta.len());
+        self.block_max = Vec::with_capacity(meta.len());
+        self.champion = Vec::with_capacity(meta.len());
+        for m in meta {
+            self.max_sat.push(m.max_sat);
+            self.block_last.push(m.block_last);
+            self.block_max.push(m.block_max);
+            self.champion.push(m.champion);
+        }
     }
 
     /// Score one document against every query term by binary-searching each posting list.
@@ -3655,6 +3837,78 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A corpus big enough that `build()` crosses [`PARALLEL_MIN_WORK`] on its posting-side
+    /// regions, built from a deterministic recombination so the test is reproducible.
+    fn wide_corpus() -> Vec<[String; 3]> {
+        let word = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"];
+        (0..7_000)
+            .map(|i| {
+                let w = |k: usize| word[(i * 7 + k * 13) % word.len()];
+                [
+                    format!("{} {} {}", w(0), w(1), i % 97),
+                    format!("{} {} store {}", w(2), w(3), i % 31),
+                    format!("{} region", w(4)),
+                ]
+            })
+            .collect()
+    }
+
+    fn wide_index() -> Index {
+        let schema = Schema::new(vec![
+            Field::new("name", 3.0, 0.4),
+            Field::new("locality", 1.5, 0.5),
+            Field::new("region", 1.0, 0.6),
+        ]);
+        let mut b = IndexBuilder::new(schema);
+        for row in wide_corpus() {
+            b.add(&Doc::new([row[0].as_str(), row[1].as_str(), row[2].as_str()]));
+        }
+        b.build().unwrap()
+    }
+
+    /// **The constraint the threading exists under.** A build that uses every core must serialize
+    /// to the same bytes as one that uses a single core, or an index can no longer be
+    /// content-hashed and every consumer's cache key becomes a function of the build machine.
+    ///
+    /// Compared against a genuinely serial build of the same corpus, not against a second threaded
+    /// one: repeating the threaded build would only prove the chunk order does not matter.
+    #[test]
+    fn a_threaded_build_is_byte_identical_to_a_serial_one() {
+        let threaded = wide_index();
+        // The corpus has to actually reach the threshold, or this test passes by never threading.
+        assert!(
+            parallel_thread(threaded.posting.iter().map(Vec::len).sum::<usize>()) > 1,
+            "test corpus does not cross PARALLEL_MIN_WORK, so nothing was run in parallel"
+        );
+
+        FORCE_SERIAL.with(|f| f.set(true));
+        let serial = wide_index();
+        FORCE_SERIAL.with(|f| f.set(false));
+
+        assert_eq!(threaded.to_bytes(), serial.to_bytes());
+    }
+
+    /// The parallel helper returns exactly what the serial map returns, above and below the
+    /// threshold, and the threshold itself keeps a small index on one thread.
+    #[test]
+    fn the_parallel_map_agrees_with_the_serial_one() {
+        let n = 60_000;
+        let f = |i: usize| ((i % 977) as f32).sqrt() * 3.7;
+        let serial: Vec<f32> = (0..n).map(f).collect();
+
+        assert_eq!(par_index_map(n, 40 * PARALLEL_MIN_WORK, f), serial);
+        assert_eq!(par_index_map(n, 0, f), serial);
+        assert_eq!(par_index_map(0, 40 * PARALLEL_MIN_WORK, f), Vec::<f32>::new());
+
+        let mut in_place: Vec<f32> = vec![0.0; n];
+        par_slice_mut(&mut in_place, 40 * PARALLEL_MIN_WORK, |i, slot| *slot = f(i));
+        assert_eq!(in_place, serial);
+
+        assert_eq!(parallel_thread(0), 1);
+        assert_eq!(parallel_thread(2 * PARALLEL_MIN_WORK - 1), 1);
+        assert!(parallel_thread(2 * PARALLEL_MIN_WORK) >= 1);
+    }
 
     fn grocery() -> Index {
         let schema = Schema::new(vec![
