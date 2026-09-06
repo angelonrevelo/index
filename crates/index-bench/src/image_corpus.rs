@@ -111,7 +111,7 @@ const BYTE_RANGE_HI: f64 = 1.0e9;
 /// is icons, spacers and tracking pixels rather than pictures. The ceiling is above anything
 /// `MAX_PIXEL` admits, so it bounds the range without silently excluding a real image.
 ///
-/// These two exist because `p56` gave them a column. Under the old four-scored-field packing there
+/// These two exist because `p65` gave them a column. Under the old four-scored-field packing there
 /// was no numeric slot left for either, so "at least 200 px on a side" — the most ordinary image
 /// filter there is — was simply not expressible in this query set.
 const DIM_RANGE_LO: f64 = 200.0;
@@ -1053,7 +1053,7 @@ fn main() {
     // This corpus yields seven columns per image — path, format, shape, colour, width, height and
     // byte length — and for most of this benchmark's life only four of them could be declared,
     // because a facet or a numeric column had to be a SCORED field and `index_text::MAX_FIELD` is
-    // 4. That collision is what produced `p56`: unscored columns. `Schema::with_column` declares a
+    // 4. That collision is what produced `p65`: unscored columns. `Schema::with_column` declares a
     // value that can be faceted, ranged or keyed on without spending a scored-field slot, and
     // `format::tests::unscored_columns_cost_no_posting_byte` proves byte-for-byte that it costs
     // nothing per posting, because it is never tokenized.
@@ -1213,7 +1213,7 @@ fn main() {
         // Three numeric ranges — width, height, byte length — each wide enough to keep a page
         // fillable and narrow enough to be a real filter: together they drop the sub-200 px,
         // sub-2-KiB tracking pixels and spacer GIFs a scrape is full of. Width and height are
-        // ranged on AT ALL only because `p56` gave them numeric columns.
+        // ranged on AT ALL only because `p65` gave them numeric columns.
         let range = [
             (0usize, DIM_RANGE_LO, DIM_RANGE_HI),
             (1usize, DIM_RANGE_LO, DIM_RANGE_HI),
@@ -1288,7 +1288,7 @@ fn main() {
     println!("  + facet(colour, every 2nd) + range(width >= {DIM_RANGE_LO:.0}) + range(height >= {DIM_RANGE_LO:.0})");
     println!("  + range(byte >= {BYTE_RANGE_LO:.0}) + vector + dHash radius {}", hash::HASH64_NEAR_MAX);
     println!("  All SEVEN columns are now query surface: three facets and three numeric ranges over");
-    println!("  p56 unscored columns, on one scored text field. Width and height carry hard range");
+    println!("  p65 unscored columns, on one scored text field. Width and height carry hard range");
     println!("  predicates here — the capability the old four-scored-field packing could not express.");
     println!("  short pages: {short}   filter leaks: {leak}   hits with agreement 0: {mute}");
     for e in example.iter().take(EXAMPLE_MAX) {
@@ -1724,16 +1724,24 @@ fn main() {
     // What this run surfaced — findings the spec did not predict
     // =============================================================================================
     println!("\n=== WHAT THIS RUN SURFACED =============================================");
-    println!("  1. AN IMAGE DOCUMENT IS COLUMN-HUNGRIER THAN THE TEXT ENGINE'S BUDGET.");
+    println!("  1. AN IMAGE DOCUMENT WAS COLUMN-HUNGRIER THAN THE TEXT ENGINE'S BUDGET — FIXED.");
     println!("     This corpus yields seven columns per image — path, format, orientation, colour");
-    println!("     bucket, width, height, byte length — and `index_text::MAX_FIELD` is 4. Three of");
-    println!("     them could not be indexed at all: orientation kept only as text, and height and");
-    println!("     width have no numeric column, so neither can carry a hard range predicate.");
-    println!("     This is not a bench limitation to route around. `p59` claims one query plan over");
-    println!("     text, facet, numeric, vector and hash predicates; that claim is bounded by how");
-    println!("     many predicates fit. Raising MAX_FIELD is the WRONG fix — it is the width of");
-    println!("     `[u16; MAX_FIELD]` on every posting, so it taxes every text consumer to serve");
-    println!("     this one tier. A candidate roadmap row, recorded rather than papered over.");
+    println!("     bucket, width, height, byte length — and `index_text::MAX_FIELD` is 4. While a");
+    println!("     facet or a numeric column had to BE a scored field, three of the seven could not");
+    println!("     be indexed at all: orientation survived only as path text, and width and height");
+    println!("     had no numeric column, so neither could carry a hard range predicate. That was");
+    println!("     never a bench limitation to route around — the fused-query claim is one query");
+    println!("     plan over text, facet, numeric, vector and hash predicates, and it was bounded");
+    println!("     by how many predicates fit.");
+    println!("     This benchmark is what surfaced that collision, and the collision produced p65:");
+    println!("     UNSCORED COLUMNS. `Schema::with_column` declares a value that can be faceted,");
+    println!("     ranged or keyed on without spending a scored-field slot, and it costs zero bytes");
+    println!("     per posting because it is never tokenized.");
+    println!("     The fix worth naming is the one NOT taken. Widening `[u16; MAX_FIELD]` would put");
+    println!("     two more u16 on every posting of every existing text consumer to serve one image");
+    println!("     corpus. The engine instead stopped spending a SCORING slot on a value that");
+    println!("     nothing scores. MAX_FIELD is still 4; this run declares all seven columns,");
+    println!("     facets three of them and ranges the other three, width and height included.");
     println!();
     println!("  2. ON THIS CORPUS THE FILE EXTENSION DOES NOT LIE.");
     println!("     `meta::sniff` disagreed with the extension on {divergence} of {} files ({:.2}%).",

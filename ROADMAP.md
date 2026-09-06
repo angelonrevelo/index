@@ -342,14 +342,14 @@ app, and the only ground in this space not already occupied.
 | Item | What it closes | Effort | Benchmark | Status |
 |---|---|---|---|---|
 | **`p57` cheap tier** — perceptual hash, OKLab colour buckets, hostile-input EXIF | A first result before any model has run. <10 ms and <200 B per image, no GPU, no decoder dependency | M | [`p57`](bench/roadmap/p57-cheap-tier.md) → cost, threshold correctness, and the hash's LIMITS proven by test | **built** |
-| **`p58` vector column** — binary popcount prefilter → int8 rerank → exact | Semantic search without an ANN graph, which below ~1 M vectors costs build time, memory, recall and mutability and buys nothing | M | [`p58`](bench/roadmap/p58-vector-column.md) → recall vs the exact oracle, bytes/vector per tier | **built, recall WITHHELD** |
-| **`p59` fusion** — one query plan, one top-k | **The headline claim.** No short pages, no filter leaks, explicable results | L | [`p59`](bench/roadmap/p59-image-fusion.md) → zero short pages, zero leaks, agreement tie-break | **built** |
+| **`p58` vector column** — binary popcount prefilter → int8 rerank → exact | Semantic search without an ANN graph, which below ~1 M vectors costs build time, memory, recall and mutability and buys nothing | M | [`p58`](bench/roadmap/p58-vector-column.md) → recall vs the exact oracle, bytes/vector per tier | **shipped — recall@10 0.9870** |
+| **`p59` fusion** — one query plan, one top-k | **The headline claim.** No short pages, no filter leaks, explicable results | L | [`p59`](bench/roadmap/p59-image-fusion.md) → zero short pages, zero leaks, agreement tie-break | **shipped — acceptance 3 HOLDS** |
 | **`p60` real corpus** — 17,311 scraped web images | Every number above, on data nobody curated for it | M | [`p60`](bench/roadmap/p60-image-corpus.md) → census first, then cost, dedup, recall, latency | **built and run** |
-| **`p61` content address** — SHA-256 dedup key and 1:1 transcode proof | "Compress to fewest bytes, still byte-exact" — reduced to one comparison | S | [`p61`](bench/roadmap/p61-content-address.md) → duplicate rate, byte accounting, round-trip proof | **partial** — round-trip proof unexercised |
+| **`p61` content address** — SHA-256 dedup key and 1:1 transcode proof | "Compress to fewest bytes, still byte-exact" — reduced to one comparison | S | [`p61`](bench/roadmap/p61-content-address.md) → duplicate rate, byte accounting, round-trip proof | **shipped — 2,000/2,000 byte-exact** |
 | **`p62` image ABI** — the tier through the C ABI, v11 → v12 | An image tier only Rust can call forfeits the whole portability thesis | M | [`p62`](bench/roadmap/p62-image-abi.md) → Node + headless Chromium match Rust exactly; linear-memory high-water mark | **shipped** |
-| **`p63` video as shots** | "Frame-by-frame video search" — rejected as framing, kept as goal | L | [`p63`](bench/roadmap/p63-video-keyframe.md) → shot-sampled recall >= uniform 1 fps at far fewer frames | spec, T3 |
-| **`p64` face clustering primitive** | The vector arithmetic, and deliberately nothing else | S | [`p64`](bench/roadmap/p64-face-cluster.md) → false-MERGE rate reported separately from accuracy | spec, T3 |
-| **`p65` field budget** | **Surfaced by `p60`, not planned.** An image document wants 7 columns; `MAX_FIELD` is 4, and an unscored facet column should not occupy a scoring slot at all | M | [`p65`](bench/roadmap/p65-field-budget.md) → zero bytes/document regression on presyo's 241,677 products | spec |
+| **`p63` video as shots** | "Frame-by-frame video search" — rejected as framing, kept as goal | L | [`p63`](bench/roadmap/p63-video-keyframe.md) → shot-sampled recall >= uniform 1 fps at far fewer frames | **built and run** — 27 real videos |
+| **`p64` face clustering primitive** | The vector arithmetic, and deliberately nothing else | S | [`p64`](bench/roadmap/p64-face-cluster.md) → false-MERGE rate reported separately from accuracy | **built** — no weights, by design |
+| **`p65` field budget** | **Surfaced by `p60`, not planned.** An image document wants 7 columns; `MAX_FIELD` is 4, and an unscored facet column should not occupy a scoring slot at all | M | [`p65`](bench/roadmap/p65-field-budget.md) → zero bytes/document regression on presyo's 241,677 products | **shipped** — `IDXTEXT8`, seven columns restored |
 
 ### Measured, 2026-09-06 — the full 17,311-file corpus
 
@@ -369,7 +369,7 @@ app, and the only ground in this space not already occupied.
 | Fused correctness (`p59`) | **0 short pages, 0 filter leaks, 0 hits with zero agreement** over **100** fused queries at k=20 |
 | Latency, 12,007 docs | text **2 µs** p50 / 39 µs p99 · vector **192 µs** / 208 µs · **fused 623 µs** / 843 µs |
 | Index size | **2,938.8 B/image**, **14.96%** of the images' own bytes |
-| `p58` recall | **WITHHELD** — synthetic embeddings |
+| **`p58` recall, REAL embeddings** | **recall@10 = 0.9870** vs the exact oracle |
 
 **Correcting an earlier figure in this file.** A 1,500-file sample (every 11th file) measured the
 exact-duplicate rate at **9.00%**. The full corpus measures **29.82%**. Systematic sampling strides
@@ -404,6 +404,72 @@ extensions was **contradicted** — `meta::sniff` disagreed with the extension o
 this host serves what it stored and the scraper wrote the extension from the URL, so the two agree
 by construction. One Supabase-backed scrape is not the web; the sniff remains the right default, but
 this run produces no evidence for it and says so.
+
+### With a real encoder — every verdict now answered
+
+The runs above default to seeded vectors and **withhold** `p58`'s recall and `p59`'s acceptance 3
+rather than score noise. A real encoder has now run, so nothing is withheld:
+
+```sh
+cargo run --release -p index-bench --bin image-corpus -- --emit-manifest manifest.tsv
+python scripts/embed-corpus.py manifest.tsv embedding.bin   # CLIP ViT-B/32, 512-d
+cargo run --release -p index-bench --bin image-corpus -- --embedding embedding.bin
+```
+
+**12,007 real CLIP ViT-B/32 embeddings in 133 s — 90 img/s on an RTX 2060 SUPER**, end to end
+including decode from disk, zero placeholders. That figure also fills a gap: §8 records **no**
+trustworthy published CLIP throughput number, and extrapolating it puts `rclip`'s 1.28 M-image
+corpus at ~4 hours against its measured 3 hours on an M1 Max — a reassuring cross-check on both.
+
+| | |
+|---|---|
+| **`p58` recall@10 vs the exact oracle** | **0.9870** |
+| **`p59` acceptance 3**, non-degenerate labels | fused **0.2932** > vector **0.2910** > text **0.0203** — **HOLDS** |
+| Fused p50, real vs synthetic vectors | **1,467 µs vs 623 µs — 2.4x higher** |
+| Check list | **8 / 8 PASS, nothing withheld** |
+
+**The recall number is the one worth keeping.** §4 recorded image-embedding recall as `UNVERIFIED` —
+every published binary-quantisation figure is for *text*. 0.9870 lands inside Qdrant's 0.98–0.9966
+text band, so the published result does transfer; it is now measured here rather than borrowed from
+another modality.
+
+**Acceptance 3 needed a second instrument, and saying why matters more than the number.** The first
+labelled set was built from exact-duplicate groups and turned out to be **degenerate**: identical
+bytes give identical embeddings, so the vector arm scores nDCG **1.0000 by construction** and
+nothing can exceed it. Reporting that as a failure of fusion would have been as dishonest as tuning
+until it passed. The set that votes is **near-duplicates with exact duplicates removed** — the pixels
+differ so the vector arm is imperfect, the paths differ so the text arm is independent, and the
+label comes from a perceptual hash, which is neither arm's own function.
+
+**And the margin is thin, which is part of the result.** Fusion beats the vector arm by **+0.0021
+nDCG, ~0.7 % relative, over 100 queries.** That satisfies the criterion and has the right sign, but
+it is not a decisive win, and the same table shows why: the text arm scores **0.0203**, because a
+CDN URL path is a poor caption. On a corpus with real captions the fusion gain should be far larger
+— and that, not a bigger number squeezed out of this corpus, is what would settle the question.
+
+**Real embeddings also cost more than synthetic ones**, which is an argument for the discipline
+rather than a footnote: fused p50 went from 623 µs to **1,467 µs**. Real image embeddings over a
+42.69 %-duplicate corpus cluster densely, so the Hamming shortlist carries far more ties into the
+rerank. A benchmark that had quietly accepted synthetic vectors would have understated its own cost
+by more than double.
+
+### The lossless-transcode claim, tested rather than cited
+
+`p61` acceptance 4 is closed with a real `cjxl`/`djxl` 0.12.0 round-trip over the corpus:
+**2,000 / 2,000 JPEG restored BYTE-EXACT**, verified by SHA-256 against the original. Both of §5's
+published claims then **failed to reproduce here**, and the third one held:
+
+| §5 claim | Measured on this corpus |
+|---|---|
+| JPEG XL lossless saves **13–22%** | **6.65%** — does NOT reproduce |
+| **~1%** of real JPEG cannot be reconstructed | **0.00%** over 2,000 files — does NOT reproduce |
+| A generic compressor wins **1–3%** on entropy-coded JPEG | **1.06%** (zlib control) — **reproduces** |
+
+The explanation is the corpus, not the codec: these are small, already-optimised CDN assets from one
+pipeline, while ~20% is measured on photographic JPEGs and the ~1% refusal rate comes from unusual
+trailing bytes a clean pipeline never emits. **The consequence sharpens this part's own conclusion**
+— at 6.65% the transcode is worth *less* here than advertised, while dedup measured **29.82%**, so
+the content address is not merely the cheaper win but roughly **4.5x the bigger one.**
 
 ### The tier through the C ABI, measured
 

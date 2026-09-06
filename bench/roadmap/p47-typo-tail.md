@@ -2,7 +2,7 @@
 
 **Tier:** T1 · **Bins:** `scale`, `pool-audit`, `presyo-catalog` · **API:** unchanged
 **Status: SHIPPED, 2026-09-06. No format change, no ABI change. 134 tests.
-The 5 ms bar is MET on every real corpus and still RED at 1 M recombined.**
+The verdict line below was corrected by `p55` — see the box in "Where the bar actually stands".**
 
 `p29` left this item explained rather than closed:
 
@@ -119,6 +119,13 @@ genuinely requires visiting, and no tightening of an existing bound reaches it.
 | DepEd schools, real | 61,467 | **1.81 ms** | **PASS** |
 | DepEd, recombined | 250,000 | 6.16 ms | FAIL |
 | DepEd, recombined | 1,000,000 | 13.58 ms | FAIL |
+
+> **CORRECTED by `p55`.** The claim below was true when written and is no longer the right way to
+> say it: the largest real corpus available at the time was 241,677 documents. `p51` found a real
+> 4.5 M-row table, and at a **real** million the bar fails at 8.1–8.8 ms. Recombination overstated
+> the tail by ~1.6x but did not invent the failure. The separation drawn here is between corpus
+> SIZES, and it was mistaken for a separation between real and synthetic data.
+> See `bench/roadmap/p55-real-million.md`.
 
 **On every corpus of real documents this project has, the bar is met.** It fails only above the real
 data, where `scale` recombines 41,069 real terms across up to sixteen times as many documents — and

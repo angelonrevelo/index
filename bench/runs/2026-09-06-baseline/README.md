@@ -45,9 +45,49 @@ read out of it. The tables are printed at every threshold anyway, because
 [`docs/research/image.md`](../../../docs/research/image.md) §5's point — that the method chooses the
 answer — is what they exist to show.
 
+## `image-corpus-real-embedding.log` — the run with a real encoder
+
+The same benchmark, driven by **12,007 real CLIP ViT-B/32 embeddings** rather than seeded noise.
+This is the authoritative run: **all eight checks PASS, nothing withheld.**
+
+    cargo run --release -p index-bench --bin image-corpus -- --emit-manifest manifest.tsv
+    python scripts/embed-corpus.py manifest.tsv embedding.bin   # 133 s, 90 img/s, RTX 2060 SUPER
+    cargo run --release -p index-bench --bin image-corpus -- --embedding embedding.bin
+
+What it adds over the synthetic run:
+
+- **`p58` recall@10 = 0.9870** — the binary-prefilter pipeline against the exact oracle, on IMAGE
+  embeddings. `docs/research/image.md` §4 had this as `UNVERIFIED`; every published
+  binary-quantisation recall figure is for *text*.
+- **`p59` acceptance 3 HOLDS**: fused nDCG@10 **0.2932** > vector-only **0.2910** > text-only
+  **0.0203**, on the non-degenerate near-duplicate labelled set.
+- Latency roughly **2.4x higher** than the synthetic run (fused p50 1,467 µs vs 623 µs). Real
+  embeddings over a 42.69 %-duplicate corpus cluster densely, so the Hamming shortlist carries far
+  more ties into the rerank. A benchmark that had quietly used synthetic vectors would have
+  understated its own cost by more than double.
+
+**Read the acceptance-3 margin honestly.** Fusion beats the vector arm by **+0.0021 nDCG — about
+0.7 % relative, over 100 queries.** It satisfies the letter of the acceptance criterion and it is
+the right sign, but it is far too thin to call a decisive win. The reason is visible in the same
+table: the text arm scores 0.0203, because a CDN URL path is a poor caption. On a corpus with real
+captions or alt text the fusion gain should be much larger — and that, not a bigger number here, is
+what would actually settle the question.
+
+## Why there are two labelled sets
+
+The first one built was **exact-duplicate groups**, and it turned out to be degenerate: byte-identical
+files give byte-identical pixels, hence identical embeddings, hence a vector arm at nDCG 1.0000 *by
+construction*. Nothing can exceed a perfect oracle, so that set cannot adjudicate "fused > vector"
+at all. It is still printed, as a `[note]`, because the shape is informative — but it does not vote.
+
+The set that votes is **near-duplicates with exact duplicates removed** (dHash <= 4, sha256 differs):
+the pixels genuinely differ so the vector arm is strong but imperfect, the paths differ so the text
+arm is independent, and the label comes from a perceptual hash — neither arm's own function — so it
+hands neither a free win.
+
 ## The withheld verdict is not a pass
 
-`p58`'s recall check prints `[HELD]`. This repo ships no embedding model, so the run's default
+Without `--embedding`, `p58`'s recall check prints `[HELD]`. This repo ships no embedding model, so the run's default
 vectors are seeded noise and a recall figure over them would measure the arithmetic rather than the
 retrieval. Re-run with `--embedding <path>` (header `u32 count`, `u32 dim`, then f32 little-endian)
 to get a real verdict. Until then §4's `UNVERIFIED` stands.

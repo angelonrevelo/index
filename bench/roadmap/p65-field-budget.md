@@ -1,7 +1,7 @@
 # P56 — an image document is column-hungrier than the engine allows
 
 **Tier:** T2 · **Bin:** `image-corpus` · **API:** `Schema`, `MAX_FIELD`
-**Status: SHIPPED (engine half), 2026-09-06. Format `IDXTEXT7` -> `IDXTEXT8`. No ABI change.
+**Status: SHIPPED, 2026-09-06. Format `IDXTEXT7` -> `IDXTEXT8`. No ABI change.
 `index-text` 106 -> 112 tests; workspace 261 -> 267, 0 failing.**
 
 `Schema::with_column(name)` declares an **unscored column**. Facet, numeric and key declarations now
@@ -18,8 +18,13 @@ decimal, same 19793 brands / 146 categories, same index growth (`+4240433 B`, 17
 wrong across every correctness check. Only wall-clock latency moved, and the machine was running
 other benchmarks concurrently.
 
-**Acceptance item 3 is NOT done here** — restoring `p60`'s schema to its natural seven columns is a
-change to `crates/index-image` and `crates/index-bench`, which this lane does not own. The engine
+**Acceptance item 3 is now DONE.** `p60`'s schema has been restored to its natural **seven columns**
+— `path` as the single scored text field, plus `format`, `shape` and `colour` faceted and `width`,
+`height` and `byte` ranged, all as unscored columns. The full corpus run reports
+`range(width >= 200)` and `range(height >= 200)` as hard predicates in its fused query set, which is
+the concrete capability the four-field packing had cost, and the run is **8 / 8 PASS**.
+
+The original text of this item is kept below because the reasoning is the point: The engine
 support the row asked for is in place and exercised by
 `index::tests::a_seven_column_schema_fits_in_four_scored_fields`, which builds exactly that
 one-scored-field / six-unscored-column image schema and facets and ranges over it.

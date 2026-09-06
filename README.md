@@ -457,7 +457,8 @@ production corpora. **`index-core` remains dependency-free.**
   `productSearchToken('Coca-Cola 1.5L') === ['coca','cola','1.5l']`; the analyzer produces `1500ml`,
   because canonicalizing the unit is what makes `1.5L`/`1500ml`/`1.5 liters` one token — worth
   **+4.6 pp recall** by presyo's own measurement. Matching it verbatim would be a regression.
-- **The tail at 1 M is characterized, not fixed** — 13.6 ms typo p99 against a 5 ms bar. Three
+- **The tail at 1 M is characterized, not fixed** — 8.1–8.8 ms typo p99 on a REAL million-row
+  corpus against a 5 ms bar (13.6 ms on the recombined one, which overstates it ~1.6x). Three
   independent attacks have now each moved it under 10 %: better seeding (`p27`), capping expansion
   (`p29`), and tightening the pruning bounds (`p47`). It is the cost of enumerating documents the
   bucket-first ranking rule genuinely requires visiting. **The bar is met on every corpus of real

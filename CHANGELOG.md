@@ -86,10 +86,32 @@ Baseline committed under [`bench/runs/2026-09-06-baseline/`](bench/runs/2026-09-
   over a graph deliberately.
 - Index is **2,938.8 B/image**, 14.96% of the bytes it indexes.
 
-**The `p58` recall verdict is withheld, not passed.** The benchmark ships no encoder, so its default
-vectors are seeded noise; it prints `[HELD]` and states that a recall figure over synthetic vectors
-would measure the arithmetic rather than the retrieval. That number stays `UNVERIFIED` until a real
-encoder runs against this corpus.
+**Then a real encoder ran, and nothing is withheld.** `scripts/embed-corpus.py` produced **12,007
+real CLIP ViT-B/32 embeddings in 133 s — 90 img/s on an RTX 2060 SUPER** — and the benchmark went to
+**8 / 8 PASS**:
+
+- **`p58` recall@10 = 0.9870** against the exact oracle. `docs/research/image.md` §4 had image-
+  embedding recall as `UNVERIFIED`: every published binary-quantisation figure is for *text*. This
+  is now measured rather than borrowed from another modality, and it lands inside Qdrant's
+  0.98–0.9966 text band.
+- **`p59` acceptance 3 HOLDS** — fused nDCG@10 **0.2932** > vector-only **0.2910** > text-only
+  **0.0203**. It needed a second labelled set to be measurable at all: the obvious one, built from
+  exact-duplicate groups, is **degenerate**, because identical bytes give identical embeddings and
+  the vector arm scores 1.0000 by construction. The set that votes is near-duplicates with exact
+  duplicates removed. **The margin is thin — +0.0021, ~0.7 % relative over 100 queries** — which is
+  reported as thin rather than dressed up; the text arm is weak here because a CDN URL path is a
+  poor caption.
+- Real embeddings cost **2.4x** the synthetic ones (fused p50 1,467 µs vs 623 µs), because a
+  42.69 %-duplicate corpus clusters densely and the Hamming shortlist carries more ties into the
+  rerank. A benchmark that had quietly used synthetic vectors would have understated its own cost by
+  more than double.
+
+**`p61` acceptance 4 closed with a real transcode**: `cjxl`/`djxl` 0.12.0, **2,000 / 2,000 JPEG
+restored byte-exact** by SHA-256. Both published claims then failed to reproduce on this corpus —
+JPEG XL saved **6.65%** against a claimed 13–22%, and **0.00%** of files were refused against a
+claimed ~1% — while the generic-compressor control reproduced at **1.06%**. At 6.65% the transcode
+is worth less than advertised and dedup measured 29.82%, so the content address is roughly **4.5x**
+the bigger win.
 
 **A correction worth recording: the dedup rate cannot be sampled.** A 1,500-file systematic sample
 put exact duplicates at 9.00%; the full corpus measures 29.82%. Striding across a corpus strides

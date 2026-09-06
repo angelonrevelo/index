@@ -7,7 +7,7 @@ from a high-level language costs a `ctypes` binding and no build step, no server
 cgo, Java FFM, C#, Ruby or PHP.
 
 That count is checkable rather than decorative: `grep -c '#\[no_mangle\]' crates/index-wasm/src/lib.rs`
-is 61 at ABI 12, the twelve `idx_image_*` symbols included, and `idx_abi_version()` is asserted below.
+is 61 at ABI 13, the twelve `idx_image_*` symbols included, and `idx_abi_version()` is asserted below.
 
 The image tier is exercised here for a specific reason. An embedding crosses as a packed
 little-endian `f32` buffer, never as JSON -- and this file builds that buffer with `struct.pack`

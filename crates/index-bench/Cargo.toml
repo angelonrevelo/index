@@ -141,3 +141,7 @@ path = "src/image_corpus.rs"
 [[bin]]
 name = "video-shot"
 path = "src/video_shot.rs"
+
+[[bin]]
+name = "real-million"
+path = "src/real_million.rs"

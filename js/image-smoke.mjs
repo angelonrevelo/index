@@ -63,7 +63,7 @@ const want = [
   'idx_image_free',
 ];
 check(want.every((k) => k in e), `all ${want.length} idx_image_* symbols are exported`);
-check(e.idx_abi_version() === 12, 'ABI version is 12');
+check(e.idx_abi_version() === 13, 'ABI version is 13');
 
 // No wasm-bindgen, asserted rather than assumed: its shims appear as imports, and this module
 // declares none at all. If the row ever grows a bindgen dependency, this line fails first.

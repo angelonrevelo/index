@@ -1,0 +1,270 @@
+p60-image-corpus :: the image tier on a real scrape of 17,311 web files
+clock backend: rdtsc
+
+corpus: C:\Users\maran\Code\alec\expressway_dump
+  17311 files on disk
+  ... 2000/17311 ingested
+  ... 4000/17311 ingested
+  ... 6000/17311 ingested
+  ... 8000/17311 ingested
+  ... 10000/17311 ingested
+  ... 12000/17311 ingested
+  ... 14000/17311 ingested
+  ... 16000/17311 ingested
+
+=== 1. CORPUS CENSUS ===================================================
+  17311 files read, 0 unreadable, 2838433090 bytes total (2838.4 MB)
+
+  --- format, by meta::sniff (magic bytes, not extension) ---
+    jpeg         11289   65.2%
+    unknown       5304   30.6%
+    webp           654    3.8%
+    png             64    0.4%
+
+  --- extension, for comparison (the extension is a CLAIM, not evidence) ---
+    jpg          11289
+    html          5163
+    webp           654
+    js              72
+    png             61
+    xml             37
+    csv             12
+    woff2            5
+
+  extension DISAGREES with sniffed format on 0 of 17311 files (0.00%)
+
+  --- dimension (12007 files with known dimensions) ---
+  megapixel
+            0 MP .. 0.050 MP        3874   32.3%
+        0.050 MP .. 0.25 MP         6523   54.3%
+         0.25 MP .. 1.00 MP          906    7.5%
+         1.00 MP .. 4.00 MP          704    5.9%
+         4.00 MP .. 12 MP              0    0.0%
+           12 MP .. inf                0    0.0%
+    p50 0.17 MP   p90 0.46 MP   p99 1.57 MP   max 2.70 MP
+  width
+            0 px .. 200 px          3199   26.6%
+          200 px .. 640 px          7143   59.5%
+          640 px .. 1280 px          964    8.0%
+         1280 px .. 1920 px          660    5.5%
+         1920 px .. 4000 px           41    0.3%
+         4000 px .. inf                0    0.0%
+    p50 500 px   p90 828 px   p99 1536 px   max 2160 px
+
+  byte size
+           0 KiB .. 4.00 KiB        3255   18.8%
+        4.00 KiB .. 32 KiB          6791   39.2%
+          32 KiB .. 128 KiB         2054   11.9%
+         128 KiB .. 512 KiB         5010   28.9%
+         512 KiB .. 2048 KiB         184    1.1%
+        2048 KiB .. inf               17    0.1%
+    p50 27 KiB   p90 395 KiB   p99 526 KiB   max 231780 KiB
+
+  --- EXIF presence (the test of docs/research/image.md §7) ---
+    12007 files sniff as a real image container
+    6 carry an EXIF/APP1 block (0.05%)
+    0 parse to NON-EMPTY EXIF (0.00%)
+    0 carry GPS, 0 carry a camera model
+    -> §7 predicts scraped/CDN assets are stripped. Measured stripping rate 100.00%: CONFIRMS §7
+
+  --- what this corpus is NOT ---
+    Scraped CDN assets. No faces, no personal photography, and (per the rate above)
+    essentially no camera metadata. It is the right shape for the OSINT question and
+    the wrong shape for the personal-photo question. Corpus ceiling 17311 files —
+    below the 20-30 k the product question asks about and far below the 100 k+ where
+    incumbents' measured failures appear. Nothing above this count is claimed.
+
+  --- ingest robustness (p57 check 5) ---
+    0 unreadable, 0 refused as over 64000000 px, 0 sniffed-as-image but failed to decode
+    0 panics
+
+=== 2. CHEAP-TIER COST (p57) ===========================================
+  12007 images decoded and fully signalled
+                                                p50        p99
+  cheap tier (luma+dHash+pHash+palette+EXIF)    2.677ms   15.866ms
+    + PDQ-shaped 256-bit (not in p57 budget)    0.864ms    3.142ms
+  third-party decode (the HOST's cost)      1.316ms   41.557ms
+
+  stored bytes/image (dHash 8 + pHash 8 + palette 16/swatch + parsed EXIF):
+    mean 112.0 B   p50 112 B   p99 112 B   max 112 B
+    (+32 B content digest and +32 B PDQ code, counted separately: neither is in p57's table)
+
+  -> p57 budget: p50 < 10 ms — measured 2.677 ms: HOLDS
+  -> p57 budget: < 200 B/image — measured 112.0 B: HOLDS
+
+=== 3. DEDUP ===========================================================
+  exact duplicates by sha256 over the ORIGINAL bytes:
+    ALL FILES: 12148 distinct digests over 17311 files
+      877 digests occur more than once, covering 6040 files
+      5163 files are redundant copies (29.82%)
+    IMAGES ONLY (the population the near-duplicate tables below cover):
+      6881 distinct digests over 12007 files
+      841 digests occur more than once, covering 5967 files
+      5126 files are redundant copies (42.69%)
+
+  near-duplicates. EVERY count carries its threshold: docs/research/image.md §5
+  records a 12x spread across published methods, so one headline number would be a
+  methodology choice masquerading as a fact.
+
+  --- dHash, 64-bit (crate default HASH64_NEAR_MAX = 4) ---
+    12007 images hashed
+    threshold      clusters       images       rate
+    <= 0               1216         9187     76.51%
+    <= 2               1018        11036     91.91%
+    <= 4                903        11655     97.07%
+    <= 6                760        11902     99.13%
+    <= 8                689        11985     99.82%
+    <= 10               624        12001     99.95%
+    <= 12               511        12001     99.95%
+
+  --- PDQ-shaped, 256-bit (Meta's recommended threshold = 31/256) ---
+    12007 images hashed
+    threshold      clusters       images       rate
+    <= 0               1049         7908     65.86%
+    <= 16               843        10992     91.55%
+    <= 31               829        11853     98.72%
+    <= 48               827        11986     99.83%
+
+  -> §5 predicts 3-37% for scraped corpora depending on method. The spread above IS
+     that finding reproduced on this corpus: the method chooses the answer.
+
+  manifest: 12007 lines -> C:/Users/maran/AppData/Local/Temp/manifest2.tsv
+    One line per indexed document, in indexing order, as
+    `<absolute path>\t<sha256 hex>`. This is the order a vector file must
+    follow: entry i is the vector for line i+1. The digest column is there so
+    a stale manifest is DETECTABLE — without it, a corpus that changed under
+    the encoder mis-attributes every vector and still prints a number.
+
+  index built: 12007 documents, 12007 embedded, 0.2 s
+  100 probe queries from real path tokens
+
+=== 4. FUSED QUERY CORRECTNESS (p59) ===================================
+  100 fused queries at k=20: text + facet(format) + facet(shape)
+  + facet(colour, every 2nd) + range(width >= 200) + range(height >= 200)
+  + range(byte >= 2048) + vector + dHash radius 4
+  All SEVEN columns are now query surface: three facets and three numeric ranges over
+  p65 unscored columns, on one scored text field. Width and height carry hard range
+  predicates here — the capability the old four-scored-field packing could not express.
+  short pages: 0   filter leaks: 0   hits with agreement 0: 0
+
+  --- p58 vector recall vs the exact oracle ---
+    recall@10 of the binary-prefilter pipeline vs search_exact: 0.9870
+    This is THIS REPO'S OWN measurement on IMAGE embeddings. Every published
+    binary-quantisation recall figure is for TEXT embeddings.
+
+  --- p59 acceptance 3: nDCG@10, fused vs each half alone ---
+
+    [A] EXACT-DUPLICATE LABELS (sha256) — INFORMATIONAL, CANNOT ADJUDICATE
+      100 queries over exact-duplicate groups, 588 relevant documents in total
+      (5.9 per query).
+
+    arm                         nDCG@10
+    text-only                    0.0000
+    vector-only (exact)          1.0000
+    FUSED                        0.9884
+    delta vs text-only:   +0.9884
+    delta vs vector-only: -0.0116
+
+      -> THIS SET CANNOT ADJUDICATE p59 ACCEPTANCE 3, whatever it prints.
+         Byte-identical files decode to identical pixels, so a real encoder
+         gives them identical embeddings and the vector arm returns the whole
+         group first: nDCG@10 = 1.0 BY CONSTRUCTION. `fused > vector` is then
+         unreachable for a reason that has nothing to do with whether fusion
+         works — nothing exceeds a perfect oracle. Reporting a FAIL from this
+         set would be a verdict produced by the instrument, so it gets a
+         [note] and set [B] below carries the verdict.
+
+    [B] NEAR-DUPLICATE LABELS (dHash <= 4, sha256 DIFFERS) — THIS SET VOTES
+      100 queries, one per distinct digest, 366 relevant documents in total
+      (3.7 per query). The query document is fed its own indexed path text and
+      its own embedding, and is excluded from its own results before scoring.
+      NON-DEGENERATE BY CONSTRUCTION: the pixels differ, so the vector arm is
+      strong but not perfect; the paths differ, so the text arm is independent;
+      and the label comes from a perceptual hash, which is neither arm's own
+      function, so it hands neither of them a free win.
+
+    arm                         nDCG@10
+    text-only                    0.0203
+    vector-only (exact)          0.2910
+    FUSED                        0.2932
+    delta vs text-only:   +0.2729
+    delta vs vector-only: +0.0021
+
+      -> fusion strictly exceeds both halves on the NON-DEGENERATE set.
+         p59 acceptance 3 HOLDS.
+
+      LIMIT, stated beside the number rather than in a footnote: this measures
+      NEAR-DUPLICATE RETRIEVAL, not semantic relevance. Nothing here shows that a
+      fused query finds a semantically SIMILAR image, only that it finds the same
+      image at another size or encoding. It is the strongest non-degenerate set
+      this corpus can yield without human judgements — a scrape carries no
+      relevance labels — and a real semantic evaluation needs a corpus with them.
+
+=== 5. LATENCY =========================================================
+  p50/p99 per query, rdtsc-timed, single-thread.
+  docs         text p50   text p99    vec p50    vec p99  fused p50  fused p99
+  1000              2us       31us      106us      114us      576us      708us
+  4000              2us       31us      133us      191us      720us      868us
+  12007             2us       42us      239us      358us      983us     1149us
+
+  -> fusion costs 393.2x the text-only p50 at full corpus (983us vs 2us);
+     p99 1149us. A number, not a claim — p59 acceptance 6.
+
+=== 6. INDEX SIZE ======================================================
+  component                         bytes      B/image
+  text index (to_bytes)           2193641        182.7
+    vector: binary                 768448         64.0
+    vector: int8                  6147584        512.0
+    vector: scale                   48028          4.0
+    vector: exact f32            24590336       2048.0
+  hash + digest columns            912532         76.0
+  TOTAL                          34660569       2886.7
+
+  source bytes for the 12007 indexed images: 235789509 (235.8 MB)
+  index is 14.70% of the images it indexes
+
+=== WHAT THIS RUN SURFACED =============================================
+  1. AN IMAGE DOCUMENT WAS COLUMN-HUNGRIER THAN THE TEXT ENGINE'S BUDGET — FIXED.
+     This corpus yields seven columns per image — path, format, orientation, colour
+     bucket, width, height, byte length — and `index_text::MAX_FIELD` is 4. While a
+     facet or a numeric column had to BE a scored field, three of the seven could not
+     be indexed at all: orientation survived only as path text, and width and height
+     had no numeric column, so neither could carry a hard range predicate. That was
+     never a bench limitation to route around — the fused-query claim is one query
+     plan over text, facet, numeric, vector and hash predicates, and it was bounded
+     by how many predicates fit.
+     This benchmark is what surfaced that collision, and the collision produced p65:
+     UNSCORED COLUMNS. `Schema::with_column` declares a value that can be faceted,
+     ranged or keyed on without spending a scored-field slot, and it costs zero bytes
+     per posting because it is never tokenized.
+     The fix worth naming is the one NOT taken. Widening `[u16; MAX_FIELD]` would put
+     two more u16 on every posting of every existing text consumer to serve one image
+     corpus. The engine instead stopped spending a SCORING slot on a value that
+     nothing scores. MAX_FIELD is still 4; this run declares all seven columns,
+     facets three of them and ranges the other three, width and height included.
+
+  2. ON THIS CORPUS THE FILE EXTENSION DOES NOT LIE.
+     `meta::sniff` disagreed with the extension on 0 of 17311 files (0.00%).
+     That CONTRADICTS the expectation that scraped assets carry lying extensions.
+     One Supabase-backed scrape is not the web: this host serves what it stored,
+     and the scraper wrote the extension from the URL, so the two agree by
+     construction. The sniff is still the right default — this run just does not
+     produce evidence for it, and says so instead of quietly implying otherwise.
+
+  3. THE NEAR-DUPLICATE RATE IS A CHOICE, NOT A MEASUREMENT.
+     The dHash table above spans thresholds 0..12 and the PDQ table 0..48. Both move
+     the answer by tens of percentage points. Any single headline rate for this
+     corpus would be the threshold talking, which is exactly §5's warning.
+
+=== CHECK LIST =========================================================
+  [PASS] no panic on any of 17311 files
+  [PASS] p57 cheap tier p50 2.677 ms < 10 ms
+  [PASS] p57 cheap tier 112.0 B/image < 200 B
+  [PASS] p59 zero short pages over 100 fused queries
+  [PASS] p59 zero filter leaks over 100 fused queries
+  [PASS] p59 every hit has why.agreement() >= 1
+  [PASS] p58 recall@10 = 0.9870 (real embeddings)
+  [PASS] p59 acc.3 fused nDCG@10 0.2932 > text 0.0203 and vector 0.2910 (NON-DEGENERATE near-duplicate labels, 100 queries)
+  [note] p59 acc.3 on EXACT-duplicate labels: fused 0.9884, text 0.0000, vector 1.0000 (100 queries) — cannot adjudicate, the vector arm is perfect by construction
+
+OVERALL: PASS
