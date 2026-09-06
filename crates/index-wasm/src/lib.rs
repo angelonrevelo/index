@@ -44,7 +44,7 @@ use std::alloc::{alloc, dealloc, Layout};
 
 /// Bump this on any incompatible change to the exported signatures or the result encoding.
 /// The host is expected to check it before doing anything else.
-pub const ABI_VERSION: u32 = 12;
+pub const ABI_VERSION: u32 = 13;
 
 /// Bytes per hit record in the result buffer.
 const HIT_BYTE: usize = 12;
@@ -649,6 +649,139 @@ pub unsafe extern "C" fn idx_build_facet(b: *mut Builder, field: u32) -> u32 {
     // builder to swap through, and constructing one asserts on an empty schema -- a panic here is
     // a trap that kills the instance. Caught by `the_abi_facets`.
     u32::from(builder.inner.set_facet_field(field as usize))
+}
+
+/// Designate field `field` as the document's **primary key**, before any document is added.
+///
+/// Returns 1 on success, 0 if the builder is null, the field is out of range, or a document has
+/// already been added — a key cannot be recovered afterwards.
+///
+/// Without one, a host can search a collection but can never say *which row* changed: every
+/// incremental operation an application performs is keyed on ITS id, and [`idx_searcher_delete`]
+/// takes a dense ordinal no database row carries.
+///
+/// # Safety
+/// `b` must be a live builder from [`idx_build_new`].
+#[no_mangle]
+pub unsafe extern "C" fn idx_build_key(b: *mut Builder, field: u32) -> u32 {
+    let Some(builder) = b.as_mut() else { return 0 };
+    u32::from(builder.inner.set_key_field(field as usize))
+}
+
+/// The document carrying `key`, or `u32::MAX` if there is none.
+///
+/// **A deleted document is still found.** This answers "which ordinal is this row", which a caller
+/// needs precisely in order to delete it; filtering here would make deleting an already-deleted row
+/// indistinguishable from deleting a row that never existed.
+///
+/// # Safety
+/// `h` must be a live handle; `key` readable for `key_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn idx_doc_of_key(h: *const Handle, key: *const u8, key_len: usize) -> u32 {
+    let Some(handle) = h.as_ref() else { return u32::MAX };
+    if key.is_null() {
+        return u32::MAX;
+    }
+    let Ok(k) = std::str::from_utf8(std::slice::from_raw_parts(key, key_len)) else {
+        return u32::MAX;
+    };
+    handle.index.doc_of_key(k).unwrap_or(u32::MAX)
+}
+
+/// Write the application key of `doc` into the handle's result buffer; returns its byte length, or
+/// 0 when the row has no key.
+///
+/// # Safety
+/// `h` must be a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn idx_key_of(h: *mut Handle, doc: u32) -> usize {
+    let Some(handle) = h.as_mut() else { return 0 };
+    handle.result = handle.index.key_of(doc).unwrap_or("").as_bytes().to_vec();
+    handle.result.len()
+}
+
+/// How many documents carry a key. Below `idx_doc_count` when some key fields were blank — worth
+/// surfacing, because those rows can never be addressed by a change stream.
+///
+/// # Safety
+/// `h` must be a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn idx_keyed_count(h: *const Handle) -> u32 {
+    h.as_ref().map_or(0, |x| x.index.keyed_count() as u32)
+}
+
+/// The LIVE document carrying `key` across every segment, as a global ordinal, or `u32::MAX`.
+///
+/// Segments are searched newest first, because a key in more than one segment means the row was
+/// updated and the newest version is the live one.
+///
+/// # Safety
+/// `s` must be a live searcher; `key` readable for `key_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn idx_searcher_doc_of_key(
+    s: *const SearcherHandle,
+    key: *const u8,
+    key_len: usize,
+) -> u32 {
+    let Some(searcher) = s.as_ref() else { return u32::MAX };
+    if key.is_null() {
+        return u32::MAX;
+    }
+    let Ok(k) = std::str::from_utf8(std::slice::from_raw_parts(key, key_len)) else {
+        return u32::MAX;
+    };
+    searcher.inner.doc_of_key(k).unwrap_or(u32::MAX)
+}
+
+/// Tombstone the row carrying `key`. Returns 1 if a live row was found and retired.
+///
+/// **This is the operation a change stream's delete becomes**, and the reason keys exist:
+/// [`idx_searcher_delete`] takes a dense global ordinal, which is assigned at insertion and is not
+/// something a database row carries.
+///
+/// Deleting a key that is already gone returns 0 and is not an error — a change stream replayed
+/// from an earlier offset re-delivers deletes, and refusing would make replay impossible.
+///
+/// # Safety
+/// `s` must be a live searcher; `key` readable for `key_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn idx_searcher_delete_key(
+    s: *mut SearcherHandle,
+    key: *const u8,
+    key_len: usize,
+) -> u32 {
+    let Some(searcher) = s.as_mut() else { return 0 };
+    if key.is_null() {
+        return 0;
+    }
+    let Ok(k) = std::str::from_utf8(std::slice::from_raw_parts(key, key_len)) else {
+        return 0;
+    };
+    u32::from(searcher.inner.delete_key(k))
+}
+
+/// Write the application key of a GLOBAL ordinal into the searcher's result buffer; returns its
+/// byte length, or 0 when the row has no key.
+///
+/// # Safety
+/// `s` must be a live searcher.
+#[no_mangle]
+pub unsafe extern "C" fn idx_searcher_key_of(s: *mut SearcherHandle, global: u32) -> usize {
+    let Some(searcher) = s.as_mut() else { return 0 };
+    searcher.result = searcher.inner.key_of(global).unwrap_or("").as_bytes().to_vec();
+    searcher.result.len()
+}
+
+/// Whether every segment carries keys, so the collection can be driven by a change stream.
+///
+/// All-or-nothing on purpose: one unkeyed segment means some rows can never be addressed, and an
+/// update that silently skipped them would drift from the source of truth with no signal.
+///
+/// # Safety
+/// `s` must be a live searcher.
+#[no_mangle]
+pub unsafe extern "C" fn idx_searcher_has_key(s: *const SearcherHandle) -> u32 {
+    s.as_ref().map_or(0, |x| u32::from(x.inner.has_key()))
 }
 
 /// Record **token positions**, before any document is added. Required for [`idx_search_phrase`]
@@ -1771,7 +1904,7 @@ mod tests {
     /// Exercise the ABI exactly as a host would: alloc, copy in, open, search, read, free.
     #[test]
     fn the_abi_round_trips_a_query() {
-        assert_eq!(idx_abi_version(), 12);
+        assert_eq!(idx_abi_version(), 13);
         let bytes = blob();
         unsafe {
             let p = idx_alloc(bytes.len());
@@ -2105,6 +2238,92 @@ mod tests {
 
             idx_close(with);
             idx_close(without);
+        }
+    }
+
+    /// **The whole point of keys, through the ABI: express an update without knowing an ordinal.**
+    ///
+    /// A host receiving "row sku-1 changed" has the key and nothing else. Before `p53` it could
+    /// search but never say which row it meant, because `idx_searcher_delete` takes a dense ordinal
+    /// assigned at insertion that no database row carries.
+    #[test]
+    fn the_abi_updates_and_deletes_by_application_key() {
+        unsafe {
+            let spec = b"sku:0:0.6\0name:3:0.4";
+            let seg = |row: &[&str]| -> *mut Handle {
+                let sp = idx_alloc(spec.len());
+                std::ptr::copy_nonoverlapping(spec.as_ptr(), sp, spec.len());
+                let b = idx_build_new(sp, spec.len());
+                idx_free(sp, spec.len());
+                assert_eq!(idx_build_key(b, 0), 1, "the key field is accepted before any row");
+                for text in row {
+                    let raw = text.as_bytes();
+                    let p = idx_alloc(raw.len());
+                    std::ptr::copy_nonoverlapping(raw.as_ptr(), p, raw.len());
+                    assert_ne!(idx_build_add(b, p, raw.len()), u32::MAX);
+                    idx_free(p, raw.len());
+                }
+                idx_build_finish(b)
+            };
+            let with_key = |k: &str, f: &dyn Fn(*const u8, usize) -> u32| -> u32 {
+                let raw = k.as_bytes();
+                let p = idx_alloc(raw.len());
+                std::ptr::copy_nonoverlapping(raw.as_ptr(), p, raw.len());
+                let out = f(p, raw.len());
+                idx_free(p, raw.len());
+                out
+            };
+
+            let base = seg(&["sku-1\0Colgate Total Toothpaste 150g", "sku-2\0Aquafresh Mini 50g"]);
+            assert_eq!(idx_keyed_count(base), 2);
+            assert_eq!(with_key("sku-1", &|p, n| idx_doc_of_key(base, p, n)), 0);
+            assert_eq!(
+                with_key("sku-404", &|p, n| idx_doc_of_key(base, p, n)),
+                u32::MAX,
+                "an unknown key is a sentinel, not a trap"
+            );
+            // Read a key back out of the result buffer, as a host would.
+            let n = idx_key_of(base, 1);
+            assert_eq!(std::str::from_utf8(std::slice::from_raw_parts(idx_result_ptr(base), n)), Ok("sku-2"));
+
+            let s = idx_searcher_new(base); // CONSUMES base
+            assert_eq!(idx_searcher_has_key(s), 1);
+
+            // sku-1 is UPDATED: append the new version, and `push` retires the old one.
+            let delta = seg(&["sku-1\0Colgate Total Charcoal 200g", "sku-3\0Oral B Pro 120g"]);
+            assert_eq!(idx_searcher_push(s, delta), 1);
+            assert_eq!(idx_searcher_doc_count(s), 4);
+            assert_eq!(idx_searcher_live_count(s), 3, "the superseded row was retired");
+            assert_eq!(with_key("sku-1", &|p, n| idx_searcher_doc_of_key(s, p, n)), 2,
+                "the LIVE sku-1 is the new one");
+
+            let n = idx_searcher_key_of(s, 2);
+            let raw = std::slice::from_raw_parts(idx_searcher_result_ptr(s), n);
+            assert_eq!(std::str::from_utf8(raw), Ok("sku-1"));
+
+            // A delete arriving from a change stream, expressed the only way a host can.
+            assert_eq!(with_key("sku-2", &|p, n| idx_searcher_delete_key(s, p, n)), 1);
+            assert_eq!(
+                with_key("sku-2", &|p, n| idx_searcher_delete_key(s, p, n)),
+                0,
+                "replaying a delete is a no-op, not an error -- a stream re-delivers them"
+            );
+            assert_eq!(
+                with_key("sku-404", &|p, n| idx_searcher_delete_key(s, p, n)),
+                0,
+                "deleting a key that never existed reports 0 rather than trapping"
+            );
+            assert_eq!(idx_searcher_live_count(s), 2);
+            assert_eq!(with_key("sku-2", &|p, n| idx_searcher_doc_of_key(s, p, n)), u32::MAX);
+
+            // Null and non-UTF-8 must return sentinels, never trap.
+            assert_eq!(idx_doc_of_key(std::ptr::null(), b"x".as_ptr(), 1), u32::MAX);
+            assert_eq!(idx_searcher_delete_key(std::ptr::null_mut(), b"x".as_ptr(), 1), 0);
+            assert_eq!(idx_searcher_doc_of_key(s, std::ptr::null(), 0), u32::MAX);
+            assert_eq!(idx_keyed_count(std::ptr::null()), 0);
+            assert_eq!(idx_build_key(std::ptr::null_mut(), 0), 0);
+
+            idx_searcher_close(s);
         }
     }
 

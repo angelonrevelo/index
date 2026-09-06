@@ -42,7 +42,7 @@ Selecting once, over a fused score, cannot make that mistake.
 | `Hit::why -> Why` | Which signal(s) found this document. A fused answer is only worth having if it is explicable. |
 | Fused scoring | Convex combination over normalised per-signal scores, reusing `fuse::convex`; agreement count breaks ties. |
 
-## Acceptance — all must hold on the real corpus of `p51`
+## Acceptance — all must hold on the real corpus of `p60`
 
 1. **No short page.** For 100 hardest fused queries at k=20, the result count equals
    `min(k, matching_count)`. Zero short pages. This is the defect the fan-out architectures have
@@ -56,7 +56,7 @@ Selecting once, over a fused score, cannot make that mistake.
    traversed **once** per query, and top-k heap-selected once.
 5. **Explicability.** For every hit, `why.agreement() >= 1`, and a hit found by two signals ranks
    above a same-score hit found by one.
-6. **p50/p99 recorded** at the corpus size of `p51`, alongside the text-only baseline, so the cost
+6. **p50/p99 recorded** at the corpus size of `p60`, alongside the text-only baseline, so the cost
    of fusion is a number rather than a claim.
 
 ## Red-to-green proof required

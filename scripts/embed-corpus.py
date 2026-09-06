@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Produce REAL image embeddings for `image-corpus`, so `p49` can stop withholding its verdict.
+"""Produce REAL image embeddings for `image-corpus`, so `p58` can stop withholding its verdict.
 
 `index-image` deliberately ships no model — `docs/research/image.md` §8 argues why, and the crate
 doc comment states the cost of that choice plainly: *this crate cannot embed an image for you*.
@@ -27,20 +27,20 @@ detected rather than quietly mis-aligning every vector.
 # The model, and why this one
 
 **CLIP ViT-B/32** (`openai/clip-vit-base-patch32`), MIT-licensed, 151 M parameters, **512-d** — the
-width `p49` prices its byte table at, so the measurement lands on the arithmetic that was specced
+width `p58` prices its byte table at, so the measurement lands on the arithmetic that was specced
 rather than a rescaled version of it.
 
 It is not the best available encoder. §8 records SigLIP 2 at 85.0 % zero-shot ImageNet against
 CLIP ViT-B/32's ~63 %. A better encoder would give better *retrieval*; it would not change what
-`p49` measures, which is whether the binary-prefilter pipeline returns the same top-k as an exact
+`p58` measures, which is whether the binary-prefilter pipeline returns the same top-k as an exact
 scan over **whatever** vectors it is given. Using the small MIT model keeps the run cheap and the
 licence unambiguous.
 
 # What this script does NOT establish
 
-It produces vectors with real visual semantics, which is what `p49` needs and what seeded noise
+It produces vectors with real visual semantics, which is what `p58` needs and what seeded noise
 could never provide. It does not turn this corpus into a semantic-relevance benchmark: the corpus
-is a CDN scrape with no human judgements, and `p50`'s labelled set is built from duplicate groups
+is a CDN scrape with no human judgements, and `p59`'s labelled set is built from duplicate groups
 for that reason.
 """
 
@@ -106,7 +106,7 @@ def main() -> int:
     dim = model.config.projection_dim
     if dim != DIM:
         print(f"note: this model is {dim}-d, not {DIM}-d; the benchmark reads the header, so this "
-              f"is fine, but p49's byte table was priced at {DIM}")
+              f"is fine, but p58's byte table was priced at {DIM}")
 
     vector = [None] * len(entry)
     failed: list[Path] = []

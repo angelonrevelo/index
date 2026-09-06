@@ -1343,7 +1343,7 @@ mod test {
         }
     }
 
-    // ---- p55: clustering ------------------------------------------------------------------
+    // ---- p64: clustering ------------------------------------------------------------------
 
     /// A labelled synthetic set: `group` well-separated centroids, `per` points jittered about
     /// each, plus `stray` lone points that belong to no group and must come back as [`NOISE`].
@@ -1378,7 +1378,7 @@ mod test {
 
     /// Purity, completeness and the **false-merge rate**, reported as three separate numbers.
     ///
-    /// They are separate because `p55` acceptance 1 says so, and it says so because NIST FRVT
+    /// They are separate because `p64` acceptance 1 says so, and it says so because NIST FRVT
     /// found demographic false-*positive* differentials of up to ~7,203x versus ~3x for false
     /// negatives. A merge of two people is the error that discriminates; a single "accuracy"
     /// figure averages it away against the harmless failure.
@@ -1452,7 +1452,7 @@ mod test {
 
         let (purity, completeness, false_merge) = score(&truth, 8, &c);
         println!(
-            "p55 recovery: group {} noise {} purity {purity:.4} completeness {completeness:.4} \
+            "p64 recovery: group {} noise {} purity {purity:.4} completeness {completeness:.4} \
              false-merge {false_merge:.4}",
             c.group_count(),
             c.noise_count()
@@ -1517,13 +1517,13 @@ mod test {
 
         let tight = col.cluster(0.05, 3);
         let (tp, tc, tf) = score(&truth, 3, &tight);
-        println!("p55 false-merge, tight r=0.05: purity {tp:.4} completeness {tc:.4} merge {tf:.4}");
+        println!("p64 false-merge, tight r=0.05: purity {tp:.4} completeness {tc:.4} merge {tf:.4}");
         assert_eq!(tight.group_count(), 3, "at a tight radius the three groups stay apart");
         assert!(tf == 0.0, "no merge at r=0.05, got {tf:.4}");
 
         let wide = col.cluster(0.5, 3);
         let (wp, wc, wf) = score(&truth, 3, &wide);
-        println!("p55 false-merge, wide  r=0.50: purity {wp:.4} completeness {wc:.4} merge {wf:.4}");
+        println!("p64 false-merge, wide  r=0.50: purity {wp:.4} completeness {wc:.4} merge {wf:.4}");
         assert_eq!(wide.noise_count(), 0, "nothing is noise -- an accuracy number would be happy");
         assert!(
             (wc - 1.0).abs() < 1e-12,
@@ -1536,7 +1536,7 @@ mod test {
         assert!(wp < wc, "purity {wp:.4} must fall while completeness {wc:.4} does not");
     }
 
-    /// `p55` acceptance 2. dlib's Chinese Whispers is non-deterministic across runs; this must not
+    /// `p64` acceptance 2. dlib's Chinese Whispers is non-deterministic across runs; this must not
     /// be. Five clusterings of the same column, byte-identical every time.
     #[test]
     fn cluster_is_byte_identical_across_five_run() {
@@ -1701,7 +1701,7 @@ mod test {
             }
             previous = Some(wide);
         }
-        println!("p55 monotonicity (radius, group, noise): {shape:?}");
+        println!("p64 monotonicity (radius, group, noise): {shape:?}");
         let last = previous.expect("at least one radius");
         assert_eq!(last.group_count(), 1, "at r=2.0 cosine distance saturates: one group");
         assert_eq!(last.noise_count(), 0);

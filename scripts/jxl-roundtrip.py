@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""`p52` acceptance 4: prove a lossless transcode round-trips BYTE-EXACT, or report that it did not.
+"""`p61` acceptance 4: prove a lossless transcode round-trips BYTE-EXACT, or report that it did not.
 
     python scripts/jxl-roundtrip.py                 # seeded 600-file sample of the default corpus
     python scripts/jxl-roundtrip.py --limit 0       # every JPEG in the corpus
@@ -7,7 +7,7 @@
 
 # Why this is a script and not a benchmark binary
 
-`bench/roadmap/p52-content-address.md` rejects taking a libjxl dependency: there is no pure-Rust
+`bench/roadmap/p61-content-address.md` rejects taking a libjxl dependency: there is no pure-Rust
 JXL *encoder*, so adopting it would put a C++ toolchain inside a crate whose whole thesis is that it
 has none. The row's conclusion is that **transcoding is a host-side decision** and the engine's job
 is only to ship the content address that proves it went right.
@@ -103,7 +103,7 @@ def main() -> int:
         print(f"SKIPPED: no corpus at {arg.corpus}. This is not a pass.")
         return 0
 
-    print("p52 acceptance 4 :: does a lossless transcode round-trip BYTE-EXACT?")
+    print("p61 acceptance 4 :: does a lossless transcode round-trip BYTE-EXACT?")
     ver = subprocess.run(["cjxl", "--version"], capture_output=True).stderr.decode("utf-8", "replace")
     print(f"  {ver.strip().splitlines()[0] if ver.strip() else 'cjxl'}")
     print(f"  corpus: {arg.corpus}")

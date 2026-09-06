@@ -2,9 +2,9 @@
 
 **Tier:** T1 · **Bin:** `image-corpus` · **API:** the whole image tier, end to end
 **Status: BUILT AND RUN, 2026-09-06.** `crates/index-bench/src/image_corpus.rs`, run to completion
-over all **17,311 files** (2,838 MB): `OVERALL: PASS` with one verdict explicitly withheld (`p49`).
+over all **17,311 files** (2,838 MB): `OVERALL: PASS` with one verdict explicitly withheld (`p58`).
 Baseline committed under [`bench/runs/2026-09-06-baseline/`](../runs/2026-09-06-baseline/). It surfaced two things nobody planned: the
-field-budget collision that became [`p56`](p56-field-budget.md), and a **contradiction** of the
+field-budget collision that became [`p65`](p65-field-budget.md), and a **contradiction** of the
 expectation that scraped assets carry lying extensions — `meta::sniff` disagreed with the
 extension on **0 of 1,500** files.
 
@@ -36,13 +36,13 @@ discipline `ROADMAP.md` already applies to the 61,467-row text ceiling.
    presence rate, exact-duplicate rate by content hash. **Print it before any result**, because
    every number below is meaningless without it — and the EXIF presence rate is itself the test of
    §7's claim.
-2. **Cheap-tier cost** (`p48`): p50/p99 ms per image and bytes per image, measured.
+2. **Cheap-tier cost** (`p57`): p50/p99 ms per image and bytes per image, measured.
 3. **Dedup**: exact-duplicate rate by digest, and near-duplicate rate at each documented hash
    threshold. §5 predicts scraped corpora run 3–37% depending on method — this produces the number
    for *this* corpus, with the method stated.
-4. **Vector recall** (`p49`): measured recall of the binary-prefilter pipeline vs the exact oracle,
+4. **Vector recall** (`p58`): measured recall of the binary-prefilter pipeline vs the exact oracle,
    the missing image-embedding number §4 records as `UNVERIFIED`.
-5. **Fused query correctness** (`p50`): short pages, leaks, agreement, and p50/p99 vs the text-only
+5. **Fused query correctness** (`p59`): short pages, leaks, agreement, and p50/p99 vs the text-only
    baseline.
 6. **Index size**, total and per image, against the corpus's own byte size.
 
@@ -54,13 +54,13 @@ therefore has two modes, and **must never silently use the second**:
 - `--embedding <path>` — real vectors produced by a host-side encoder, the honest path.
 - `--embedding synthetic` — a seeded, deterministic stand-in so the *plumbing* can be gated in CI
   without a model. Every number derived from synthetic vectors must be printed with a
-  **`SYNTHETIC`** marker, and the recall check of `p49` must **refuse to report a verdict** in this
+  **`SYNTHETIC`** marker, and the recall check of `p58` must **refuse to report a verdict** in this
   mode. A recall figure over made-up vectors measures nothing.
 
 ## Acceptance
 
 - Runs to completion over all 17,311 files without panicking, including on whatever malformed or
-  truncated files the scrape contains. **A crash on hostile input is a failure of `p48` check 5**,
+  truncated files the scrape contains. **A crash on hostile input is a failure of `p57` check 5**,
   not a corpus problem.
 - Deterministic: same corpus, same verdict, every run. Baseline committed under `runs/` per
   [`bench/README.md`](../README.md) so before/after is a real `diff`.

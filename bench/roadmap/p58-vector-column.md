@@ -8,7 +8,7 @@ default oversample, and **0.333 / 0.603 / 0.876 at oversample 4 / 16 / 64** for 
 no neighbourhood at all — that second number is the honest boundary of the binary prefilter and is
 recorded rather than hidden.
 **A real encoder has now run.** `scripts/embed-corpus.py` produced **12,007 real CLIP ViT-B/32
-embeddings** over the `p51` corpus (90 img/s on an RTX 2060 SUPER, 133 s, zero placeholders), and
+embeddings** over the `p60` corpus (90 img/s on an RTX 2060 SUPER, 133 s, zero placeholders), and
 the benchmark measured the binary-prefilter pipeline against `search_exact` at the default
 oversample of 4:
 
@@ -58,7 +58,7 @@ oversample **4**, justified by the Qdrant 3–4x figure above.
 ## Acceptance
 
 1. **Recall against the oracle.** `search()` must return the same top-10 as `search_exact()` on the
-   real embedding set of `p51`. Report the measured recall. **The number is the deliverable** — do
+   real embedding set of `p60`. Report the measured recall. **The number is the deliverable** — do
    not assert Qdrant's 0.98 and move on.
 2. **The published figure does not transfer, and the benchmark must say so.** Every
    binary-quantisation recall number in the literature is for **text** embeddings; §4 records

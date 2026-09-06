@@ -9,7 +9,7 @@ it.
 
 ## What is technically trivial
 
-A face embedding is a 512-d vector. `VectorColumn` (`p49`) already stores and searches those.
+A face embedding is a 512-d vector. `VectorColumn` (`p58`) already stores and searches those.
 Clustering them is DBSCAN or agglomerative over cosine distance — a few hundred lines, and the same
 arithmetic the vector column already does. Immich runs a modified DBSCAN (>=3 neighbours for a core
 point, distance 0.3–0.7); PhotoPrism runs DBSCAN on L2-normalised embeddings; Apple runs two-pass
@@ -60,7 +60,7 @@ integrator.
    versus ~3x for false negatives. A single "accuracy" number would hide exactly the failure that
    matters.
 2. Determinism. Chinese Whispers is non-deterministic across runs; whatever is chosen here must not
-   be, because `p51` requires a stable verdict.
+   be, because `p60` requires a stable verdict.
 3. The API must be **unable to express** a cross-corpus identity query. If it can, the envelope
    above is decoration.
 4. Documentation states the accuracy limits plainly: children are near-unusable (**47.9%
@@ -69,6 +69,6 @@ integrator.
 
 ## Why this is T3
 
-No named consumer, and the corpus of `p51` contains essentially no faces. Shipping a face feature
+No named consumer, and the corpus of `p60` contains essentially no faces. Shipping a face feature
 against a corpus that cannot test it would be building on an assumption — and in this row's legal
 context, an untested assumption is the expensive kind.

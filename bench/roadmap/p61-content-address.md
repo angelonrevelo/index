@@ -51,12 +51,12 @@ actually 1:1**, and the dedup that does most of the saving.
 |---|---|
 | `ImageDoc::digest` | A 32-byte content address over the **original bytes**, computed in-crate (no dependency). Dedup key and round-trip proof in one. |
 | `ImageIndex::duplicate_of(digest)` | Exact-duplicate lookup, reusing the existing key-field machinery (`p40`) rather than a new structure. |
-| Near-duplicate report | Clusters at the `p48` hash thresholds, with the threshold printed beside every count. |
+| Near-duplicate report | Clusters at the `p57` hash thresholds, with the threshold printed beside every count. |
 | Round-trip verification | Given an original and a restored file, assert digest equality. **This is the whole "1:1" claim, reduced to one comparison.** |
 
 ## Acceptance
 
-1. **Exact-duplicate rate** on the real corpus of `p51`, by digest. Printed with the corpus census.
+1. **Exact-duplicate rate** on the real corpus of `p60`, by digest. Printed with the corpus census.
 2. **Near-duplicate rate** at each documented threshold, with the count at each — not one headline
    number. §5 records a **12x spread** (3% to 37%) across published methods, which means any single
    figure is a methodology choice, not a fact, and the benchmark must present it that way.
@@ -75,5 +75,5 @@ actually 1:1**, and the dedup that does most of the saving.
   into a crate whose whole thesis (§8) is that it has no dependencies. Transcoding is a host-side
   decision, and this row gives the host the digest to prove it went right.
 - **A thumbnail cache.** The preview tier reduces *bandwidth*, not archival storage. Worth doing,
-  but it is a different claim and belongs in its own row — the free path (`p48`'s embedded-EXIF
+  but it is a different claim and belongs in its own row — the free path (`p57`'s embedded-EXIF
   thumbnail, and JPEG DC-only 1/8-scale decode) is already noted there.

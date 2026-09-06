@@ -1,6 +1,6 @@
-//! p54-video-shot :: video as SHOTS, not frames — measured on the real video files on this machine.
+//! p63-video-shot :: video as SHOTS, not frames — measured on the real video files on this machine.
 //!
-//! `bench/roadmap/p54-video-keyframe.md` is the spec; `docs/research/image.md` §9 is the evidence.
+//! `bench/roadmap/p63-video-keyframe.md` is the spec; `docs/research/image.md` §9 is the evidence.
 //! The ask was "frame-by-frame image search on video". §9 says frame-by-frame is both more
 //! expensive and *worse*, so this benchmark measures the alternative it proposes: decode I-frames
 //! only, detect shots, embed the **middle** frame of each shot (middle, not first — a shot's first
@@ -23,7 +23,7 @@
 //! Marketing hero loops, product reels and screen-recorded slide decks found on this developer
 //! machine. Mostly short; many have very few real cuts. That makes it a legitimate test of the
 //! **pipeline** — decode strategy, shot detection, cost, storage — and a **poor test of
-//! retrieval**, because there are no relevance judgements anywhere in it. `p54` acceptance 3 (a
+//! retrieval**, because there are no relevance judgements anywhere in it. `p63` acceptance 3 (a
 //! labelled-clip recall check) is therefore **WITHHELD**, not guessed at. A recall number over a
 //! corpus with no ground truth would be a number about nothing.
 //!
@@ -40,8 +40,8 @@
 //! keyframe, so `scripts/embed-corpus.py` can embed them and a shot can be indexed as an ordinary
 //! document carrying a timestamp. Nothing in `index-image` changes: a shot is an `ImageDoc` with a
 //! `(video, start_ms, end_ms)`, and the fusion layer, the vector column and the hash column already
-//! index it. **Video search needed no new index type at all** — which `p54` names as the strongest
-//! available evidence that the `p50` architecture is the right one.
+//! index it. **Video search needed no new index type at all** — which `p63` names as the strongest
+//! available evidence that the `p59` architecture is the right one.
 
 use index_image::sha256;
 use index_image::vector::{Metric, VectorColumn};
@@ -70,7 +70,7 @@ const MAX_DEPTH: usize = 5;
 /// nobody's content.
 const EXCLUDE_DIR: [&str; 1] = ["node_modules"];
 
-/// Embedding width. 512-d is the width `p49` prices its byte table at, and the width `p51` uses.
+/// Embedding width. 512-d is the width `p58` prices its byte table at, and the width `p60` uses.
 const DIM: usize = 512;
 
 /// Bytes for the per-frame perceptual hash stored beside the embedding. dHash is 64 bits.
@@ -454,13 +454,13 @@ fn main() {
     let arg = match parse_arg() {
         Ok(a) => a,
         Err(e) => {
-            println!("p54-video-shot: {e}");
+            println!("p63-video-shot: {e}");
             println!("usage: video-shot [--limit N] [--emit-manifest <path>]");
             std::process::exit(2);
         }
     };
 
-    println!("p54-video-shot :: video as SHOTS, not frames, on the real video on this machine");
+    println!("p63-video-shot :: video as SHOTS, not frames, on the real video on this machine");
 
     // ---- the decoder, and the licence it sits on ------------------------------------------------
     let version = match run("ffmpeg", &[os("-version")]) {
@@ -684,18 +684,18 @@ fn main() {
     println!("    found on a developer machine. They are mostly short and many contain very few");
     println!("    real cuts. That makes this a legitimate test of the PIPELINE — decode strategy,");
     println!("    shot detection, cost, storage — and a POOR test of RETRIEVAL: there are no");
-    println!("    relevance judgements anywhere in it, so p54 acceptance 3 is WITHHELD below rather");
+    println!("    relevance judgements anywhere in it, so p63 acceptance 3 is WITHHELD below rather");
     println!("    than answered with a number that would mean nothing.");
     withheld.push(
-        "p54 acceptance 3: shot-sampled recall >= uniform 1 fps — needs a LABELLED clip set; this \
+        "p63 acceptance 3: shot-sampled recall >= uniform 1 fps — needs a LABELLED clip set; this \
          corpus has no relevance judgements"
             .to_string(),
     );
 
     // =============================================================================================
-    // 2. DECODE STRATEGY COST (p54 acceptance 1)
+    // 2. DECODE STRATEGY COST (p63 acceptance 1)
     // =============================================================================================
-    println!("\n=== 2. DECODE STRATEGY COST (p54 acceptance 1) =========================");
+    println!("\n=== 2. DECODE STRATEGY COST (p63 acceptance 1) =========================");
     println!("  Wall clock for a whole ffmpeg process, PROCESS SPAWN INCLUDED. That is the honest");
     println!("  figure for a host that shells out, and on a 7-second hero loop the ~0.1-0.2 s of");
     println!("  spawn is a large share of it — so the speedup below is UNDERSTATED on short files");
@@ -768,7 +768,7 @@ fn main() {
     }
 
     // =============================================================================================
-    // 3. SHOT DETECTION (p54 acceptance 1) — a HEURISTIC, reported as one
+    // 3. SHOT DETECTION (p63 acceptance 1) — a HEURISTIC, reported as one
     // =============================================================================================
     println!("\n=== 3. SHOT DETECTION ==================================================");
     println!("  Detector: ffmpeg `select='gt(scene,T)'` — a frame-difference threshold. It is an");
@@ -837,7 +837,7 @@ fn main() {
     }
 
     // =============================================================================================
-    // 4. FRAMES PER VIDEO-MINUTE (p54 acceptance 1)
+    // 4. FRAMES PER VIDEO-MINUTE (p63 acceptance 1)
     // =============================================================================================
     println!("\n=== 4. FRAMES PER VIDEO-MINUTE =========================================");
     let frame_total: usize = video.iter().map(|v| v.frame_count).sum();
@@ -872,9 +872,9 @@ fn main() {
     println!("     semantic unit. That is exactly why the pipeline has both stages.");
 
     // =============================================================================================
-    // 5. STORAGE PER VIDEO-MINUTE (p54 acceptance 2)
+    // 5. STORAGE PER VIDEO-MINUTE (p63 acceptance 2)
     // =============================================================================================
-    println!("\n=== 5. STORAGE PER VIDEO-MINUTE (p54 acceptance 2) =====================");
+    println!("\n=== 5. STORAGE PER VIDEO-MINUTE (p63 acceptance 2) =====================");
     // Real figures, measured off `index-image` rather than assumed: build both column shapes at the
     // real width and ask them what they cost.
     let probe_vector: Vec<f32> = (0..DIM).map(|i| (i as f32).sin()).collect();
@@ -935,7 +935,7 @@ fn main() {
     // 6. EXTRACT ONE KEYFRAME PER SHOT — the MIDDLE frame
     // =============================================================================================
     println!("\n=== 6. KEYFRAME EXTRACTION (middle frame of each shot) =================");
-    let out_dir = std::env::temp_dir().join("index-p54-video-shot");
+    let out_dir = std::env::temp_dir().join("index-p63-video-shot");
     let _ = std::fs::remove_dir_all(&out_dir);
     if let Err(e) = std::fs::create_dir_all(&out_dir) {
         println!("  FAIL: cannot create {}: {e}", out_dir.display());
@@ -1085,8 +1085,8 @@ fn main() {
     println!("     middle frame, emit a manifest. Not one line of `index-image` or `index-text`");
     println!("     changed, and none needed to. A shot is an ImageDoc with a (video, start_ms,");
     println!("     end_ms) and an embedding; the fusion layer, the vector column and the hash");
-    println!("     column already index it. p54 names that asymmetry as the strongest available");
-    println!("     evidence that the p50 architecture is right, and this run is that evidence.");
+    println!("     column already index it. p63 names that asymmetry as the strongest available");
+    println!("     evidence that the p59 architecture is right, and this run is that evidence.");
     println!();
     println!("  2. THE CHEAP DECODE DOES NOT PAY FOR THE SHOT DETECTION.");
     println!("     `-skip_frame nokey` is {agg_full:.2}x faster than a full decode here, but the scene");
@@ -1100,15 +1100,15 @@ fn main() {
     println!("     {} unique video, {:.2} video-minutes, no relevance judgements. Every count above",
         video.len(), minute);
     println!("     is exact and reproducible; every claim about 10-minute broadcast-paced footage");
-    println!("     belongs to §9 and is cited, not re-derived. p54's acceptance 3 stays open until");
+    println!("     belongs to §9 and is cited, not re-derived. p63's acceptance 3 stays open until");
     println!("     a labelled clip set exists on this machine.");
     println!();
-    println!("  4. NEAR-DUPLICATE VIDEO (p54 acceptance 4) IS NOT ATTEMPTED HERE.");
+    println!("  4. NEAR-DUPLICATE VIDEO (p63 acceptance 4) IS NOT ATTEMPTED HERE.");
     println!("     A vPDQ-shaped per-shot hash sequence needs the per-shot hashes, which needs the");
     println!("     extracted frames this run has only just produced. The manifest is the seam: the");
     println!("     hash sequence is a second pass over it, not a change to this pipeline.");
     withheld.push(
-        "p54 acceptance 4: near-duplicate video via a per-shot hash sequence (vPDQ shape) — needs \
+        "p63 acceptance 4: near-duplicate video via a per-shot hash sequence (vPDQ shape) — needs \
          a hashing pass over the manifest this run emits"
             .to_string(),
     );
@@ -1124,7 +1124,7 @@ fn main() {
         println!("  [HELD] {name}");
     }
     if !withheld.is_empty() {
-        println!("\n  {} verdict(s) WITHHELD. This run does not answer all of p54 — it declines to,",
+        println!("\n  {} verdict(s) WITHHELD. This run does not answer all of p63 — it declines to,",
             withheld.len());
         println!("  and says which parts and why.");
     }

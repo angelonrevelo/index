@@ -47,7 +47,7 @@ answer — is what they exist to show.
 
 ## The withheld verdict is not a pass
 
-`p49`'s recall check prints `[HELD]`. This repo ships no embedding model, so the run's default
+`p58`'s recall check prints `[HELD]`. This repo ships no embedding model, so the run's default
 vectors are seeded noise and a recall figure over them would measure the arithmetic rather than the
 retrieval. Re-run with `--embedding <path>` (header `u32 count`, `u32 dim`, then f32 little-endian)
 to get a real verdict. Until then §4's `UNVERIFIED` stands.

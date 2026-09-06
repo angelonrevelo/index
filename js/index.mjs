@@ -13,7 +13,7 @@
 // which made every `build()` and `open()` throw `ABI mismatch` -- the check worked, the constant
 // did not. `js/smoke.mjs` asserts the module's version but instantiates the module directly, so it
 // never touched this file. Nothing here is gate-covered until it is, which is `p44`'s open note.
-const ABI_VERSION = 12;
+const ABI_VERSION = 13;
 const HIT_BYTE = 12; // u32 doc, f32 score, u32 typo_bucket
 
 // WASM has no unsigned 32-bit return type: every `u32` arrives in JS as a **signed** i32, so
@@ -41,7 +41,7 @@ export class SearchIndex {
    * positionally aligned with `field`. Use this when the host has the data but no build step —
    * `open()` is for a prebuilt artifact.
    */
-  static async build(wasmBytes, field, doc, { label = null, position = false } = {}) {
+  static async build(wasmBytes, field, doc, { label = null, position = false, key = null } = {}) {
     const { instance } = await WebAssembly.instantiate(wasmBytes, {});
     const e = instance.exports;
     if (e.idx_abi_version() !== ABI_VERSION) throw new Error('ABI mismatch');
@@ -65,6 +65,11 @@ export class SearchIndex {
     if (position && u32(e.idx_build_position(builder)) === 0) {
       e.idx_build_free(builder);
       throw new Error('idx_build_position was refused');
+    }
+    // Same for the key field, and without one this collection can never be updated by key.
+    if (key !== null && u32(e.idx_build_key(builder, key)) === 0) {
+      e.idx_build_free(builder);
+      throw new Error(`idx_build_key was refused for field ${key}`);
     }
 
     for (const d of doc) {
@@ -250,6 +255,34 @@ export class SearchIndex {
     );
     if (n === ERR) throw new Error('idx_search_phrase failed');
     return n === 0 ? [] : this.#hit(n);
+  }
+
+  /**
+   * The document carrying `key`, or `null`.
+   *
+   * A **deleted** document is still found: this answers "which ordinal is this row", which a
+   * caller needs precisely in order to delete it.
+   */
+  docOfKey(key) {
+    const d = this.#withStr(key, (p, n) => u32(this.#exports.idx_doc_of_key(this.#handle, p, n)));
+    return d === ERR ? null : d;
+  }
+
+  /** The application key of `doc`, or `null` when the row has none. */
+  keyOf(doc) {
+    const e = this.#exports;
+    const n = u32(e.idx_key_of(this.#handle, doc));
+    if (n === 0) return null;
+    const p = u32(e.idx_result_ptr(this.#handle));
+    return new TextDecoder().decode(new Uint8Array(e.memory.buffer, p, n));
+  }
+
+  /**
+   * Rows carrying a key. Below `docCount` when some key fields were blank — and those rows can
+   * never be addressed by a change stream, which is why it is worth checking rather than assuming.
+   */
+  get keyedCount() {
+    return u32(this.#exports.idx_keyed_count(this.#handle));
   }
 
   /** Serialize this index to bytes, so a host can build once and cache the artifact. */

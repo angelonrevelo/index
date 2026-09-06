@@ -45,7 +45,7 @@ other *users*, not from the *platform* — absence at download is not absence at
 ## Acceptance
 
 1. **Cost.** Measured p50 per image for the whole cheap tier is **under 10 ms**, and total stored
-   bytes per image **under 200**, on the real corpus of `p51`. Both printed, not asserted from the
+   bytes per image **under 200**, on the real corpus of `p60`. Both printed, not asserted from the
    table above.
 2. **The hash actually works.** On the real corpus: a re-encode and a resize of the same image stay
    under the recommended threshold; an unrelated pair sits near 50% of the code length.

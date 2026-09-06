@@ -2,7 +2,7 @@
 //!
 //! # Why a cryptographic hash, when a faster one would fit in ten lines
 //!
-//! `bench/roadmap/p52-content-address.md` spends this one 32-byte field on **two** jobs at once:
+//! `bench/roadmap/p61-content-address.md` spends this one 32-byte field on **two** jobs at once:
 //!
 //!   - the **dedup key** — ~30 % of a scraped corpus is duplicated, and dedup saves more bytes
 //!     than the best lossless codec does;

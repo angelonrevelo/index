@@ -1,4 +1,4 @@
-// CI smoke test for the IMAGE tier through the C ABI — the p53 row.
+// CI smoke test for the IMAGE tier through the C ABI — the p62 row.
 //
 // `js/smoke.mjs` proves the text engine works with no server and no Rust build step. This one
 // proves the same thing for images, which is where the claim actually bites: `docs/research/image.md`
@@ -329,7 +329,7 @@ phase.push(mark('teardown'));
 
 // ---- Linear-memory high-water mark ------------------------------------------------------------------
 //
-// p53 acceptance item 3. `docs/research/portability.md` §1: an mmap-style format does not FAIL to
+// p62 acceptance item 3. `docs/research/portability.md` §1: an mmap-style format does not FAIL to
 // port to WASM — it silently reads the whole index into linear memory. A vector column is the
 // largest thing this engine has ever put there, so the number that actually binds in a browser is
 // not latency, it is address space.

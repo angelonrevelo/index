@@ -30,7 +30,7 @@ Almost nothing in this crate. A shot is an [`ImageDoc`] with a `(video_id, start
 embedding — the fusion layer, the vector column and the hash column already index it. The work is
 **host-side**: decode, shot-detect, pick the frame.
 
-That asymmetry is the point, and it is the strongest available evidence that the `p50` architecture
+That asymmetry is the point, and it is the strongest available evidence that the `p59` architecture
 is the right one: video search needed **no new index type at all**.
 
 ## Acceptance
@@ -56,7 +56,7 @@ must not link a bundled H.264 decoder, and the benchmark must record which path 
 Two honest reasons, stated rather than dressed up as sequencing:
 
 1. **No named consumer.** `ROADMAP.md`'s rule is that no row lands without one whose measured pain
-   it closes. The image rows have the scraped corpus of `p51`; video has no corpus on this machine
+   it closes. The image rows have the scraped corpus of `p60`; video has no corpus on this machine
    and no application asking for it.
 2. **It is the only row here that needs a heavyweight dependency** (ffmpeg or a platform decoder),
    which is exactly the cost the rest of the tier was designed to avoid.

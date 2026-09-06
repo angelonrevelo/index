@@ -107,10 +107,10 @@ below it — the same limit [`ROADMAP.md`](../../ROADMAP.md) already records for
 
 **Caveat recorded rather than buried:** every published binary-quantisation recall number above is
 for **text** embeddings. No equivalent published figure for image embeddings was found. That is why
-`p49` measures recall on this repo's own corpus instead of citing Qdrant's.
+`p58` measures recall on this repo's own corpus instead of citing Qdrant's.
 
 > **RESOLVED 2026-09-06 — this repo measured it.** 12,007 real CLIP ViT-B/32 embeddings over the
-> `p51` corpus, binary-prefilter pipeline against the exact oracle at oversample 4:
+> `p60` corpus, binary-prefilter pipeline against the exact oracle at oversample 4:
 > **recall@10 = 0.9870.** That lands inside the 0.98–0.9966 band Qdrant reports for *text*
 > embeddings, so the published figure does transfer — but it is now a measurement rather than an
 > assumption, and it is the first image-embedding number in this file that is ours.

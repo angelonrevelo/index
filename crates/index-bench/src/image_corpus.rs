@@ -1,6 +1,6 @@
-//! p51-image-corpus :: the image tier, measured on 17,311 real scraped web files.
+//! p60-image-corpus :: the image tier, measured on 17,311 real scraped web files.
 //!
-//! `bench/roadmap/p51-image-corpus.md` is the spec. The rule this repo runs on is that a benchmark
+//! `bench/roadmap/p60-image-corpus.md` is the spec. The rule this repo runs on is that a benchmark
 //! runs on real data or it does not count, and for the image tier that bites harder than usual
 //! because every failure mode is a property of a *messy* corpus: stripped metadata,
 //! near-duplicates, mixed formats, and files that are not photographs at all.
@@ -23,7 +23,7 @@
 //!
 //! This crate ships no embedding model either. `--embedding synthetic` produces a seeded
 //! deterministic stand-in so the *plumbing* is gated today; every number derived from it is printed
-//! with a `SYNTHETIC` marker and the `p49` recall verdict is **withheld**, because a recall figure
+//! with a `SYNTHETIC` marker and the `p58` recall verdict is **withheld**, because a recall figure
 //! over made-up vectors measures nothing.
 //!
 //! ## `--emit-manifest <path>` — the contract an external encoder binds to
@@ -63,24 +63,24 @@ mod timer;
 // Constants — every one of them carries the number that justifies it.
 // ---------------------------------------------------------------------------------------------
 
-/// `p48` acceptance 1: measured p50 for the whole cheap tier, per image.
+/// `p57` acceptance 1: measured p50 for the whole cheap tier, per image.
 const CHEAP_P50_MS_MAX: f64 = 10.0;
-/// `p48` acceptance 1: total stored bytes per image.
+/// `p57` acceptance 1: total stored bytes per image.
 const CHEAP_BYTE_MAX: f64 = 200.0;
 
-/// Embedding width when synthesising. 512-d is the width `p49` prices its byte table at.
+/// Embedding width when synthesising. 512-d is the width `p58` prices its byte table at.
 const DIM: usize = 512;
 
-/// Page size for the fused correctness queries. `p50` acceptance 1 fixes k = 20.
+/// Page size for the fused correctness queries. `p59` acceptance 1 fixes k = 20.
 const K: usize = 20;
-/// `p50` acceptance 1: "the 100 hardest fused queries".
+/// `p59` acceptance 1: "the 100 hardest fused queries".
 const QUERY_COUNT: usize = 100;
 
-/// `p50` acceptance 3 fixes the cutoff at 10: "fused nDCG@10 must exceed both".
+/// `p59` acceptance 3 fixes the cutoff at 10: "fused nDCG@10 must exceed both".
 const NDCG_K: usize = 10;
 /// Fewest queries the NON-DEGENERATE labelled set must yield before acceptance 3 is adjudicated on
 /// it at all. Below this the mean of three nDCG figures is noise wearing a verdict's clothes, and an
-/// underpowered PASS is worth nothing — so the verdict is withheld exactly as `p49`'s recall is
+/// underpowered PASS is worth nothing — so the verdict is withheld exactly as `p58`'s recall is
 /// withheld under synthetic embeddings, rather than rendered from too little evidence.
 const NDCG_QUERY_MIN: usize = 20;
 
@@ -135,7 +135,7 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 // Panic containment
 // ---------------------------------------------------------------------------------------------
 
-/// `p48` acceptance 5: the corpus is scraped, so the parsers eat arbitrary input and a crash is a
+/// `p57` acceptance 5: the corpus is scraped, so the parsers eat arbitrary input and a crash is a
 /// FAILURE OF THIS REPO, not a corpus problem. The decoder is third-party and gets the same
 /// treatment. The hook stores the message instead of printing it, so a caught panic becomes a
 /// bounded finding rather than a wall of backtrace.
@@ -189,7 +189,7 @@ struct Record {
     /// Cheap tier (luma + dHash + pHash + palette + EXIF), nanoseconds. Decode excluded — see the
     /// note where this is reported.
     cheap_ns: f64,
-    /// The 256-bit PDQ-shaped hash, timed separately: it is not in `p48`'s <10 ms budget line.
+    /// The 256-bit PDQ-shaped hash, timed separately: it is not in `p57`'s <10 ms budget line.
     pdq_ns: f64,
     /// Third-party decode, nanoseconds. The host's cost, reported beside the engine's.
     decode_ns: f64,
@@ -197,11 +197,11 @@ struct Record {
     signal_byte: usize,
 }
 
-/// Bytes the cheap tier costs to STORE, which is what `p48`'s <200 B budget is about.
+/// Bytes the cheap tier costs to STORE, which is what `p57`'s <200 B budget is about.
 ///
 /// dHash 8 + pHash 8 + palette (OKLab triple + weight, 4 x f32 per swatch) + whatever EXIF
 /// survived. The 256-bit PDQ code and the 32-byte content digest are counted separately because
-/// neither is in `p48`'s table.
+/// neither is in `p57`'s table.
 fn signal_byte(rec: &Record) -> usize {
     let hash = rec.dhash.map_or(0, |_| 8) + rec.phash.map_or(0, |_| 8);
     let palette = rec.palette.as_ref().map_or(0, |p| p.0.len() * 16);
@@ -496,7 +496,7 @@ fn main() {
     let arg = match parse_arg() {
         Ok(a) => a,
         Err(e) => {
-            println!("p51-image-corpus: {e}");
+            println!("p60-image-corpus: {e}");
             println!(
                 "usage: image-corpus [--limit N] [--embedding synthetic|<path>] [--emit-manifest <path>]"
             );
@@ -505,7 +505,7 @@ fn main() {
     };
 
     let clock = timer::Clock::new();
-    println!("p51-image-corpus :: the image tier on a real scrape of 17,311 web files");
+    println!("p60-image-corpus :: the image tier on a real scrape of 17,311 web files");
     println!("clock backend: {}", clock.backend());
 
     // ---- corpus presence -----------------------------------------------------------------------
@@ -580,7 +580,7 @@ fn main() {
         };
         corpus_byte += byte.len() as u64;
 
-        // Everything below runs on attacker-shaped bytes. A panic anywhere here is a `p48` check-5
+        // Everything below runs on attacker-shaped bytes. A panic anywhere here is a `p57` check-5
         // failure; it is recorded with the filename and the walk continues.
         let built = guard(|| {
             let digest = sha256(&byte);
@@ -634,7 +634,7 @@ fn main() {
         if decodable && !too_big {
             let mut decoded: Option<(u32, u32, Vec<u8>)> = None;
             let decode_ns = clock.measure_ns(|| {
-                // The decoder is third-party and gets the panic guard too: `p48` check 5 is about
+                // The decoder is third-party and gets the panic guard too: `p57` check 5 is about
                 // this pipeline surviving hostile input, and a crash here is still a crash.
                 decoded = guard(|| {
                     let img = image::load_from_memory(&byte).ok()?;
@@ -651,9 +651,9 @@ fn main() {
                 rec.decoded_dim = Some((w, h));
                 // ---- the cheap tier, from ONE decode ------------------------------------------
                 // Decode cost is real at 17 k files, so every signal derives from this single
-                // buffer. What is timed here is `p48`'s table: luma reduction, dHash, pHash,
+                // buffer. What is timed here is `p57`'s table: luma reduction, dHash, pHash,
                 // palette, EXIF. The decode above is the HOST's cost and is reported separately —
-                // `p48`'s <10 ms budget is a claim about the engine's tier, not about libjpeg.
+                // `p57`'s <10 ms budget is a claim about the engine's tier, not about libjpeg.
                 let mut dhash = None;
                 let mut phash = None;
                 let mut palette = None;
@@ -808,8 +808,8 @@ fn main() {
     println!("    below the 20-30 k the product question asks about and far below the 100 k+ where");
     println!("    incumbents' measured failures appear. Nothing above this count is claimed.");
 
-    // ---- p48 check 5: no panic on any file ------------------------------------------------------
-    println!("\n  --- ingest robustness (p48 check 5) ---");
+    // ---- p57 check 5: no panic on any file ------------------------------------------------------
+    println!("\n  --- ingest robustness (p57 check 5) ---");
     println!("    {unreadable} unreadable, {oversize} refused as over {MAX_PIXEL} px, {decode_fail} sniffed-as-image but failed to decode");
     println!("    {} panics", crash.len());
     for (path, msg) in crash.iter().take(EXAMPLE_MAX) {
@@ -821,9 +821,9 @@ fn main() {
     }
 
     // =============================================================================================
-    // 2. CHEAP-TIER COST (p48)
+    // 2. CHEAP-TIER COST (p57)
     // =============================================================================================
-    println!("\n=== 2. CHEAP-TIER COST (p48) ===========================================");
+    println!("\n=== 2. CHEAP-TIER COST (p57) ===========================================");
     let mut cheap: Vec<f64> = record.iter().filter(|r| r.cheap_ns > 0.0).map(|r| r.cheap_ns).collect();
     let mut pdq_t: Vec<f64> = record.iter().filter(|r| r.pdq_ns > 0.0).map(|r| r.pdq_ns).collect();
     let mut dec: Vec<f64> = record.iter().filter(|r| r.decode_ns > 0.0).map(|r| r.decode_ns).collect();
@@ -833,7 +833,7 @@ fn main() {
     println!("  {} images decoded and fully signalled", cheap.len());
     println!("  {:<38} {:>10} {:>10}", "", "p50", "p99");
     println!("  {:<38} {:>8.3}ms {:>8.3}ms", "cheap tier (luma+dHash+pHash+palette+EXIF)", ms(&cheap, 0.5), ms(&cheap, 0.99));
-    println!("  {:<38} {:>8.3}ms {:>8.3}ms", "  + PDQ-shaped 256-bit (not in p48 budget)", ms(&pdq_t, 0.5), ms(&pdq_t, 0.99));
+    println!("  {:<38} {:>8.3}ms {:>8.3}ms", "  + PDQ-shaped 256-bit (not in p57 budget)", ms(&pdq_t, 0.5), ms(&pdq_t, 0.99));
     println!("  {:<38} {:>8.3}ms {:>8.3}ms", "third-party decode (the HOST's cost)", ms(&dec, 0.5), ms(&dec, 0.99));
 
     let mut byte: Vec<f64> = record.iter().filter(|r| r.cheap_ns > 0.0).map(|r| r.signal_byte as f64).collect();
@@ -843,17 +843,17 @@ fn main() {
     println!("    mean {byte_mean:.1} B   p50 {:.0} B   p99 {:.0} B   max {:.0} B",
         timer::percentile(&byte, 0.5), timer::percentile(&byte, 0.99),
         byte.last().copied().unwrap_or(0.0));
-    println!("    (+32 B content digest and +32 B PDQ code, counted separately: neither is in p48's table)");
+    println!("    (+32 B content digest and +32 B PDQ code, counted separately: neither is in p57's table)");
 
     let cheap_p50 = ms(&cheap, 0.5);
     let cost_ok = cheap_p50 < CHEAP_P50_MS_MAX;
     let byte_ok = byte_mean < CHEAP_BYTE_MAX;
-    println!("\n  -> p48 budget: p50 < {CHEAP_P50_MS_MAX} ms — measured {cheap_p50:.3} ms: {}",
+    println!("\n  -> p57 budget: p50 < {CHEAP_P50_MS_MAX} ms — measured {cheap_p50:.3} ms: {}",
         if cost_ok { "HOLDS" } else { "DOES NOT HOLD" });
-    println!("  -> p48 budget: < {CHEAP_BYTE_MAX} B/image — measured {byte_mean:.1} B: {}",
+    println!("  -> p57 budget: < {CHEAP_BYTE_MAX} B/image — measured {byte_mean:.1} B: {}",
         if byte_ok { "HOLDS" } else { "DOES NOT HOLD" });
-    check.push((format!("p48 cheap tier p50 {cheap_p50:.3} ms < {CHEAP_P50_MS_MAX} ms"), cost_ok));
-    check.push((format!("p48 cheap tier {byte_mean:.1} B/image < {CHEAP_BYTE_MAX} B"), byte_ok));
+    check.push((format!("p57 cheap tier p50 {cheap_p50:.3} ms < {CHEAP_P50_MS_MAX} ms"), cost_ok));
+    check.push((format!("p57 cheap tier {byte_mean:.1} B/image < {CHEAP_BYTE_MAX} B"), byte_ok));
     if !cost_ok {
         fail += 1;
     }
@@ -862,7 +862,7 @@ fn main() {
     }
 
     // =============================================================================================
-    // 3. DEDUP (p52)
+    // 3. DEDUP (p61)
     // =============================================================================================
     println!("\n=== 3. DEDUP ===========================================================");
     let mut by_digest: HashMap<[u8; 32], usize> = HashMap::new();
@@ -970,7 +970,7 @@ fn main() {
         println!("# This crate ships no embedding model. Vectors below are a seeded       #");
         println!("# deterministic stand-in derived from each file's content digest. They  #");
         println!("# carry NO visual semantics. Every number they touch is marked          #");
-        println!("# SYNTHETIC, and the p49 recall verdict is WITHHELD -- recall over       #");
+        println!("# SYNTHETIC, and the p58 recall verdict is WITHHELD -- recall over       #");
         println!("# made-up vectors measures nothing at all.                              #");
         println!("# Run with --embedding <path> to get a real verdict.                    #");
         println!("########################################################################");
@@ -1156,9 +1156,9 @@ fn main() {
     println!("  {} probe queries from real path tokens", probe.len());
 
     // =============================================================================================
-    // 4. FUSED QUERY CORRECTNESS (p50)
+    // 4. FUSED QUERY CORRECTNESS (p59)
     // =============================================================================================
-    println!("\n=== 4. FUSED QUERY CORRECTNESS (p50) ===================================");
+    println!("\n=== 4. FUSED QUERY CORRECTNESS (p59) ===================================");
     let n_doc = ix.doc_count();
     let mut short = 0usize;
     let mut leak = 0usize;
@@ -1244,9 +1244,9 @@ fn main() {
     for e in example.iter().take(EXAMPLE_MAX) {
         println!("    {e}");
     }
-    check.push((format!("p50 zero short pages over {tried} fused queries"), short == 0));
-    check.push((format!("p50 zero filter leaks over {tried} fused queries"), leak == 0));
-    check.push(("p50 every hit has why.agreement() >= 1".to_string(), mute == 0));
+    check.push((format!("p59 zero short pages over {tried} fused queries"), short == 0));
+    check.push((format!("p59 zero filter leaks over {tried} fused queries"), leak == 0));
+    check.push(("p59 every hit has why.agreement() >= 1".to_string(), mute == 0));
     if short > 0 {
         fail += 1;
     }
@@ -1257,15 +1257,15 @@ fn main() {
         fail += 1;
     }
 
-    // --- p49 recall, or the refusal to report one -------------------------------------------------
-    println!("\n  --- p49 vector recall vs the exact oracle ---");
+    // --- p58 recall, or the refusal to report one -------------------------------------------------
+    println!("\n  --- p58 vector recall vs the exact oracle ---");
     if embedding.is_synthetic() {
         println!("    WITHHELD. The vectors are SYNTHETIC — seeded noise with no visual semantics.");
         println!("    A recall figure over made-up vectors measures the arithmetic, not the");
-        println!("    retrieval, and printing one would be the exact overclaim p49 exists to avoid.");
+        println!("    retrieval, and printing one would be the exact overclaim p58 exists to avoid.");
         println!("    docs/research/image.md §4 records the image-embedding recall number as");
         println!("    UNVERIFIED and it STAYS UNVERIFIED until a real encoder runs here.");
-        withheld.push("p49 recall verdict (synthetic embedding mode)".to_string());
+        withheld.push("p58 recall verdict (synthetic embedding mode)".to_string());
     } else {
         let mut recalled = 0usize;
         let mut expected = 0usize;
@@ -1281,13 +1281,13 @@ fn main() {
         println!("    recall@10 of the binary-prefilter pipeline vs search_exact: {recall:.4}");
         println!("    This is THIS REPO'S OWN measurement on IMAGE embeddings. Every published");
         println!("    binary-quantisation recall figure is for TEXT embeddings.");
-        check.push((format!("p49 recall@10 = {recall:.4} (real embeddings)"), recall >= 0.98));
+        check.push((format!("p58 recall@10 = {recall:.4} (real embeddings)"), recall >= 0.98));
         if recall < 0.98 {
             fail += 1;
         }
     }
 
-    // --- p50 acceptance 3: fused nDCG@10 against each half alone ----------------------------------
+    // --- p59 acceptance 3: fused nDCG@10 against each half alone ----------------------------------
     //
     // Acceptance 3 says fused nDCG@10 must EXCEED both text-only and vector-only, and that a row
     // which fails "is wrong and must be rejected, not tuned until it passes". This block is written
@@ -1298,20 +1298,20 @@ fn main() {
     // which and why. The short version: exact-duplicate labels make the vector arm perfect BY
     // CONSTRUCTION, so they cannot adjudicate "fused > vector" at all, and the near-duplicate set
     // with the exact duplicates removed is the one that can.
-    println!("\n  --- p50 acceptance 3: nDCG@10, fused vs each half alone ---");
+    println!("\n  --- p59 acceptance 3: nDCG@10, fused vs each half alone ---");
     if embedding.is_synthetic() {
-        println!("    WITHHELD, for the same reason p49's recall is. The vectors are SYNTHETIC —");
+        println!("    WITHHELD, for the same reason p58's recall is. The vectors are SYNTHETIC —");
         println!("    seeded noise keyed on the content digest, carrying no visual semantics. An");
         println!("    nDCG over them would measure that identical bytes hash identically, which is");
         println!("    arithmetic, not retrieval. Run with --embedding <path> for a verdict.");
-        withheld.push("p50 acceptance 3 nDCG@10 verdict (synthetic embedding mode)".to_string());
+        withheld.push("p59 acceptance 3 nDCG@10 verdict (synthetic embedding mode)".to_string());
     } else if ix.doc_count() != indexed.len() {
         // Document ordinals are assigned in insertion order, so the labels below are only valid if
         // every indexed record actually became a document. If one failed to add, say so and decline.
         println!("    WITHHELD: {} documents indexed but {} records offered, so a document ordinal",
             ix.doc_count(), indexed.len());
         println!("    no longer names the record it came from and the labels cannot be trusted.");
-        withheld.push("p50 acceptance 3 nDCG@10 verdict (document ordinals not aligned)".to_string());
+        withheld.push("p59 acceptance 3 nDCG@10 verdict (document ordinals not aligned)".to_string());
     } else {
         // ---- TWO labelled sets, and which one is allowed to vote ---------------------------------
         //
@@ -1472,7 +1472,7 @@ fn main() {
                 println!("         set would be a verdict produced by the instrument, so it gets a");
                 println!("         [note] and set [B] below carries the verdict.");
                 note.push(format!(
-                    "p50 acc.3 on EXACT-duplicate labels: fused {:.4}, text {:.4}, vector {:.4} ({} queries) — cannot adjudicate, the vector arm is perfect by construction",
+                    "p59 acc.3 on EXACT-duplicate labels: fused {:.4}, text {:.4}, vector {:.4} ({} queries) — cannot adjudicate, the vector arm is perfect by construction",
                     a.fused, a.text, a.vector, a.scored
                 ));
             }
@@ -1524,13 +1524,13 @@ fn main() {
             );
             println!("      for want of a vector. At this corpus size the non-degenerate set is NOT");
             println!("      TESTABLE, and an underpowered pass is worth nothing, so the verdict is");
-            println!("      WITHHELD the same way p49's recall is under synthetic embeddings.");
+            println!("      WITHHELD the same way p58's recall is under synthetic embeddings.");
             if b.scored > 0 {
                 print_arm(&b);
                 println!("\n      (printed for information only — too few queries to mean anything.)");
             }
             withheld.push(format!(
-                "p50 acceptance 3 nDCG@10 verdict (non-degenerate set has {} quer(ies), under {NDCG_QUERY_MIN})",
+                "p59 acceptance 3 nDCG@10 verdict (non-degenerate set has {} quer(ies), under {NDCG_QUERY_MIN})",
                 b.scored
             ));
         } else {
@@ -1555,7 +1555,7 @@ fn main() {
             let beat = b.fused > b.text && b.fused > b.vector;
             if beat {
                 println!("\n      -> fusion strictly exceeds both halves on the NON-DEGENERATE set.");
-                println!("         p50 acceptance 3 HOLDS.");
+                println!("         p59 acceptance 3 HOLDS.");
             } else {
                 let lose = if b.fused <= b.text && b.fused <= b.vector {
                     "BOTH halves"
@@ -1578,7 +1578,7 @@ fn main() {
 
             check.push((
                 format!(
-                    "p50 acc.3 fused nDCG@10 {:.4} > text {:.4} and vector {:.4} (NON-DEGENERATE near-duplicate labels, {} queries)",
+                    "p59 acc.3 fused nDCG@10 {:.4} > text {:.4} and vector {:.4} (NON-DEGENERATE near-duplicate labels, {} queries)",
                     b.fused, b.text, b.vector, b.scored
                 ),
                 beat,
@@ -1639,7 +1639,7 @@ fn main() {
     println!("\n  -> fusion costs {:.1}x the text-only p50 at full corpus ({:.0}us vs {:.0}us);",
         if text_p50_full > 0.0 { fused_p50_full / text_p50_full } else { 0.0 },
         fused_p50_full, text_p50_full);
-    println!("     p99 {fused_p99_full:.0}us. A number, not a claim — p50 acceptance 6.");
+    println!("     p99 {fused_p99_full:.0}us. A number, not a claim — p59 acceptance 6.");
 
     // =============================================================================================
     // 6. INDEX SIZE
@@ -1679,7 +1679,7 @@ fn main() {
     println!("     bucket, width, height, byte length — and `index_text::MAX_FIELD` is 4. Three of");
     println!("     them could not be indexed at all: orientation kept only as text, and height and");
     println!("     width have no numeric column, so neither can carry a hard range predicate.");
-    println!("     This is not a bench limitation to route around. `p50` claims one query plan over");
+    println!("     This is not a bench limitation to route around. `p59` claims one query plan over");
     println!("     text, facet, numeric, vector and hash predicates; that claim is bounded by how");
     println!("     many predicates fit. Raising MAX_FIELD is the WRONG fix — it is the width of");
     println!("     `[u16; MAX_FIELD]` on every posting, so it taxes every text consumer to serve");
@@ -1718,7 +1718,7 @@ fn main() {
         println!("  [HELD] {name}");
     }
     if !withheld.is_empty() {
-        println!("\n  {} verdict(s) WITHHELD. This run does not pass p49 — it declines to answer it.",
+        println!("\n  {} verdict(s) WITHHELD. This run does not pass p58 — it declines to answer it.",
             withheld.len());
     }
     println!("\nOVERALL: {}", if fail == 0 { "PASS" } else { "FAIL" });

@@ -1,9 +1,30 @@
 # P56 — an image document is column-hungrier than the engine allows
 
 **Tier:** T2 · **Bin:** `image-corpus` · **API:** `Schema`, `MAX_FIELD`
-**Status: SPEC — surfaced by `p51`, 2026-09-06.**
+**Status: SHIPPED (engine half), 2026-09-06. Format `IDXTEXT7` -> `IDXTEXT8`. No ABI change.
+`index-text` 106 -> 112 tests; workspace 261 -> 267, 0 failing.**
 
-This row was not planned. It was discovered by running `p51` against the real corpus, which is the
+`Schema::with_column(name)` declares an **unscored column**. Facet, numeric and key declarations now
+take a *column* index rather than a scored-field index, so a column that is never scored no longer
+occupies a scoring slot. `MAX_FIELD` stayed at **4** and the per-posting `[u16; MAX_FIELD]` did not
+move — asserted directly by `format::tests::unscored_columns_cost_no_posting_byte`, which serializes
+the same corpus with and without five unscored columns and compares the posting section **byte for
+byte**, not merely by size. `with_facet(field)` / `with_numeric(field)` are untouched and still take
+a scored-field index; `p65` adds a road, it does not close one.
+
+Verified against the shipping consumers rather than asserted: `real-corpus` and `facet-shop` report
+identical numbers before and after — same dictionary bytes (29896 / 6789), same accuracy to the
+decimal, same 19793 brands / 146 categories, same index growth (`+4240433 B`, 17.55 B/doc), and 0
+wrong across every correctness check. Only wall-clock latency moved, and the machine was running
+other benchmarks concurrently.
+
+**Acceptance item 3 is NOT done here** — restoring `p60`'s schema to its natural seven columns is a
+change to `crates/index-image` and `crates/index-bench`, which this lane does not own. The engine
+support the row asked for is in place and exercised by
+`index::tests::a_seven_column_schema_fits_in_four_scored_fields`, which builds exactly that
+one-scored-field / six-unscored-column image schema and facets and ranges over it.
+
+This row was not planned. It was discovered by running `p60` against the real corpus, which is the
 only reason it exists and the best argument for the benchmark that found it.
 
 ## What happened
@@ -34,7 +55,7 @@ posting, for **every existing consumer**: presyo's 241,677 products, sisia's cat
 profstopick's names. **Taxing four shipping consumers to serve one new corpus is the wrong trade,
 and doing it silently would be worse.**
 
-So `p51` was fitted into four fields instead, and the limit was recorded rather than removed. That
+So `p60` was fitted into four fields instead, and the limit was recorded rather than removed. That
 is the honest short-term answer and it is not the right long-term one.
 
 ## The actual finding
@@ -63,7 +84,7 @@ constant.
 | Raise `MAX_FIELD` to 8 | +2 bytes/posting/document for every existing consumer | Rejected as a first move — taxes four shipping apps for one corpus |
 | Decouple facet/numeric columns from text fields entirely | An API change and a format change (`IDXTEXT`n bump) | **The right answer.** A column that is never scored should not occupy a scoring slot |
 | Pack several values into one field's text | Free, but reintroduces the string-parsing `p31` exists to remove | Rejected — it is the bug that row fixed |
-| Leave the cap and fit inside it | Free | What `p51` does today, recorded as a limitation |
+| Leave the cap and fit inside it | Free | What `p60` does today, recorded as a limitation |
 
 ## Acceptance
 
@@ -71,7 +92,7 @@ constant.
 2. `[u16; MAX_FIELD]` per posting does **not** grow for a consumer that adds only unscored columns.
    Measured in bytes/document against presyo's 241,677-product baseline: the regression must be
    **zero**, not merely small.
-3. `p51`'s schema is restored to its natural seven columns, and the census reports the same numbers
+3. `p60`'s schema is restored to its natural seven columns, and the census reports the same numbers
    it reports today under the four-field workaround.
 4. Existing consumers' results are bit-identical before and after. This is a refactor of where a
    column lives, not a change to what anything scores — if a single presyo result moves, the change

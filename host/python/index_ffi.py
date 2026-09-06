@@ -157,6 +157,14 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
             [p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32],
             ctypes.c_uint32,
         ),
+        "idx_build_key": ([p, ctypes.c_uint32], ctypes.c_uint32),
+        "idx_doc_of_key": ([p, ctypes.c_char_p, ctypes.c_size_t], ctypes.c_uint32),
+        "idx_key_of": ([p, ctypes.c_uint32], ctypes.c_size_t),
+        "idx_keyed_count": ([p], ctypes.c_uint32),
+        "idx_searcher_doc_of_key": ([p, ctypes.c_char_p, ctypes.c_size_t], ctypes.c_uint32),
+        "idx_searcher_delete_key": ([p, ctypes.c_char_p, ctypes.c_size_t], ctypes.c_uint32),
+        "idx_searcher_key_of": ([p, ctypes.c_uint32], ctypes.c_size_t),
+        "idx_searcher_has_key": ([p], ctypes.c_uint32),
         # -- the image tier. `f32p` is the whole point of the row: an embedding crosses as a
         # pointer to floats the host already owns, not as text that must be parsed on arrival.
         "idx_image_new": ([ctypes.c_char_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_uint32], p),
@@ -363,6 +371,40 @@ class Live:
     def delete(self, global_doc: int) -> bool:
         return bool(self._lib.idx_searcher_delete(self._s, global_doc))
 
+    def doc_of_key(self, key: str) -> int | None:
+        """The LIVE document carrying `key`, as a global ordinal, or `None`.
+
+        Segments are searched newest first: a key present in more than one means the row was
+        updated, and the newest version is the live one.
+        """
+        k = key.encode()
+        d = self._lib.idx_searcher_doc_of_key(self._s, k, len(k))
+        return None if d == U32_MAX else d
+
+    def delete_key(self, key: str) -> bool:
+        """Tombstone the row carrying `key`. **This is what a change stream's delete becomes.**
+
+        `Live.delete` cannot serve it: that takes a dense global ordinal, which is assigned at
+        insertion and is not something a database row carries.
+
+        Deleting a key that is already gone returns `False` and is not an error -- a stream replayed
+        from an earlier offset re-delivers deletes, and refusing would make replay impossible.
+        """
+        k = key.encode()
+        return bool(self._lib.idx_searcher_delete_key(self._s, k, len(k)))
+
+    def key_of(self, global_doc: int) -> str | None:
+        """The application key of a global ordinal, or `None`."""
+        n = self._lib.idx_searcher_key_of(self._s, global_doc)
+        if n == 0:
+            return None
+        return ctypes.string_at(self._lib.idx_searcher_result_ptr(self._s), n).decode()
+
+    @property
+    def has_key(self) -> bool:
+        """Whether EVERY segment carries keys, so a change stream can address every row."""
+        return bool(self._lib.idx_searcher_has_key(self._s))
+
     @property
     def doc_count(self) -> int:
         return self._lib.idx_searcher_doc_count(self._s)
@@ -409,6 +451,7 @@ class Index:
         facet: int | list[int] | None = None,
         numeric: int | list[int] | None = None,
         position: bool = False,
+        key: int | None = None,
     ) -> "Index":
         spec = SEP.join(f"{n}:{boost}:{b}".encode() for n, boost, b in field)
         builder = lib.idx_build_new(spec, len(spec))
@@ -425,6 +468,9 @@ class Index:
         if position and not lib.idx_build_position(builder):
             lib.idx_build_free(builder)
             raise ValueError("positions must be enabled before the first document")
+        if key is not None and not lib.idx_build_key(builder, key):
+            lib.idx_build_free(builder)
+            raise ValueError(f"key field out of range or set too late: {key}")
         try:
             for r in row:
                 blob = SEP.join(v.encode() for v in r)
@@ -529,6 +575,29 @@ class Index:
         if n == 0:
             return []
         return _hit(ctypes.string_at(self._lib.idx_result_ptr(self._h), n * HIT_BYTE), n)
+
+    def doc_of_key(self, key: str) -> int | None:
+        """The document carrying `key`, or `None`.
+
+        A DELETED document is still found: this answers "which ordinal is this row", which a caller
+        needs precisely in order to delete it.
+        """
+        k = key.encode()
+        d = self._lib.idx_doc_of_key(self._h, k, len(k))
+        return None if d == U32_MAX else d
+
+    def key_of(self, doc: int) -> str | None:
+        """The application key of `doc`, or `None` when the row has none."""
+        n = self._lib.idx_key_of(self._h, doc)
+        if n == 0:
+            return None
+        return ctypes.string_at(self._lib.idx_result_ptr(self._h), n).decode()
+
+    @property
+    def keyed_count(self) -> int:
+        """Rows carrying a key. Below `doc_count` when some key fields were blank -- and those rows
+        can never be addressed by a change stream."""
+        return self._lib.idx_keyed_count(self._h)
 
     def search_phrase(self, query: str, k: int = 10, offset: int = 0) -> list[Hit]:
         """The query's tokens, consecutive and in order, within ONE field.
@@ -1046,7 +1115,7 @@ def main() -> int:
         if not ok:
             failed += 1
 
-    check(lib.idx_abi_version() == 12, "ABI version is 12")
+    check(lib.idx_abi_version() == 13, "ABI version is 13")
 
     with Index.build(lib, [("name", 3, 0.4), ("brand", 1, 0.6)], ROW) as idx:
         check(idx.doc_count == len(ROW), "doc_count matches what was added")
@@ -1343,6 +1412,44 @@ def main() -> int:
     # section passes, the fused image query is reachable from any language with `dlopen` and no
     # numerical library at all.
     image_check(lib, check)
+
+    # Application keys: saying WHICH ROW, which is what a change stream needs.
+    kf = [("sku", 0, 0.6), ("name", 3, 0.4)]
+    with Index.build(lib, kf, [
+        ["sku-1", "Colgate Total Toothpaste 150g"],
+        ["sku-2", "Aquafresh Mini Toothpaste 50g"],
+        ["", "Unkeyed Toothpaste"],
+    ], key=0) as kx:
+        check(kx.keyed_count == 2, "a blank key field is NO key, so only two rows are addressable")
+        check(kx.doc_of_key("sku-1") == 0, "a key resolves to its document")
+        check(kx.doc_of_key("sku-404") is None, "an unknown key resolves to nothing")
+        check(kx.key_of(1) == "sku-2", "and the key reads back out")
+        check(kx.key_of(2) is None, "the unkeyed row reports no key")
+
+    live3 = Live(lib, Index.build(lib, kf, [
+        ["sku-1", "Colgate Total Toothpaste 150g"],
+        ["sku-2", "Aquafresh Mini Toothpaste 50g"],
+    ], key=0))
+    with live3:
+        check(live3.has_key, "the collection is fully keyed")
+        # An UPDATE: append the new version; push retires the old one.
+        live3.push(Index.build(lib, kf, [
+            ["sku-1", "Colgate Total Charcoal Toothpaste 200g"],
+            ["sku-3", "Oral B Toothpaste Pro 120g"],
+        ], key=0))
+        check(live3.live_count == 3, "the superseded row was retired, not accumulated")
+        check(live3.doc_of_key("sku-1") == 2, "the LIVE sku-1 is the new version")
+        check(live3.key_of(2) == "sku-1", "a global ordinal reads back its key")
+        check(
+            len([h for h in live3.search("Charcoal")]) == 1,
+            "the updated row is findable by its new text",
+        )
+        # A DELETE, expressed the only way an application can.
+        check(live3.delete_key("sku-2"), "a delete by key retires the row")
+        check(not live3.delete_key("sku-2"), "replaying a delete is a no-op, not an error")
+        check(not live3.delete_key("sku-404"), "deleting a key that never existed reports False")
+        check(live3.doc_of_key("sku-2") is None, "and the row is gone")
+        check(live3.live_count == 2, "two live rows remain")
 
     check(Index.build(lib, [("name", 3, 0.4)], []).doc_count == 0, "an empty corpus builds and is empty")
 

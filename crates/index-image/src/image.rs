@@ -34,14 +34,14 @@
 //! - **Hard predicates are genuinely fused into the text pass.** Facet and numeric-range clauses go
 //!   to [`index_text::Index::search_clause`], which applies them *during* scoring. That is one
 //!   traversal of the posting list, and it is `p30`/`p31` work this crate did not have to redo.
-//! - **The vector column is one linear pass** over its own storage (`p49`).
+//! - **The vector column is one linear pass** over its own storage (`p58`).
 //! - **The hash column is one linear popcount pass.**
 //! - **The three are then fused and top-k is selected exactly once.**
 //!
 //! What this is **not** is a single interleaved traversal that advances postings and vectors in
 //! lockstep. Three passes over three columns, one selection. The distinction that matters for
 //! correctness — and the one the incumbents get wrong — is where **top-k** happens, not how many
-//! times memory is walked. `bench/roadmap/p50-image-fusion.md` asserts the property that actually
+//! times memory is walked. `bench/roadmap/p59-image-fusion.md` asserts the property that actually
 //! bites (no short page, no leak), not the implementation detail.
 
 use crate::hash::Hash64;
@@ -67,7 +67,7 @@ pub const CANDIDATE_MULTIPLIER: usize = 8;
 /// `fuse::convex` exposes `alpha` for exactly this and its doc comment gives the rule this follows:
 /// use a tuned convex combination once ~40 judgments exist, and until then prefer a default that
 /// needs no tuning set. 0.5 is that default — it asserts nothing about which signal is better,
-/// which is the honest position before the labelled set of `p50` acceptance check 3 exists.
+/// which is the honest position before the labelled set of `p59` acceptance check 3 exists.
 pub const TEXT_ALPHA: f32 = 0.5;
 
 /// The "no content address computed" sentinel. See [`ImageIndexBuilder::build`] for why the zero
@@ -156,6 +156,25 @@ impl ImageIndexBuilder {
     /// Declare a numeric column, in slot order. Passthrough to `p31`.
     pub fn with_numeric(mut self, field: usize) -> Self {
         self.text = self.text.with_numeric(field);
+        self
+    }
+
+    /// Declare a facet on an **unscored column**, resolved by name (`p65`).
+    ///
+    /// This is the declaration an image document actually wants. `p60` measured the collision that
+    /// produced `p65`: a scraped image yields seven columns — path, format, orientation, colour,
+    /// width, height, byte length — against a four-scored-field budget, so three of them could not
+    /// be indexed at all and width and height carried no range predicate. An unscored column costs
+    /// nothing per posting, which is why the fix was to stop spending a *scoring* slot on a value
+    /// nothing scores rather than to widen the slot for everybody.
+    pub fn with_facet_of(mut self, name: &str) -> Self {
+        self.text = self.text.with_facet_of(name);
+        self
+    }
+
+    /// Declare a numeric range column on an **unscored column**, resolved by name (`p65`).
+    pub fn with_numeric_of(mut self, name: &str) -> Self {
+        self.text = self.text.with_numeric_of(name);
         self
     }
 
@@ -297,7 +316,7 @@ impl ImageIndex {
         self.dhash.get(doc as usize).copied().flatten()
     }
 
-    /// Exact-duplicate lookup by content address (`p52`).
+    /// Exact-duplicate lookup by content address (`p61`).
     ///
     /// # Why this is a map, and why it was linear first
     ///
@@ -306,7 +325,7 @@ impl ImageIndex {
     /// to pick a structure from. Building an index before measuring the distribution is how the
     /// wrong index gets built.
     ///
-    /// `p51` then measured this repo's own corpus: **9.00 % of files are redundant exact copies**,
+    /// `p60` then measured this repo's own corpus: **9.00 % of files are redundant exact copies**,
     /// 118 digests occurring more than once across 1,500 sampled files. At that rate dedup is a
     /// real ingest path rather than a curiosity, and a linear scan makes ingesting *n* files
     /// O(n^2) — 17,311 files would be ~150 M comparisons of 32-byte keys for a check that should be
@@ -325,7 +344,7 @@ impl ImageIndex {
     /// Every group of two or more documents sharing a content address.
     ///
     /// Returned in ascending order of the first ordinal in each group, and each group internally
-    /// ascending, so the report `p52` prints is stable across runs on the same corpus.
+    /// ascending, so the report `p61` prints is stable across runs on the same corpus.
     pub fn duplicate_group(&self) -> Vec<Vec<u32>> {
         let mut group: HashMap<&[u8; 32], Vec<u32>> = HashMap::new();
         for (i, d) in self.digest.iter().enumerate() {
@@ -395,7 +414,7 @@ impl ImageIndex {
     ///
     /// Ties break by agreement count, then by ascending doc id. Agreement first because a document
     /// two independent signals found is genuinely better evidence than one signal's marginally
-    /// higher score; doc id last so the result is deterministic, which `p51` requires.
+    /// higher score; doc id last so the result is deterministic, which `p60` requires.
     pub fn search_fused(&self, q: &FusedQuery, k: usize) -> Vec<FusedHit> {
         if k == 0 || self.doc_count() == 0 {
             return Vec::new();
@@ -434,7 +453,7 @@ impl ImageIndex {
         // Capped at `wide`, like every other arm.
         //
         // `hash_near` returns EVERY document inside the radius, and on a real corpus that is not a
-        // small number: `p51` measured **67.09 % of images within dHash radius 4 of another** on
+        // small number: `p60` measured **67.09 % of images within dHash radius 4 of another** on
         // the 17,311-file scrape. An uncapped arm therefore hands the fusion step most of the
         // corpus, and since `hash_near` already sorts by ascending distance, everything past the
         // first `wide` entries is strictly worse than what is already there -- it cannot change the
@@ -556,7 +575,7 @@ mod test {
 
     /// A deterministic stand-in for an embedding model.
     ///
-    /// `bench/roadmap/p51-image-corpus.md` forbids reporting a recall verdict over synthetic
+    /// `bench/roadmap/p60-image-corpus.md` forbids reporting a recall verdict over synthetic
     /// vectors, and that rule holds here too: these tests assert *plumbing* — that a document is
     /// reachable, that a filter is not leaked, that selection happens once. They do not, and must
     /// not, claim anything about retrieval quality.
@@ -605,7 +624,7 @@ mod test {
 
     #[test]
     fn a_full_page_is_returned_when_enough_document_match() {
-        // THE defect the fan-out architectures have structurally. `p50` acceptance check 1.
+        // THE defect the fan-out architectures have structurally. `p59` acceptance check 1.
         let ix = fixture();
         for k in [1usize, 5, 10, 20, 40] {
             let q = FusedQuery {
@@ -621,7 +640,7 @@ mod test {
     #[test]
     fn a_facet_filter_is_never_leaked_by_the_vector_arm() {
         // The vector arm knows nothing about facets. If its candidates are trusted rather than
-        // re-filtered, a "brand: acme" query silently returns globex images. `p50` check 2.
+        // re-filtered, a "brand: acme" query silently returns globex images. `p59` check 2.
         let ix = fixture();
         let clause = [FacetClause::any(0, &["acme"])];
         let q = FusedQuery {
@@ -656,7 +675,7 @@ mod test {
 
     #[test]
     fn a_document_two_signal_found_outranks_one_a_single_signal_found() {
-        // Explicability is not decoration: `p50` check 5 requires agreement to break ties, because
+        // Explicability is not decoration: `p59` check 5 requires agreement to break ties, because
         // two independent signals agreeing is better evidence than one signal scoring marginally
         // higher.
         let ix = fixture();
@@ -716,7 +735,7 @@ mod test {
 
     #[test]
     fn the_result_is_deterministic() {
-        // `p51` requires same corpus, same verdict, every run.
+        // `p60` requires same corpus, same verdict, every run.
         let ix = fixture();
         let q = FusedQuery {
             text: Some("beach photo"),

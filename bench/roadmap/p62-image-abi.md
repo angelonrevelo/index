@@ -25,10 +25,10 @@ where it matters most, because [`docs/research/image.md`](../../docs/research/im
 | | |
 |---|---|
 | `idx_image_push_vector(ix, doc, ptr, len)` | Vectors cross the boundary as a flat `f32` buffer the host already owns. |
-| `idx_image_search_vector(ix, ptr, len, k, oversample)` | The `p49` pipeline. |
-| `idx_image_search_fused(...)` | The `p50` claim, callable from JavaScript. |
+| `idx_image_search_vector(ix, ptr, len, k, oversample)` | The `p58` pipeline. |
+| `idx_image_search_fused(...)` | The `p59` claim, callable from JavaScript. |
 | `idx_image_hash_near(ix, hi, lo, max)` | Near-duplicate lookup over the hash column. |
-| `idx_image_why(hit)` | Which signal found it — the explicability `p50` requires, preserved across the boundary. |
+| `idx_image_why(hit)` | Which signal found it — the explicability `p59` requires, preserved across the boundary. |
 | `include/index.h` | Extended, since the header is the contract, not documentation of it. |
 
 ABI 11 -> **12**.

@@ -39,9 +39,12 @@ const want = [
   'idx_search_clause', 'idx_search_page',
   'idx_searcher_search_clause', 'idx_searcher_search_page',
   'idx_build_position', 'idx_search_phrase', 'idx_searcher_search_phrase',
+  'idx_build_key', 'idx_doc_of_key', 'idx_key_of', 'idx_keyed_count',
+  'idx_searcher_doc_of_key', 'idx_searcher_delete_key', 'idx_searcher_key_of',
+  'idx_searcher_has_key',
 ];
 check(want.every((k) => k in e), `all ${want.length} ABI symbols are exported`);
-check(e.idx_abi_version() === 12, 'ABI version is 12');
+check(e.idx_abi_version() === 13, 'ABI version is 13');
 
 // Allocation round-trips through linear memory.
 const u32 = (n) => n >>> 0;
@@ -532,6 +535,64 @@ e.idx_close(h);
 
   e.idx_close(withPos);
   e.idx_close(noPos);
+}
+
+// ---- Application keys: saying WHICH ROW changed ------------------------------------------------
+//
+// A host receiving "row sku-1 changed" has the key and nothing else. Before p53 it could search but
+// never say which row it meant: `idx_searcher_delete` takes a dense ordinal assigned at insertion
+// that no database row carries. This is that gap, closed and gated.
+{
+  const spec = 'sku:0:0.6\0name:3:0.4';
+  const mk = (row) => {
+    const [sp, sl] = put(spec);
+    const b = u32(e.idx_build_new(sp, sl));
+    e.idx_free(sp, sl);
+    check(u32(e.idx_build_key(b, 0)) === 1, 'the key field is accepted before any row');
+    for (const r of row) {
+      const [dp, dl] = put(r);
+      e.idx_build_add(b, dp, dl);
+      e.idx_free(dp, dl);
+    }
+    return u32(e.idx_build_finish(b));
+  };
+  const withKey = (k, f) => {
+    const [p, n] = put(k);
+    const out = f(p, n);
+    e.idx_free(p, n);
+    return out;
+  };
+
+  const base = mk(['sku-1\0Colgate Total Toothpaste 150g', 'sku-2\0Aquafresh Mini 50g']);
+  check(u32(e.idx_keyed_count(base)) === 2, 'both rows carry a key');
+  check(withKey('sku-1', (p, n) => u32(e.idx_doc_of_key(base, p, n))) === 0, 'a key resolves to its row');
+  check(withKey('sku-404', (p, n) => u32(e.idx_doc_of_key(base, p, n))) === 0xffffffff,
+    'an unknown key is a sentinel, not a trap');
+  const kn = u32(e.idx_key_of(base, 1));
+  check(new TextDecoder().decode(new Uint8Array(e.memory.buffer, u32(e.idx_result_ptr(base)), kn)) === 'sku-2',
+    'a key reads back out of the result buffer');
+
+  const sk = u32(e.idx_searcher_new(base));           // CONSUMES base
+  check(u32(e.idx_searcher_has_key(sk)) === 1, 'the collection is fully keyed');
+
+  // An UPDATE is an append plus a retirement, because segments are immutable.
+  e.idx_searcher_push(sk, mk(['sku-1\0Colgate Total Charcoal 200g', 'sku-3\0Oral B Pro 120g']));
+  check(u32(e.idx_searcher_doc_count(sk)) === 4, 'ordinals only ever grow');
+  check(u32(e.idx_searcher_live_count(sk)) === 3, 'the superseded row was retired, not accumulated');
+  check(withKey('sku-1', (p, n) => u32(e.idx_searcher_doc_of_key(sk, p, n))) === 2,
+    'the LIVE sku-1 is the new version');
+  const gn = u32(e.idx_searcher_key_of(sk, 2));
+  check(new TextDecoder().decode(new Uint8Array(e.memory.buffer, u32(e.idx_searcher_result_ptr(sk)), gn)) === 'sku-1',
+    'a global ordinal reads back its key');
+
+  // A DELETE, expressed the only way an application can.
+  check(withKey('sku-2', (p, n) => u32(e.idx_searcher_delete_key(sk, p, n))) === 1, 'delete by key retires the row');
+  check(withKey('sku-2', (p, n) => u32(e.idx_searcher_delete_key(sk, p, n))) === 0,
+    'replaying a delete is a no-op, not an error');
+  check(withKey('sku-404', (p, n) => u32(e.idx_searcher_delete_key(sk, p, n))) === 0,
+    'deleting a key that never existed reports 0');
+  check(u32(e.idx_searcher_live_count(sk)) === 2, 'two live rows remain');
+  e.idx_searcher_close(sk);
 }
 
 // ---- The shipped host module ------------------------------------------------------------------
