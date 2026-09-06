@@ -155,6 +155,72 @@ document wants seven columns and `index_text::MAX_FIELD` allows four.
 
 
 
+## p52-p55 — the segmentation ceiling, keys on the ABI, varint positions, and a real million (2026-09-06)
+
+### p52 — collection-wide statistics
+
+- **`p38` and `p50` hit the same wall from opposite directions and neither fixed it**: each segment
+  scored IDF against its own collection statistics, so a term was rare or common according to the
+  shard holding the row rather than the corpus. A three-row delta scores a term at 0.98 where a
+  4,001-row base scores 7.89.
+- **The obvious fix made it worse.** Correcting only `doc_count` left `df = 1` against a corpus of
+  200 and inflated small segments instead of correcting them —
+  `ranking_skew_is_bounded_for_a_small_delta` rejected it in twenty minutes. **A partial correction
+  of a ratio is not a partial improvement.**
+- **Summing `df` can only be keyed on the term's TEXT**, because a term id means something different
+  in each dictionary. The FST stores no strings, but its stream already yields the key bytes during
+  traversal and the expansion was discarding them. The single-index path never pays.
+- **Broad-query agreement 51-64 % -> 84-87 %, selective rank-1 96-98 % -> 99.0-99.8 %, and now FLAT
+  in segment count** — two segments and fifty give the same quality, which is what `p38` could not
+  achieve by tuning. On a change stream the decay flattens: rank-1 fell 9 points over 8,000
+  operations and now falls 3.3; overlap fell 21 and now falls 7.5.
+- **Costs +13 % to +25 % on p50 at the recommended segment counts and ~2x on the typo tail**, timed
+  interleaved in one process because the machine was too noisy for cross-run comparison.
+  `Searcher::set_collection_stat(false)` trades it back; on by default.
+
+### p53 — keys reach the C ABI
+
+- **`p48` left keys unreachable from anything but Rust**, which meant a browser or Python service
+  could search a live collection and never update it: the only deletion the ABI offered takes a
+  dense ordinal assigned at insertion that no database row carries.
+- **Eight symbols, ABI 12 -> 13, 69 total.** An update needs none of them beyond the build-time key:
+  it is a delta plus `idx_searcher_push`, which retires the shadowed row itself.
+- **Three behaviours pinned because each is a trap**: `doc_of_key` finds DELETED documents (that is
+  what you need in order to delete them); deleting an absent key returns 0 rather than erroring (a
+  replayed stream re-delivers deletes, and replay is a pipe consumer's only recovery); every failure
+  returns a sentinel rather than trapping.
+- Gated in all three places — a Rust ABI test, `js/smoke.mjs` through the raw ABI (113 checks), and
+  `host/python/index_ffi.py` — because `p44` already learned what an ungated host does.
+
+### p54 — delta-varint positions
+
+- **`p45` published what was wrong with phrase support and declined to guess at the fix**: the offset
+  array cost 2.2x the positions it addressed, because most (term, document) pairs carry one position
+  and each paid an eight-byte offset to say so.
+- **Phrase support now costs +15.9 % of artifact size instead of +74.7 %** — position sections
+  1,778,052 B -> 377,061 B, 12.64 -> 2.68 bytes per occurrence, a 4.7x reduction. Correctness
+  re-verified identically: 980 hits over 184 real phrases, 0 wrong.
+- **The reader got stricter, not looser.** Variable width removes the length check fixed width gave
+  for free, so the count is explicit and checked, the first offset must be 0, deltas are unsigned so
+  monotonicity is structural, and every accumulation is `checked_add`.
+- Format `IDXTEXT8` -> `IDXTEXT9`. Also made the format-version test compare against `MAGIC` rather
+  than a hard-coded string, so the next bump need not remember to edit it.
+
+### p55 — the 5 ms bar at a real million, and a correction
+
+- **`p47` named the missing input and `p51` found it by accident**: presyo's `raw_product` holds
+  4,524,754 real rows. One `psql | index build` pipe later the question is answerable.
+- **The bar fails on real data too: 8.12 / 8.69 / 8.84 ms at a real million** (202,727 terms), against
+  13.58 ms on the recombined corpus (41,069 terms, held fixed). **Recombination overstated the tail
+  by ~1.6x but did not invent the failure.**
+- **This corrects `p47`**, which wrote "on every corpus of real documents this project has, the bar
+  is met" and had it repeated into README and ROADMAP. That was true only because the largest real
+  corpus was 241,677 documents; the separation it drew was between corpus SIZES and was mistaken for
+  a separation between real and synthetic data.
+- **The expansion cap, priced on real vocabulary**: cap 8 -> 6,961 us at 99.45 % top-10 agreement,
+  cap 4 -> 6,273 us at 96.90 %, cap 2 -> 5,199 us at 92.70 %. **Nothing reaches 5 ms.** The bar stays
+  red and unraised for the fourth document running, but is no longer arguable.
+
 ## p51 — the claim, tested against every database in the estate (2026-09-06)
 
 - **Swept 122 databases across 5 machines and 3 engines**: PostgreSQL 16/17/18, SQLite and DuckDB,

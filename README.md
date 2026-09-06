@@ -113,7 +113,7 @@ crates/
                 addressing, and a quantised vector column (binary popcount prefilter ->
                 int8 rerank -> exact) that fuses with index-text in ONE query plan with
                 ONE top-k selection. Ships NO model: an embedding is an INPUT.
-  index-wasm/   The binding. 61 symbols, hand-written C ABI (v12, facets/ranges/sort/
+  index-wasm/   The binding. 69 symbols, hand-written C ABI (v13, facets/ranges/sort/
                 live segments/highlight/clauses/paging/phrases/IMAGE),
                 NO wasm-bindgen,
                 so ONE artifact serves

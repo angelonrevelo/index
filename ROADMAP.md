@@ -779,46 +779,50 @@ deletes regardless of arrival order, so `upsert k; delete k` left the row presen
 **Membership is now exact over 8,000 operations (0 wrong, 14,288 = 14,288); ranking drift is
 measured, not hidden.** Format IDXTEXT7, 162 tests, one new dependency-free crate.
 
+**`p52`-`p55` closed the four items that were next in this list.** `p52` found the ceiling `p38` and
+`p50` had both hit and neither fixed — each segment scored IDF against its own statistics, so a term
+was rare or common according to the shard holding it. Correcting only the document count made it
+*worse*, which is the finding: a partial correction of a ratio is not a partial improvement. With
+`df` summed by term text as well, broad-query agreement went **51-64 % to 84-87 % and became flat in
+segment count**. `p53` put keys on the ABI, so a browser or Python host can finally say *which row*
+changed. `p54` delta-varint encoded the position sections and **phrase support fell from +74.7 % to
++15.9 %** of artifact size. `p55` used the real 4.5 M-row table `p51` stumbled on to settle the typo
+bar: **it fails on real data too, at 8.1-8.8 ms**, and recombination had been overstating it ~1.6x
+rather than inventing it — which corrects a claim `p47` made and this file repeated.
+
 **Next, in order:**
 
-1. **Commit.** Fifty roadmap documents, ~13 bench bins, two WASM hosts, the C header, the Python
-   host, the new CLI and every engine change still sit uncommitted against `d6c7500`. This is the
-   largest risk in the repository and the cheapest thing on the list, and it has been top of this
-   list for two sweeps.
-2. **Deploy an integration.** `docs/integration.md` already runs all four apps against their *own*
+1. **Deploy an integration.** `docs/integration.md` already runs all four apps against their *own*
    test suites — profstopick 9/9 and 1,922/1,958, onegrid 294/294, presyo head-to-head against its
    own SQL at 260,000 rows, sisia 91.2 % vs 0.0 % — but all of it lives on throwaway branches.
-   Opening a PR is the step nobody but you can authorize. **`p49` changes what that PR looks like**:
-   an app can now adopt the engine with a shell command in its deploy script instead of a build
-   step in its own language.
-3. **Expose keys over the C ABI.** The Rust `Searcher` and the CLI can resolve and delete by key;
-   the JavaScript and Python hosts cannot, so a browser or a Python service still cannot express an
-   update. That is the obvious next ABI bump and `p48` names it.
-4. **Global collection statistics across segments.** `p38` found segmentation costs ranking parity
-   and `p50` measured the same cost under a delete-heavy stream: 93 % rank-1 after the first delta,
-   84 % after 8,000 operations, and **no compaction threshold holds it above ~93 %** because the
-   first delta already costs that much. Per-segment statistics are the cause of both, and fixing
-   them is the only thing that would raise the ceiling rather than move the trade-off.
-5. **Decide the typo-tail bar, which is now a question about corpora rather than about code.**
-   `p47` separated the failing rows from the passing ones by whether the documents are real:
+   Opening a PR is the step nobody but you can authorize, and it is now the only item on this list
+   that nobody here can do. **`p49` changes what that PR looks like**: an app adopts the engine with
+   a shell command in its deploy script instead of a build step in its own language.
+2. **Decide the typo bar, which `p55` turned from a methodology argument into a product decision.**
+   It fails at a real million — 8.1–8.8 ms against 5 ms — and no measured arm reaches the bar:
 
    | corpus | documents | typo p99 | 5 ms bar |
    |---|---|---|---|
-   | presyo, real products | 241,677 | **4.54 ms** | **PASS** |
    | DepEd schools, real | 61,467 | **1.81 ms** | **PASS** |
-   | DepEd, recombined | 250,000 | 6.16 ms | FAIL |
+   | presyo, real products | 241,677 | **4.54 ms** | **PASS** |
+   | **presyo raw_product, REAL** | **1,000,000** | **8.1–8.8 ms** | **FAIL** |
    | DepEd, recombined | 1,000,000 | 13.58 ms | FAIL |
 
-   **The bar is met on every corpus of real documents this project has.** It fails only where
-   `scale` holds vocabulary fixed at 41,069 terms while multiplying documents up to sixteenfold,
-   which makes every posting list longer than a genuine corpus of that size would produce. Three
-   independent attacks — `p27` seeding, `p29` expansion, `p47` bounds — have each moved that row by
-   under 10 %, so the remaining options are a genuinely new enumeration strategy (bucket-tiered
-   candidate generation), a real million-document corpus to measure instead of a recombined one, or
-   `p29`'s opt-in `search_capped(.., 4)` at 98.1 % agreement. **The bar stays red and unraised.**
-6. **Phrase-query follow-ups `p45` left named:** varint/delta encoding for the position offsets (a
-   pure win, no API change), and a quoted-substring query syntax, which needs a query parser this
-   engine has deliberately never had.
+   The remaining options are unchanged and now priced on real vocabulary: build a genuinely
+   different enumeration strategy (bucket-tiered candidate generation, still unbuilt), accept ~8 ms
+   at a million and publish it as the number, or adopt `search_capped` and publish the agreement
+   beside it — cap 8 gives 6.96 ms at 99.45 % top-10 agreement. **The bar stays red and unraised.**
+3. **Recover `p52`'s second dictionary expansion.** Collection-wide statistics cost ~2x on the typo
+   tail because both passes traverse the same automaton over the same dictionary; the first could
+   hand its expansion to the second. That needs `plan` split into an expand phase and a weigh
+   phase, and it is where the whole cost lives.
+4. **Delta-encode the posting lists**, the idea `p54` proved out on the position sections. Doc ids
+   are monotone within a list and the postings are the largest section in the file — but they are
+   also the hot path, so varint decoding is a latency cost where the offsets were only a size cost.
+   Measure before believing.
+5. **A second change-stream consumer.** `index apply` is the only complete one; the hosts can now
+   express every operation it performs (`p53`) but nobody has written the JavaScript or Python
+   equivalent, so that ABI is proven by tests rather than by use.
 
 ## Done — the pruning gate
 
