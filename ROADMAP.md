@@ -839,7 +839,8 @@ rejected with reasons.
    ~250 K documents and exact beyond that. Either publish that as the product statement, adopt
    `search_capped` with its agreement figure, or build bucket-tiered enumeration. **Still red.**
 6. **Concurrency.** Every number in `docs/benchmarks.md` is one core. A 33 ms tail at 8 M is a
-   single-threaded tail, and nothing in the engine shards a query.
+   single-threaded tail, and nothing in the engine shards a query. `p73` has since threaded the
+   *build* — 1.89x at a million documents, bytes identical — but the query path is unchanged.
 
 ## Done — the pruning gate
 

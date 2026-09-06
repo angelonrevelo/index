@@ -159,6 +159,94 @@ document wants seven columns and `index_text::MAX_FIELD` allows four.
 
 
 
+## p69-p73 — the fan-out: half the bytes, a parser, a range tier, and a build that was mispriced (2026-09-06)
+
+A parallel fan-out across isolated worktrees, part of it on a free non-Anthropic model until that
+tier's quota ran out mid-run. **Every lane was gated here on the real tree before merge** — a
+worker's report is a claim about the tree, not the tree — and three of the five merges required
+fixes the lane could not have made, because the format changed underneath it.
+
+### p69 — delta-varint the posting lists
+
+The posting list was the largest section in the file and still fixed width. Doc ids ascend within a
+term's list, so their deltas varint-encode well.
+
+- **Bytes per document 106.4 → 60.0** at 100 K, 105.4 → 54.2 at 250 K, 101.3 → 51.5 at 500 K.
+  profstopick's shipped artifact went **386,043 → 220,471 bytes**.
+- **The tail improved with the size rather than paying for it** — typo p99 at 250 K went
+  5,183 → 3,286 us. Smaller postings mean more of a list per cache line.
+- The count is written **per list**, not once per section, so a single posting span still decodes on
+  its own. That is the range-read property `p72` consumes.
+- **Fixed before merge:** the lane grew `MAGIC` to nine bytes, which breaks the fixed head a range
+  reader depends on — you cannot know the head's size until you have read the version out of it. The
+  magic is held at eight bytes forever as `IDXTXT10`, dropping the `E` rather than the invariant.
+
+### p70 — a query parser
+
+`p45` left `search_phrase` treating the whole query as one phrase, so `red "ice cream"` was
+inexpressible. `parse()` separates terms, quoted phrases and exclusions — a pure function over a
+string, no index access, no new dependency, with a fuzz loop asserting it never panics.
+
+**Its own test caught a real bug:** `flush` cleared the negation marker unconditionally and an
+opening quote also flushes, so a negated phrase lost its marker and was filed as a *required* phrase
+— the exact inversion, silently.
+
+### p71 — the TOAST placeholder, refused by name
+
+`p67` measured that every table with a TOAST relation in the estate holds TOASTed data (7.8 GB in
+presyo alone), and that logical decoding emits a placeholder rather than the value for an untouched
+TOASTed column. `--require` guarded the *empty* case; the placeholder is a **sentinel string**, so it
+waved it through. `--placeholder VALUE` now refuses the record naming the field and the key, and
+`index stat` reports empty-value counts per field so blanking that already happened is detectable.
+
+### p72 — the range tier: query an index without reading it
+
+`p68` left the range path unwired; `p56` measured a 10 M index at ~910 MB, which a tab cannot hold.
+
+- **A prefetch plan, not a lazy handle.** `createSyncAccessHandle().read()` is worker-only and
+  synchronous and cannot be awaited from inside a WASM call without JSPI or cross-origin isolation.
+  A plan is also inspectable — the host can count the bytes, and the byte count is the claim.
+- Measured in a real Chromium: opened from 296 B + resident sections, **82,785 B of 220,470 read =
+  37.5 %**, **4/4 hits identical** to a whole-file open, **0 network calls**.
+- Answers are exact, not approximate: where a tie-break would need a `df` the planner has not read,
+  the call verifies and returns `u32::MAX` so the host falls back to a full open.
+- **Fixed before merge:** unfetched terms were given a zero-length span, which `p69` had just made
+  invalid — an empty list is now the byte `0x00`, and a zero-length span is unreadable rather than
+  empty. Also the Python host's ABI pin was not moved 13 → 14.
+
+### p73 — the build was never bound by the thing everyone threaded
+
+`p56` closed with *"no concurrency"*, which reads as an invitation to thread `build()`. Profiling
+first showed `build()` and `rebuild_meta()` were **2.6 s of a 24.3 s** million-document build, so
+threading them alone caps at 12 %. The real cost was the builder's inner
+`BTreeMap<u32, [u16; MAX_FIELD]>` — 15 M node allocations sorting data that already arrived sorted.
+
+- Append-only posting columns plus threading on `std::thread::scope`, **no new dependency**.
+- **1,000,000 documents: 18,436 → 9,732 ms (1.89x)**, and **bytes identical at all five scale rungs**.
+- A test builds a corpus that *asserts* it crosses the threading threshold, then rebuilds it
+  genuinely serial via a `cfg(test)` thread-local and compares `to_bytes()`.
+- **Corrects the lane's own 2.38x claim**: it branched from a pre-`p69` base, so its "before" column
+  was slower than this tree's.
+
+### Rejected in the same fan-out
+
+- **prefix-bleed** — gave every strict prefix extension +1 edit distance so an exact term outranks
+  its own extensions. Tests passed, clippy clean, principled. But `typo_bucket` is the *primary* sort
+  key, so the +1 demoted legitimate typeahead: **maphy-place hit rate 76.2 % → 46.9 %**, a 29-point
+  regression — and it **did not move the metric it targeted** (sisia prefix bleed stayed at 1,391
+  extra rows against LIKE's 295), because the change reorders results rather than removing them.
+
+### Honest gaps
+
+- **The free-model tier ran out mid-fan-out.** Two lanes returned with no changes for that reason,
+  not because the work was done; they were relaunched on a different worker.
+- **`p70`'s parser is not wired to the ABI.** It parses and is tested; `idx_searcher_*` still takes a
+  pre-split clause set.
+- **`p72`'s 37.5 % is one artifact and four queries.** The fraction should fall sharply with file
+  size, and that is unmeasured.
+- **`p73` leaves tokenization as the largest single build cost** — 6.9 s of the remaining 9.7 s at
+  1 M — and query remains single-threaded.
+
 ## p56, p67, p68 — the browser tier, the scaling grid, and the connector priced (2026-09-06)
 
 ### p68 — the OPFS tier (see also `js/opfs.mjs`, `js/opfs-worker.mjs`, `js/opfs.html`)

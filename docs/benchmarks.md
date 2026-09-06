@@ -18,7 +18,9 @@ And §7.3, on the other absence:
 
 So: the grid, and the staleness contract.
 
-**Machine.** One Windows workstation, Samsung MZALQ512HALU NVMe, single-threaded throughout.
+**Machine.** One Windows workstation, Samsung MZALQ512HALU NVMe. **Every query number here is
+single-threaded**; since `p69`/`p73` the *build* is threaded, which is why the `build` column above
+carries a staleness note and the query columns do not.
 `rdtsc` timing with calibrated overhead subtraction (`crates/index-bench/src/timer.rs`). Numbers
 were taken while a parallel build was sometimes running on the same box — where that mattered,
 arms are timed **interleaved in one process** rather than compared across runs, and it is said so.
@@ -26,6 +28,29 @@ arms are timed **interleaved in one process** rather than compared across runs, 
 ---
 
 ## 1. The scaling grid — real documents, real vocabulary
+
+> ### ⚠ This grid was measured before `p69` and `p73`, and both moved it
+>
+> The engine has changed underneath these numbers, in the two columns they are read for. Stating it
+> here rather than quietly leaving the table wrong:
+>
+> - **`p69` (delta-varint postings) roughly halved the `bytes` and `B/doc` columns.** Re-measured on
+>   the same bin at the rungs it covered: **100 K 106.4 → 60.0**, **250 K 105.4 → 54.2**,
+>   **500 K 101.3 → 51.5 B/doc**. The 1 M–8 M rungs are **not** re-measured. A 10 M index should now
+>   be estimated at roughly **500 MB, not 910 MB**.
+> - **`p69` also improved the tail** it was expected to charge for: **typo p99 at 250 K
+>   5,183 → 3,286 us**, at 500 K 5,601 → 5,392 us. The 5 ms bar's crossing point therefore moved
+>   **up** from ~250 K, and the "holds to ~250 K" verdict below is now **conservative** rather than
+>   current.
+> - **`p73` (parallel build) roughly halved the `build` column** — a million recombined documents
+>   went 18,436 → 9,732 ms on the `scale` bin, bytes identical. The `build` figures below are
+>   single-threaded and are now an upper bound.
+>
+> **Why it is not simply re-run here.** The corpus is a live pull from presyo's `raw_product`;
+> `bench/fixture/presyo-1m.tsv` is not committed. Re-timing it also requires an otherwise-idle box,
+> and this grid is worth exactly one authoritative re-run once the current work lands — a benchmark
+> taken next to three running builds is not a measurement.
+
 
 **Corpus:** 8,290,639 real product names from presyo's `raw_product` and `extraction_insight`.
 Queries are real product names drawn from the indexed slice, then corrupted by transposing one
@@ -213,7 +238,8 @@ Nothing here is hidden elsewhere in this file.
 - **Ranking drifts under a change stream** — 92.7 % → 88.7 % rank-1 over 8,000 operations. Exact on
   membership, approximate on order, until a rebuild.
 - **Segmentation costs ~310x p50 at 50 segments.** Usable only in single digits.
-- **Everything is single-threaded.** No query is sharded across cores.
+- **Every query is single-threaded.** Nothing shards a query across cores. `p73` threaded the
+  *build* (1.89x at a million, bytes identical); the query path is untouched by it.
 - **10 M is unmeasured** because 10 M of real text does not exist in this estate, and recombining to
   reach it would report a number ~2x worse than reality.
 - **Learned-expansion queries still score per segment** — the expansion table stores term ids, not
