@@ -12,4 +12,9 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 index-text = { path = "../index-text" }
 
+# The image tier. It is itself dependency-free (no model, no ONNX runtime, no image decoder — an
+# embedding is an INPUT), so adding it here costs the artifact its own code and nothing else, which
+# is the only reason a browser-shippable image search is possible at all.
+index-image = { path = "../index-image" }
+
 # Profiles are set at the workspace root; a per-package profile would be ignored anyway.

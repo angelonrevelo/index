@@ -46,6 +46,22 @@ jobs:
       - name: WASM loads and answers a query in Node
         run: node js/smoke.mjs
 
+      # The image tier through the SAME C ABI, in Node. This is hermetic -- it builds its index
+      # in-process and needs no corpus -- so unlike `image-corpus` (whose 17,311-file scrape is
+      # machine-local and skips cleanly when absent) it belongs in the gate. It asserts the ABI
+      # version, a fused query's exact ordering against one computed in JS, and that the vector arm
+      # does not leak a facet filter -- the defect `bench/roadmap/p50-image-fusion.md` exists to
+      # catch.
+      - name: The image tier answers a fused query in Node
+        run: node js/image-smoke.mjs
+
+      # The CLI is the only surface a database administrator ever touches, so "it builds" is not
+      # enough: this drives `build`, `apply` and `search` end to end over a pipe, exactly as the
+      # README tells people to, and asserts that applying a change stream converges on the same
+      # answers as rebuilding from the final state.
+      - name: CLI builds an index from a pipe and keeps it current
+        run: bash scripts/cli-smoke.sh
+
       # This one is a correctness gate, not a performance gate. `geo-bench` asserts that the WASM
       # index and a pure-JS scan return the IDENTICAL polygon for every one of 53,715 real points,
       # and throws otherwise. The timings it prints are informational here — CI runners are far too

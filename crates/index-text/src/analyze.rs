@@ -175,6 +175,124 @@ pub fn parse_quantity(tok: &str) -> Option<Quantity> {
 /// Splits on any non-alphanumeric character, **except** that a `.` or `,` directly between two
 /// digits is kept, so `1.5l` survives as one token rather than becoming `1` and `5l`.
 /// Quantity tokens are rewritten to their canonical form.
+/// [`fold`], plus the **original byte offset** each folded character came from.
+///
+/// Folding is not length-preserving -- a diacritic is dropped, `ß` lowercases to two characters --
+/// so an offset into the folded string says nothing about the input. Highlighting needs offsets
+/// into the text the caller passed, which is what this returns.
+///
+/// Kept separate from [`fold`] rather than replacing it: `fold` runs on every field of every
+/// document at build time and should not allocate a second vector to serve a query-time feature.
+/// `fold_agrees_with_fold_with_origin` pins the two to the same output.
+pub fn fold_with_origin(s: &str) -> (String, Vec<usize>) {
+    let mut out = String::with_capacity(s.len());
+    let mut origin = Vec::with_capacity(s.len());
+    for (at, ch) in s.char_indices() {
+        match strip_diacritic(ch) {
+            Some(base) => {
+                for c in base.to_lowercase() {
+                    out.push(c);
+                    origin.push(at);
+                }
+            }
+            None => {
+                if !('\u{0300}'..='\u{036F}').contains(&ch) {
+                    for c in ch.to_lowercase() {
+                        out.push(c);
+                        origin.push(at);
+                    }
+                }
+            }
+        }
+    }
+    (out, origin)
+}
+
+/// [`tokenize`], plus each token's `[start, end)` byte range in the ORIGINAL text.
+///
+/// Produces exactly the same tokens as [`tokenize`] -- pinned by
+/// `tokenize_span_matches_tokenize` -- so a highlight can never disagree with what was indexed.
+/// When two tokens merge into a quantity (`500` + `ml` -> `500ml`) the surviving span covers both,
+/// which is what a reader expects to see underlined.
+pub fn tokenize_span(text: &str) -> Vec<(Token, usize, usize)> {
+    let (folded, origin) = fold_with_origin(text);
+    let ch: Vec<char> = folded.chars().collect();
+    // Byte offset in `text` just past the character that produced folded char `i`.
+    let end_of = |i: usize| -> usize {
+        let at = origin.get(i).copied().unwrap_or(text.len());
+        text[at..].chars().next().map_or(text.len(), |c| at + c.len_utf8())
+    };
+
+    let mut out: Vec<(Token, usize, usize)> = Vec::new();
+    let mut cur = String::new();
+    let mut position = 0u32;
+    let mut first: Option<usize> = None;
+    let mut last = 0usize;
+
+    let flush = |cur: &mut String,
+                     out: &mut Vec<(Token, usize, usize)>,
+                     position: &mut u32,
+                     first: &mut Option<usize>,
+                     last: usize| {
+        if cur.is_empty() {
+            *first = None;
+            return;
+        }
+        let t = match parse_quantity(cur) {
+            Some(q) => q.token(),
+            None => std::mem::take(cur),
+        };
+        cur.clear();
+        let is_numeric = t.chars().any(|c| c.is_ascii_digit());
+        let start = first.map_or(0, |f| origin.get(f).copied().unwrap_or(0));
+        out.push((Token { text: t, position: *position, is_numeric }, start, end_of(last)));
+        *position += 1;
+        *first = None;
+    };
+
+    for i in 0..ch.len() {
+        let c = ch[i];
+        if c.is_alphanumeric() {
+            if first.is_none() {
+                first = Some(i);
+            }
+            last = i;
+            cur.push(c);
+        } else if (c == '.' || c == ',' || c == '-')
+            && i > 0
+            && ch[i - 1].is_ascii_digit()
+            && ch.get(i + 1).is_some_and(|n| n.is_ascii_digit())
+        {
+            last = i;
+            cur.push('.');
+        } else {
+            flush(&mut cur, &mut out, &mut position, &mut first, last);
+        }
+    }
+    flush(&mut cur, &mut out, &mut position, &mut first, last);
+
+    // Mirror `merge_split_quantity`, extending the span over both halves.
+    let mut i = 0;
+    while i + 1 < out.len() {
+        let number_only = !out[i].0.text.is_empty()
+            && out[i].0.text.chars().all(|c| c.is_ascii_digit() || c == '.');
+        let unit_only = !out[i + 1].0.text.is_empty()
+            && out[i + 1].0.text.chars().all(|c| c.is_ascii_alphabetic());
+        if number_only && unit_only {
+            let joined = format!("{}{}", out[i].0.text, out[i + 1].0.text);
+            if let Some(q) = parse_quantity(&joined) {
+                out[i].0.text = q.token();
+                out[i].0.is_numeric = true;
+                out[i].2 = out[i + 1].2;
+                out.remove(i + 1);
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 pub fn tokenize(text: &str) -> Vec<Token> {
     let folded = fold(text);
     let bytes: Vec<char> = folded.chars().collect();
@@ -370,6 +488,56 @@ pub fn apply_alias(token: &mut [Token], alias: &AliasTable) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The span tokenizer is a second implementation of the tokenizing rules, so it can drift from
+    /// the first. It must not: a highlight that disagrees with what was indexed marks the wrong
+    /// words. These pin them together over the shapes the rules actually bend for.
+    #[test]
+    fn tokenize_span_matches_tokenize() {
+        for text in [
+            "",
+            "   ",
+            "Colgate Total Toothpaste 150g",
+            "Lucky Me Pancit Canton 60g",
+            "1.5L Coke Zero",
+            "MATH 30-23 section",
+            "Cafe\u{301} Espan\u{303}ol nin\u{303}o",
+            "Nesc\u{e1}fe 3-in-1",
+            "500 ml bottle",
+            "a,b.c-d",
+            "\u{df}rasse 12,5 kg",
+            "---",
+            "9",
+        ] {
+            let plain = tokenize(text);
+            let span: Vec<Token> = tokenize_span(text).into_iter().map(|(t, _, _)| t).collect();
+            assert_eq!(plain, span, "token streams diverge for {text:?}");
+        }
+    }
+
+    #[test]
+    fn fold_agrees_with_fold_with_origin() {
+        for text in ["", "Caf\u{e9}", "\u{df}", "ÅNGSTRÖM", "1.5L", "ni\u{f1}o"] {
+            assert_eq!(fold(text), fold_with_origin(text).0, "fold diverges for {text:?}");
+        }
+    }
+
+    /// Spans must index the ORIGINAL text, not the folded one -- folding is not length preserving.
+    #[test]
+    fn spans_point_into_the_original_text() {
+        let text = "Caf\u{e9} Nesc\u{e1}fe 500 ml";
+        for (t, a, b) in tokenize_span(text) {
+            assert!(a <= b && b <= text.len(), "span {a}..{b} out of bounds for {text:?}");
+            assert!(text.is_char_boundary(a) && text.is_char_boundary(b), "span not on a boundary");
+            let raw = &text[a..b];
+            assert!(!raw.is_empty(), "empty span for token {:?}", t.text);
+        }
+        let span = tokenize_span(text);
+        assert_eq!(&text[span[0].1..span[0].2], "Caf\u{e9}", "the accented word keeps its bytes");
+        // `500` + `ml` merge into one quantity token, and the span covers both halves.
+        let last = span.last().unwrap();
+        assert_eq!(&text[last.1..last.2], "500 ml");
+    }
 
     /// profstopick's scar: `Peña-Reyes` must be reachable by typing `pena`.
     /// Its measured failure was 72 entries unreachable by the name a student actually types.

@@ -89,10 +89,102 @@ impl Searcher {
 
     /// Append a segment. Its documents take the next global ordinals, so ordinals already handed
     /// out never move — an application may store them.
-    pub fn push(&mut self, segment: Index) {
+    ///
+    /// **If both the collection and the new segment carry application keys, a key the new segment
+    /// re-uses SHADOWS the older document, which is tombstoned here.** That is what makes an update
+    /// expressible at all: segments are immutable, so "row 4172 changed" can only mean "append the
+    /// new version and retire the old one". Doing it inside `push` is what keeps the invariant the
+    /// rest of the API relies on —
+    ///
+    /// > **at most one live document per key** —
+    ///
+    /// true by construction rather than by the caller remembering. Without it a change stream
+    /// silently accumulates every historical version of every row, and a search returns all of
+    /// them: a duplicate that looks like a ranking bug and is actually a bookkeeping one.
+    ///
+    /// Returns the number of documents retired this way. Zero when either side is unkeyed, so an
+    /// append-only collection is unaffected and this costs it nothing.
+    pub fn push(&mut self, segment: Index) -> usize {
+        let mut shadowed = 0usize;
+        if segment.has_key() && self.segment.iter().any(Index::has_key) {
+            // Collected first: resolution borrows `self` immutably and the tombstoning needs it
+            // mutably. Keys are borrowed from the incoming segment, which is not yet moved in.
+            let retire: Vec<u32> =
+                segment.key_iter().filter_map(|(k, _)| self.doc_of_key(k)).collect();
+            for global in retire {
+                if self.delete(global) {
+                    shadowed += 1;
+                }
+            }
+        }
         self.base.push(self.doc_count as u32);
         self.doc_count += segment.doc_count();
         self.segment.push(segment);
+        shadowed
+    }
+
+    /// Borrow segment `i`, in insertion order.
+    ///
+    /// A collection persisted as files needs this: applying a change stream tombstones documents
+    /// inside existing segments, and those segments have to be re-serialized to make the deletion
+    /// survive a restart. Without it a caller would have to keep its own parallel copy of the
+    /// segments and hope the two agree.
+    pub fn segment(&self, i: usize) -> Option<&Index> {
+        self.segment.get(i)
+    }
+
+    /// The live document carrying `key`, as a **global** ordinal, or `None`.
+    ///
+    /// Segments are searched **newest first**, because a key present in more than one segment means
+    /// the row was updated and the newest version is the live one. `push` tombstones the older
+    /// ones, so this normally finds the only live occurrence on the first hit; the ordering is what
+    /// makes it correct even for a collection assembled without that guarantee.
+    pub fn doc_of_key(&self, key: &str) -> Option<u32> {
+        for (i, seg) in self.segment.iter().enumerate().rev() {
+            if let Some(local) = seg.doc_of_key(key) {
+                if !seg.is_deleted(local) {
+                    return Some(self.base[i] + local);
+                }
+            }
+        }
+        None
+    }
+
+    /// The application key of a global ordinal, if it has one.
+    pub fn key_of(&self, global: u32) -> Option<&str> {
+        let (i, local) = self.locate(global)?;
+        self.segment[i].key_of(local)
+    }
+
+    /// Tombstone the row carrying `key`. Returns `true` if a live row was found and retired.
+    ///
+    /// This is the operation a change stream's *delete* becomes. [`Searcher::delete`] cannot serve
+    /// it: that takes a dense global ordinal, which is assigned at insertion and is not something a
+    /// database row carries.
+    pub fn delete_key(&mut self, key: &str) -> bool {
+        match self.doc_of_key(key) {
+            Some(global) => self.delete(global),
+            None => false,
+        }
+    }
+
+    /// Whether every segment carries keys, so the collection can be driven by a change stream.
+    ///
+    /// All-or-nothing on purpose: one unkeyed segment means some rows can never be addressed by
+    /// key, and an `apply` that silently skipped them would drift from the source of truth without
+    /// any signal that it had.
+    pub fn has_key(&self) -> bool {
+        !self.segment.is_empty() && self.segment.iter().all(Index::has_key)
+    }
+
+    /// How many live documents carry a key. Equal to `live_count()` for a fully keyed collection;
+    /// less when some rows had a blank key field, which is worth surfacing because those rows can
+    /// never be updated or deleted by a change stream.
+    pub fn keyed_count(&self) -> usize {
+        self.segment
+            .iter()
+            .map(|s| s.key_iter().filter(|&(_, d)| !s.is_deleted(d)).count())
+            .sum()
     }
 
     pub fn segment_count(&self) -> usize {
@@ -205,6 +297,246 @@ impl Searcher {
     }
 
     /// [`Searcher::search`] with typeahead semantics on the last token.
+    /// Byte ranges of `text` that matched `query`.
+    ///
+    /// Delegates to the segment that owns `global`, because typo expansion is resolved against that
+    /// segment's dictionary — the same vocabulary that decided the hit. Using another segment's
+    /// dictionary could mark a word the match never considered.
+    pub fn highlight(&self, global: u32, query: &str, text: &str) -> Vec<(usize, usize)> {
+        match self.locate(global) {
+            Some((i, _)) => self.segment[i].highlight(query, text),
+            None => Vec::new(),
+        }
+    }
+
+    /// **Faceted search across every segment**, conjunctive over `(slot, value)` pairs.
+    ///
+    /// Facet labels are interned **per segment**, so the same value can carry a different id in
+    /// each one. Resolution therefore happens inside each segment, by string, and a segment that
+    /// has never seen the value simply contributes nothing — which is the right answer, not an
+    /// error: a value can legitimately exist only in the newest delta.
+    pub fn search_facet_all(&self, query: &str, k: usize, want: &[(usize, &str)]) -> Vec<Hit> {
+        self.merge(k, |ix| ix.search_facet_all(query, k, want))
+    }
+
+    /// **The full filter bar across every segment**: OR within a clause, AND across clauses, NOT.
+    ///
+    /// Clause values are resolved inside each segment, by string, for the same reason
+    /// [`Searcher::facet_tally_at`] merges by string: labels are interned per segment and the same
+    /// integer means different things in each.
+    pub fn search_clause(
+        &self,
+        query: &str,
+        k: usize,
+        offset: usize,
+        clause: &[crate::index::FacetClause],
+        range: &[(usize, f64, f64)],
+    ) -> Vec<Hit> {
+        // Each segment must yield everything up to the end of the page, because the global page
+        // boundary is only known after the merge -- a segment's 3rd-best can be the page's 1st.
+        let want = k.saturating_add(offset);
+        let mut all = self.merge(want, |ix| ix.search_clause(query, want, 0, clause, range));
+        if offset > 0 {
+            all.drain(..offset.min(all.len()));
+        }
+        all
+    }
+
+    /// **Phrase query across every segment.**
+    ///
+    /// Resolution is per segment, like a facet clause and for the same reason: a phrase's terms are
+    /// resolved against the dictionary that will verify them, and a segment that has never seen one
+    /// of the words contributes nothing. A phrase is exact, so a segment missing a word genuinely
+    /// cannot contain the phrase -- this is not an approximation.
+    ///
+    /// A segment built without positions contributes nothing rather than falling back to a
+    /// bag-of-words match, which would quietly mix phrase and non-phrase results in one list.
+    pub fn search_phrase(&self, query: &str, k: usize) -> Vec<Hit> {
+        self.merge(k, |ix| ix.search_phrase(query, k))
+    }
+
+    /// [`Searcher::search_phrase`] with an offset, over-fetching per segment the way
+    /// [`Searcher::search_page`] does.
+    pub fn search_phrase_page(&self, query: &str, offset: usize, k: usize) -> Vec<Hit> {
+        let want = k.saturating_add(offset);
+        let mut all = self.merge(want, |ix| ix.search_phrase_page(query, 0, want));
+        if offset > 0 {
+            all.drain(..offset.min(all.len()));
+        }
+        all
+    }
+
+    /// [`Searcher::search`] starting at `offset` — page `n` is `offset = n * k`.
+    ///
+    /// Cost grows with `offset` and with segment count together: every segment must produce
+    /// `offset + k` before the merge can find the page.
+    pub fn search_page(&self, query: &str, offset: usize, k: usize) -> Vec<Hit> {
+        let want = k.saturating_add(offset);
+        let mut all = self.merge(want, |ix| ix.search_page(query, 0, want));
+        if offset > 0 {
+            all.drain(..offset.min(all.len()));
+        }
+        all
+    }
+
+    /// [`Searcher::search_facet_all`] against facet slot 0.
+    pub fn search_facet(&self, query: &str, k: usize, value: &str) -> Vec<Hit> {
+        self.search_facet_all(query, k, &[(0, value)])
+    }
+
+    /// [`Searcher::search_facet_all`] against one slot.
+    pub fn search_facet_at(&self, query: &str, k: usize, slot: usize, value: &str) -> Vec<Hit> {
+        self.search_facet_all(query, k, &[(slot, value)])
+    }
+
+    /// Search restricted to a half-open numeric range, across every segment.
+    pub fn search_range(&self, query: &str, k: usize, slot: usize, lo: f64, hi: f64) -> Vec<Hit> {
+        self.merge(k, |ix| ix.search_range(query, k, slot, lo, hi))
+    }
+
+    /// The whole filter bar — facets and numeric ranges — across every segment.
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        k: usize,
+        want: &[(usize, &str)],
+        range: &[(usize, f64, f64)],
+    ) -> Vec<Hit> {
+        self.merge(k, |ix| ix.search_filtered(query, k, want, range))
+    }
+
+    /// **Facet tally across every segment**, merged by VALUE rather than by id.
+    ///
+    /// Two segments intern their labels independently, so slot 1's id 4 may be `"Dairy"` in one and
+    /// `"Snacks"` in another. Merging on the integer would silently add unrelated categories
+    /// together — a wrong count that looks like a count. The merge is therefore keyed on the string.
+    ///
+    /// Deleted documents are excluded by each segment, so the counts are live counts.
+    pub fn facet_tally_at(&self, query: &str, slot: usize) -> Vec<(String, usize)> {
+        let mut total: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for ix in &self.segment {
+            for (label, n) in ix.facet_tally_at(query, slot) {
+                *total.entry(label).or_default() += n;
+            }
+        }
+        let mut out: Vec<(String, usize)> =
+            total.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        out.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
+
+    /// [`Searcher::facet_tally_at`] for slot 0.
+    pub fn facet_tally(&self, query: &str) -> Vec<(String, usize)> {
+        self.facet_tally_at(query, 0)
+    }
+
+    /// Histogram across every segment. Bucket edges are caller-supplied and identical for all
+    /// segments, so unlike a facet tally these counts add elementwise with no key to reconcile.
+    pub fn range_tally(&self, query: &str, slot: usize, edge: &[f64]) -> Vec<usize> {
+        let mut total = vec![0usize; edge.len().saturating_sub(1)];
+        for ix in &self.segment {
+            for (i, n) in ix.range_tally(query, slot, edge).into_iter().enumerate() {
+                if let Some(t) = total.get_mut(i) {
+                    *t += n;
+                }
+            }
+        }
+        total
+    }
+
+    /// Sort by a numeric column across every segment.
+    ///
+    /// Each segment returns its own `k` best by value; the merge re-sorts by value and truncates.
+    /// Taking `k` from each is what makes the result exact — the global `k` cheapest can all live
+    /// in one segment.
+    pub fn search_sorted(&self, query: &str, k: usize, slot: usize, ascending: bool) -> Vec<Hit> {
+        self.search_sorted_filtered(query, k, slot, ascending, &[], &[])
+    }
+
+    /// [`Searcher::search_sorted`] with the filter bar applied first.
+    pub fn search_sorted_filtered(
+        &self,
+        query: &str,
+        k: usize,
+        slot: usize,
+        ascending: bool,
+        want: &[(usize, &str)],
+        range: &[(usize, f64, f64)],
+    ) -> Vec<Hit> {
+        if k == 0 {
+            return Vec::new();
+        }
+        // Cannot reuse `merge`: that orders by rank, and this orders by value. Collect with the
+        // originating segment so the value can be read back after globalisation.
+        let mut all: Vec<(f64, Hit)> = Vec::new();
+        for (i, ix) in self.segment.iter().enumerate() {
+            let base = self.base[i];
+            for h in ix.search_sorted_filtered(query, k, slot, ascending, want, range) {
+                let Some(v) = ix.numeric_of(h.doc, slot) else { continue };
+                let mut g = h;
+                g.doc += base;
+                all.push((v, g));
+            }
+        }
+        all.sort_by(|a, b| {
+            let primary = if ascending { a.0.total_cmp(&b.0) } else { b.0.total_cmp(&a.0) };
+            primary.then_with(|| crate::index::rank_cmp(&a.1, &b.1))
+        });
+        all.truncate(k);
+        all.into_iter().map(|(_, h)| h).collect()
+    }
+
+    /// The facet value of a global document ordinal, in slot 0.
+    pub fn facet_of(&self, global: u32) -> Option<&str> {
+        self.facet_of_at(global, 0)
+    }
+
+    /// The facet value of a global document ordinal, in a given slot.
+    pub fn facet_of_at(&self, global: u32, slot: usize) -> Option<&str> {
+        let (i, local) = self.locate(global)?;
+        self.segment[i].facet_of_at(local, slot)
+    }
+
+    /// The numeric value of a global document ordinal, in a given column.
+    pub fn numeric_of(&self, global: u32, slot: usize) -> Option<f64> {
+        let (i, local) = self.locate(global)?;
+        self.segment[i].numeric_of(local, slot)
+    }
+
+    /// Every distinct facet value in a slot, across all segments, sorted.
+    ///
+    /// Segments are unioned by string for the same reason tallies are: independent interning.
+    pub fn facet_label_at(&self, slot: usize) -> Vec<String> {
+        let mut all: Vec<String> = Vec::new();
+        for ix in &self.segment {
+            all.extend(ix.facet_label_at(slot).iter().cloned());
+        }
+        all.sort_unstable();
+        all.dedup();
+        all
+    }
+
+    /// How many facet slots the segments carry.
+    ///
+    /// Reported from the **first** segment. Segments with mismatched facet configuration are a
+    /// caller error this type cannot repair -- see [`Searcher::facet_config_is_uniform`].
+    pub fn facet_slot_count(&self) -> usize {
+        self.segment.first().map_or(0, |s| s.facet_slot_count())
+    }
+
+    /// Do all segments agree on their facet and numeric column layout?
+    ///
+    /// A delta segment built from a different schema would put a different field in slot 0, so
+    /// `search_facet_at(.., 0, "Dairy")` would mean two different questions in two segments and
+    /// silently return a mixture. Nothing prevents that at `push` time -- a segment is just an
+    /// `Index` -- so this is offered as a check an application can assert once after loading.
+    pub fn facet_config_is_uniform(&self) -> bool {
+        let Some(first) = self.segment.first() else { return true };
+        self.segment.iter().all(|s| {
+            s.facet_field() == first.facet_field() && s.numeric_field() == first.numeric_field()
+        })
+    }
+
     pub fn search_prefix(&self, query: &str, k: usize) -> Vec<Hit> {
         self.merge(k, |ix| ix.search_prefix(query, k))
     }
@@ -231,6 +563,325 @@ impl Searcher {
 mod tests {
     use super::*;
     use crate::index::{Doc, Field, IndexBuilder, Schema};
+
+    fn shop(row: &[(&str, &str, &str)]) -> Index {
+        let mut b = IndexBuilder::new(Schema::new(vec![
+            Field::new("name", 3.0, 0.4),
+            Field::new("brand", 1.0, 0.6),
+            Field::new("size", 0.0, 0.6),
+        ]))
+        .with_facet(1)
+        .with_numeric(2);
+        for (n, br, sz) in row {
+            b.add(&Doc::new(vec![*n, *br, *sz]));
+        }
+        b.build().unwrap()
+    }
+
+    /// Two segments that intern the SAME label at DIFFERENT ids.
+    ///
+    /// This is the case a tally merged on the integer id gets silently wrong: it would add
+    /// unrelated categories together and report a plausible number. Segment 0 sees Colgate first,
+    /// segment 1 sees Aquafresh first, so `"Colgate"` is id 0 in one and id 1 in the other.
+    #[test]
+    fn facet_tally_merges_by_value_not_by_interned_id() {
+        let a = shop(&[
+            ("Colgate Toothpaste Large", "Colgate", "150"),
+            ("Aquafresh Toothpaste Mini", "Aquafresh", "50"),
+        ]);
+        let b = shop(&[
+            ("Aquafresh Toothpaste Twin", "Aquafresh", "100"),
+            ("Aquafresh Toothpaste Family", "Aquafresh", "300"),
+            ("Colgate Toothpaste Travel", "Colgate", "25"),
+        ]);
+        // The premise of the test: the two segments really do disagree about ids.
+        assert_eq!(a.facet_label_at(0), ["Aquafresh", "Colgate"]);
+        assert_eq!(b.facet_label_at(0), ["Aquafresh", "Colgate"]);
+        assert_eq!(a.facet_of_at(0, 0), Some("Colgate"));
+        assert_eq!(b.facet_of_at(0, 0), Some("Aquafresh"));
+
+        let mut s = Searcher::new(a);
+        s.push(b);
+        assert!(s.facet_config_is_uniform());
+
+        let t = s.facet_tally("Toothpaste");
+        assert_eq!(t, vec![("Aquafresh".to_string(), 3), ("Colgate".to_string(), 2)]);
+        assert_eq!(t.iter().map(|x| x.1).sum::<usize>(), s.doc_count());
+    }
+
+    /// A filtered search must reach across segments and return global ordinals.
+    #[test]
+    fn faceted_search_spans_segments_and_globalises_ordinals() {
+        let a = shop(&[("Colgate Toothpaste Large", "Colgate", "150")]);
+        let b = shop(&[
+            ("Colgate Toothpaste Travel", "Colgate", "25"),
+            ("Aquafresh Toothpaste Twin", "Aquafresh", "100"),
+        ]);
+        let mut s = Searcher::new(a);
+        s.push(b);
+
+        let mut got: Vec<u32> =
+            s.search_facet("Toothpaste", 10, "Colgate").iter().map(|h| h.doc).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1], "segment 1's local 0 is global 1");
+        for d in &got {
+            assert_eq!(s.facet_of(*d), Some("Colgate"));
+        }
+
+        // A value only one segment has ever seen is not an error.
+        let only_b: Vec<u32> =
+            s.search_facet("Toothpaste", 10, "Aquafresh").iter().map(|h| h.doc).collect();
+        assert_eq!(only_b, vec![2]);
+        assert!(s.search_facet("Toothpaste", 10, "Nestle").is_empty());
+    }
+
+    /// Ranges, histograms and sort must span segments too.
+    #[test]
+    fn range_histogram_and_sort_span_segments() {
+        let a = shop(&[
+            ("Colgate Toothpaste Large", "Colgate", "150"),
+            ("Colgate Toothpaste Sample", "Colgate", ""),
+        ]);
+        let b = shop(&[
+            ("Colgate Toothpaste Travel", "Colgate", "25"),
+            ("Aquafresh Toothpaste Twin", "Aquafresh", "100"),
+        ]);
+        let mut s = Searcher::new(a);
+        s.push(b);
+        let q = "Toothpaste";
+
+        let mut mid: Vec<u32> =
+            s.search_range(q, 10, 0, 100.0, 200.0).iter().map(|h| h.doc).collect();
+        mid.sort_unstable();
+        assert_eq!(mid, vec![0, 3], "150 from segment 0 and 100 from segment 1");
+
+        // Buckets add elementwise; the row with no size is counted nowhere.
+        let hist = s.range_tally(q, 0, &[0.0, 100.0, 200.0]);
+        assert_eq!(hist, vec![1, 2]);
+        assert_eq!(hist.iter().sum::<usize>(), 3, "the empty size is in no bucket");
+
+        // The globally cheapest is in segment 1, which a per-segment top-k must not lose.
+        let asc: Vec<u32> = s.search_sorted(q, 10, 0, true).iter().map(|h| h.doc).collect();
+        assert_eq!(asc, vec![2, 3, 0], "25, 100, 150");
+        assert_eq!(
+            s.search_sorted(q, 1, 0, true).iter().map(|h| h.doc).collect::<Vec<_>>(),
+            vec![2],
+            "k=1 returns the global cheapest, not the first segment's cheapest"
+        );
+    }
+
+    /// Clauses and paging must work across segments, not just within one.
+    #[test]
+    fn clauses_and_pages_span_segments() {
+        use crate::index::FacetClause;
+        let a = shop(&[
+            ("Colgate Toothpaste Large", "Colgate", "150"),
+            ("Aquafresh Toothpaste Mini", "Aquafresh", "50"),
+        ]);
+        let b = shop(&[
+            ("Oral B Toothpaste Twin", "Oral B", "100"),
+            ("Colgate Toothpaste Travel", "Colgate", "25"),
+        ]);
+        let mut s = Searcher::new(a);
+        s.push(b);
+        let q = "Toothpaste";
+        let docs = |mut h: Vec<Hit>| {
+            h.sort_by_key(|x| x.doc);
+            h.iter().map(|x| x.doc).collect::<Vec<_>>()
+        };
+
+        // OR reaching into the second segment.
+        assert_eq!(
+            docs(s.search_clause(q, 10, 0, &[FacetClause::any(0, &["Colgate", "Oral B"])], &[])),
+            vec![0, 2, 3]
+        );
+        // NOT, across segments.
+        assert_eq!(
+            docs(s.search_clause(q, 10, 0, &[FacetClause::none(0, &["Colgate"])], &[])),
+            vec![1, 2]
+        );
+        // The unknown-value rules survive the merge.
+        assert!(s.search_clause(q, 10, 0, &[FacetClause::any(0, &["Nestle"])], &[]).is_empty());
+        assert_eq!(
+            s.search_clause(q, 10, 0, &[FacetClause::none(0, &["Nestle"])], &[]).len(),
+            4,
+            "an all-unknown exclude excludes nothing, across segments too"
+        );
+
+        // Paging must partition the MERGED ranking, not each segment's.
+        let all: Vec<u32> = s.search(q, 4).iter().map(|h| h.doc).collect();
+        let mut paged: Vec<u32> = Vec::new();
+        for page in 0..2 {
+            paged.extend(s.search_page(q, page * 2, 2).iter().map(|h| h.doc));
+        }
+        assert_eq!(paged, all, "two pages of 2 equal one request for 4, across segments");
+        assert!(s.search_page(q, 99, 5).is_empty());
+    }
+
+    /// A phrase must be verified inside the segment that owns the document, and a segment built
+    /// WITHOUT positions must contribute nothing rather than bag-of-words results.
+    #[test]
+    fn a_phrase_is_verified_per_segment() {
+        let field = vec![Field::new("name", 3.0, 0.4)];
+        let mut a = IndexBuilder::new(Schema::new(field.clone())).with_position();
+        a.add(&Doc::new(["Vanilla Ice Cream Tub"])); // 0: the phrase
+        a.add(&Doc::new(["Ice Crushed Cream Soda"])); // 1: both words, apart
+        let mut b = IndexBuilder::new(Schema::new(field.clone())).with_position();
+        b.add(&Doc::new(["Mango Ice Cream Bar"])); // 2: the phrase, second segment
+        b.add(&Doc::new(["Cream Ice Bar"])); // 3: reversed
+
+        let mut s = Searcher::new(a.build().unwrap());
+        s.push(b.build().unwrap());
+        let mut doc: Vec<u32> = s.search_phrase("Ice Cream", 10).iter().map(|h| h.doc).collect();
+        doc.sort_unstable();
+        assert_eq!(doc, vec![0, 2], "the phrase is found at global ordinals in both segments");
+        assert_eq!(s.search("Ice Cream", 10).len(), 4, "the bag-of-words search still sees all four");
+
+        // A segment with no positions contributes nothing. Silently falling back to a term match
+        // would mix phrase and non-phrase rows in one list with no way to tell them apart.
+        let mut c = IndexBuilder::new(Schema::new(field));
+        c.add(&Doc::new(["Strawberry Ice Cream Cone"]));
+        let mut s2 = Searcher::new(c.build().unwrap());
+        assert!(s2.search_phrase("Ice Cream", 10).is_empty(), "no positions, no phrase results");
+        s2.push({
+            let mut d = IndexBuilder::new(Schema::new(vec![Field::new("name", 3.0, 0.4)]))
+                .with_position();
+            d.add(&Doc::new(["Durian Ice Cream Tub"]));
+            d.build().unwrap()
+        });
+        assert_eq!(
+            s2.search_phrase("Ice Cream", 10).iter().map(|h| h.doc).collect::<Vec<_>>(),
+            vec![1],
+            "only the segment that CAN verify contributes"
+        );
+    }
+
+    /// **The invariant the whole change-stream story rests on: at most one live row per key.**
+    ///
+    /// An update is an append plus a retirement, because segments are immutable. If `push` did not
+    /// retire the shadowed row, a change stream would accumulate every historical version of every
+    /// row and a search would return all of them — a duplicate that reads as a ranking bug and is
+    /// actually a bookkeeping one.
+    #[test]
+    fn an_updated_key_shadows_the_old_row_and_leaves_one_live() {
+        let field = vec![Field::new("sku", 0.0, 0.6), Field::new("name", 3.0, 0.4)];
+        let keyed = |row: &[(&str, &str)]| {
+            let mut b = IndexBuilder::new(Schema::new(field.clone())).with_key(0);
+            for (sku, name) in row {
+                b.add(&Doc::new([*sku, *name]));
+            }
+            b.build().unwrap()
+        };
+
+        let mut s = Searcher::new(keyed(&[
+            ("sku-1", "Colgate Total Toothpaste 150g"),
+            ("sku-2", "Aquafresh Mini Toothpaste 50g"),
+        ]));
+        assert!(s.has_key());
+        assert_eq!(s.keyed_count(), 2);
+        assert_eq!(s.doc_of_key("sku-1"), Some(0));
+        assert_eq!(s.key_of(1), Some("sku-2"));
+        assert_eq!(s.doc_of_key("sku-404"), None, "an unknown key resolves to nothing");
+
+        // sku-1 is UPDATED and sku-3 is new. The update must replace, not accumulate.
+        let shadowed = s.push(keyed(&[
+            ("sku-1", "Colgate Total Toothpaste 200g"),
+            ("sku-3", "Oral B Toothpaste Pro 120g"),
+        ]));
+        assert_eq!(shadowed, 1, "exactly the updated row was retired");
+        assert_eq!(s.doc_count(), 4, "ordinals still only ever grow");
+        assert_eq!(s.live_count(), 3, "but one of them is retired");
+        assert_eq!(s.keyed_count(), 3);
+
+        // The live row for sku-1 is the NEW one, and there is exactly one of it.
+        assert_eq!(s.doc_of_key("sku-1"), Some(2));
+        let hit: Vec<u32> = s.search("Colgate Toothpaste", 10).iter().map(|h| h.doc).collect();
+        assert_eq!(hit.first(), Some(&2), "the new version ranks first");
+        assert!(!hit.contains(&0), "the superseded version does not come back");
+        assert_eq!(
+            hit.iter().filter(|&&d| s.key_of(d) == Some("sku-1")).count(),
+            1,
+            "exactly one row for the key, not one per version"
+        );
+        assert!(
+            s.search("150g", 10).is_empty(),
+            "text that only the retired version had is gone from the results"
+        );
+
+        // A delete arriving from a change stream, expressed the only way an application can.
+        assert!(s.delete_key("sku-2"));
+        assert!(!s.delete_key("sku-2"), "deleting twice is not an error but is not a second delete");
+        assert!(!s.delete_key("sku-404"), "deleting a key that never existed reports false");
+        assert_eq!(s.live_count(), 2);
+        assert_eq!(s.doc_of_key("sku-2"), None);
+    }
+
+    /// A blank key field means the row has NO key, not a key of `""`.
+    ///
+    /// Two such rows would otherwise both answer to the empty key, and a change stream would update
+    /// an arbitrary one of them. `keyed_count` is below `live_count` precisely so an operator can
+    /// see that some rows are unaddressable instead of discovering it when they fail to update.
+    #[test]
+    fn a_blank_key_is_no_key_rather_than_an_empty_one() {
+        let mut b = IndexBuilder::new(Schema::new(vec![
+            Field::new("sku", 0.0, 0.6),
+            Field::new("name", 3.0, 0.4),
+        ]))
+        .with_key(0);
+        b.add(&Doc::new(["sku-1", "Colgate Total Toothpaste"]));
+        b.add(&Doc::new(["", "Aquafresh Mini Toothpaste"]));
+        b.add(&Doc::new(["  ", "Oral B Toothpaste Pro"])); // whitespace is trimmed to blank
+        let ix = b.build().unwrap();
+
+        assert_eq!(ix.doc_count(), 3);
+        assert_eq!(ix.keyed_count(), 1, "only one row can be addressed by key");
+        assert_eq!(ix.doc_of_key(""), None, "the empty key resolves to nothing");
+        assert_eq!(ix.key_of(1), None);
+        assert_eq!(ix.doc_of_key("sku-1"), Some(0));
+        // The unkeyed rows are still perfectly searchable; they just cannot be addressed.
+        assert_eq!(ix.search("Aquafresh", 10).len(), 1);
+    }
+
+    /// An unkeyed collection is untouched by any of this, and mixing is refused rather than
+    /// silently half-working.
+    #[test]
+    fn an_unkeyed_collection_is_unaffected() {
+        let mut plain = IndexBuilder::new(Schema::new(vec![Field::new("name", 3.0, 0.4)]));
+        plain.add(&Doc::new(["Colgate Total Toothpaste"]));
+        let mut s = Searcher::new(plain.build().unwrap());
+        assert!(!s.has_key());
+        assert_eq!(s.doc_of_key("sku-1"), None);
+        assert!(!s.delete_key("sku-1"));
+
+        let mut more = IndexBuilder::new(Schema::new(vec![Field::new("name", 3.0, 0.4)]));
+        more.add(&Doc::new(["Aquafresh Mini Toothpaste"]));
+        assert_eq!(s.push(more.build().unwrap()), 0, "nothing is shadowed without keys");
+        assert_eq!(s.search("Toothpaste", 10).len(), 2);
+
+        // One unkeyed segment makes the COLLECTION unkeyed, so an `apply` cannot claim to be
+        // keeping it in sync with a source of truth it cannot fully address.
+        let mut keyed = IndexBuilder::new(Schema::new(vec![Field::new("name", 3.0, 0.4)]))
+            .with_key(0);
+        keyed.add(&Doc::new(["Oral B Toothpaste Pro"]));
+        s.push(keyed.build().unwrap());
+        assert!(!s.has_key(), "a partially keyed collection reports unkeyed");
+    }
+
+    /// Mismatched facet layout is detectable rather than silently wrong.
+    #[test]
+    fn a_segment_with_a_different_facet_field_is_reported() {
+        let a = shop(&[("Colgate Toothpaste", "Colgate", "150")]);
+        let mut odd = IndexBuilder::new(Schema::new(vec![
+            Field::new("name", 3.0, 0.4),
+            Field::new("brand", 1.0, 0.6),
+            Field::new("size", 0.0, 0.6),
+        ]))
+        .with_facet(2); // slot 0 is SIZE here, not brand
+        odd.add(&Doc::new(vec!["Colgate Toothpaste", "Colgate", "150"]));
+        let mut s = Searcher::new(a);
+        s.push(odd.build().unwrap());
+        assert!(!s.facet_config_is_uniform(), "slot 0 means two different fields");
+    }
 
     fn schema() -> Schema {
         Schema::new(vec![Field::new("title", 1.0, 0.4)])

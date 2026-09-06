@@ -30,6 +30,23 @@ use std::collections::BTreeMap;
 /// `docs/research/relevance.md` recommends, and keeps a posting one cache-friendly struct.
 pub const MAX_FIELD: usize = 4;
 
+/// Bits a packed position reserves for the token index inside its field.
+///
+/// A position is `field << POSITION_FIELD_SHIFT | token_index`. Packing the field IN rather than
+/// storing it alongside is what makes phrase matching field-aware for free: consecutive positions
+/// can only be adjacent if they share a field, so `"Colgate Total"` cannot match a document whose
+/// name ends in *Colgate* and whose brand begins with *Total*. `doc_len` is `u16`, so a token index
+/// never needs more than sixteen bits.
+const POSITION_FIELD_SHIFT: u32 = 16;
+/// Mask for the token index of a packed position.
+const POSITION_INDEX_MASK: u32 = (1 << POSITION_FIELD_SHIFT) - 1;
+
+/// Pack a field index and a token index into one sortable `u32`.
+#[inline]
+fn pack_position(field: usize, at: u16) -> u32 {
+    ((field as u32) << POSITION_FIELD_SHIFT) | at as u32
+}
+
 /// Per-field retrieval parameters.
 #[derive(Clone, Debug)]
 pub struct Field {
@@ -93,6 +110,53 @@ pub const MISSING_TERM_PENALTY: u32 = 3;
 /// this only ever *promotes* documents the user is plausibly typing from the start of.
 pub const UNANCHORED_KEEP: f32 = 0.5;
 
+/// What a document keeps when field 0 is **not** exactly the query.
+///
+/// A document whose first field has the same token count as the query and matches every group is
+/// *the thing that was asked for*, not merely a good match for it. BM25 cannot see that: it sums
+/// term frequency across fields, so a longer relative whose comment repeats the term outscores the
+/// exact row. `bench/roadmap/p40-booted-schema.md` found this on real schema names -- `session`
+/// losing to `session_resource`, `user` to `user_agent` -- and the same shape exists for product
+/// names.
+///
+/// **A demotion, not a boost**, exactly like [`UNANCHORED_KEEP`] and static priors: `max_score`
+/// bounds assume a factor of 1.0, so a factor in `(0, 1]` keeps every pruning bound valid by
+/// construction. A boost above 1.0 would quietly break MaxScore.
+///
+/// Deliberately mild. It is a tiebreak between comparable matches, not a filter -- a demoted
+/// document with a much better BM25 score still wins, which is what keeps `"Colgate Toothpaste"`
+/// from burying a better product just because its name is not word-for-word the query.
+pub const INEXACT_FIELD_KEEP: f32 = 0.9;
+
+/// How much wider the candidate pool gets when a learned expansion fires.
+///
+/// # This is a workaround, and the measurement says so
+///
+/// The pool is ordered by SCORE; the final ranking is ordered by `typo_bucket` FIRST, so a
+/// perfect-bucket document with a modest score can be evicted before the sort sees it. Expansion
+/// makes that acute by adding scoring competitors. Widening the pool hides it.
+///
+/// **No single multiplier is correct**, which is how you know it is not the real fix. Measured
+/// in-sample precision@10 against the multiplier, `bench/roadmap/p21-pool-eviction.md`:
+///
+/// | mult | presyo | profstopick | blead |
+/// |---|---|---|---|
+/// | 3 | 96.5 % | 87.5 % | 84.8 % |
+/// | 6 | **97.0 %** | 92.2 % | 89.6 % |
+/// | 24 | 97.0 % | 96.7 % | **95.6 %** |
+/// | 48 | 97.0 % | **99.4 %** | 95.6 % |
+///
+/// presyo saturates at 6, blead at 24, and profstopick is still climbing at 48. 24 is chosen as
+/// the point where two of three corpora have saturated and the third has most of its gain; on
+/// presyo it buys nothing over 6 and costs ~200 µs.
+///
+/// **The real fix is to make pruning consistent with ranking.** The engine prunes by score and
+/// ranks by bucket-then-score, and those two disagree — that is the actual defect, and it is
+/// recorded in `p21` rather than papered over here.
+const EXPANDED_POOL_MULT: usize = 24;
+/// Floor for the widened pool, so a small `k` still clears the eviction.
+const EXPANDED_POOL_MIN: usize = 256;
+
 /// Edit-distance marker carried by a *learned expansion* term.
 ///
 /// Not a real edit distance — it is how an expansion term is priced. `emit` already discounts a
@@ -139,7 +203,7 @@ const CHAMPION_SIZE: usize = 64;
 ///
 /// Expansions are kept in order of **edit distance first, then document frequency ascending**, so
 /// the cap discards the vaguest and least discriminative matches rather than an arbitrary slice.
-const MAX_EXPANSION: usize = 16;
+pub const MAX_EXPANSION: usize = 16;
 
 /// One posting on the **hot path**: a document and its precomputed saturated contribution.
 ///
@@ -200,6 +264,23 @@ pub struct IndexBuilder {
     expansion_cfg: Option<(usize, usize)>,
     /// Normalized text of the facet field per document. Empty unless learning is enabled.
     facet_text: Vec<String>,
+    /// Fields designated as stored facets by [`IndexBuilder::with_facet`], in call order.
+    /// Their positions here are the **slot** indices the query API takes.
+    facet_field: Vec<usize>,
+    /// Raw (untokenized, trimmed) facet value per document, per slot: `facet_store[doc][slot]`.
+    facet_store: Vec<Vec<String>>,
+    /// Fields designated as numeric columns by [`IndexBuilder::with_numeric`], in call order.
+    numeric_field: Vec<usize>,
+    /// Parsed numeric value per document, per numeric slot. `NaN` marks absent or unparseable.
+    numeric_store: Vec<Vec<f64>>,
+    /// Field holding the application's primary key, if one was designated.
+    key_field: Option<usize>,
+    /// Raw (untokenized, trimmed) key per document. Empty unless `key_field` is set.
+    key_store: Vec<String>,
+    /// Whether to record token positions. See [`IndexBuilder::with_position`].
+    position_on: bool,
+    /// term text -> doc -> packed positions. Empty unless `position_on`.
+    term_pos: BTreeMap<String, BTreeMap<u32, Vec<u32>>>,
 }
 
 impl IndexBuilder {
@@ -213,7 +294,155 @@ impl IndexBuilder {
             first_text: Vec::new(),
             expansion_cfg: None,
             facet_text: Vec::new(),
+            facet_field: Vec::new(),
+            facet_store: Vec::new(),
+            numeric_field: Vec::new(),
+            numeric_store: Vec::new(),
+            key_field: None,
+            key_store: Vec::new(),
+            position_on: false,
+            term_pos: BTreeMap::new(),
         }
+    }
+
+    /// Record **token positions**, which is what a phrase query needs and nothing else does.
+    ///
+    /// Opt-in, and it is the only build option that costs a posting-sized structure rather than a
+    /// document-sized one: one `u32` per token OCCURRENCE, against eight bytes per (term, document)
+    /// pair for the postings themselves. A corpus of short product names roughly doubles; a corpus
+    /// of prose does much worse. Off by default, so no existing index pays for a feature it does
+    /// not query.
+    ///
+    /// Must be set before the first document is added -- positions cannot be recovered afterwards,
+    /// because the analyzed tokens are not kept.
+    pub fn with_position(mut self) -> Self {
+        assert!(self.set_position(), "positions must be enabled before the first document");
+        self
+    }
+
+    /// Non-consuming [`IndexBuilder::with_position`], for the C ABI. Returns `false` once a
+    /// document has been added, rather than panicking -- a trap kills the whole WASM instance.
+    pub fn set_position(&mut self) -> bool {
+        if !self.doc_len.is_empty() {
+            return false;
+        }
+        self.position_on = true;
+        true
+    }
+
+    /// Store field `field` as a **facet**: a value kept verbatim per document, for filtering and
+    /// counting rather than for scoring.
+    ///
+    /// Facet values are deliberately **not tokenized**. `"Lucky Me"` is one value, not two terms;
+    /// a shopper filtering by brand wants the brand, and tokenizing would make `"Lucky Me"` and
+    /// `"Me Lucky"` the same facet. This is the one place the engine stores field text rather than
+    /// an analysis of it, and the cost is bounded by the field's cardinality, not by `doc_count` --
+    /// values are interned, so a million products over 145 categories store a million `u32` ids and
+    /// 145 strings.
+    ///
+    /// Independent of [`IndexBuilder::learn_expansion`], which also takes a "facet field" but uses
+    /// it to derive query expansions and keeps a *tokenized* copy. They may name the same field.
+    pub fn with_facet(mut self, field: usize) -> Self {
+        assert!(self.set_facet_field(field), "facet field out of range");
+        self
+    }
+
+    /// The designated facet fields, in slot order.
+    pub fn facet_field(&self) -> &[usize] {
+        &self.facet_field
+    }
+
+    /// Store field `field` as a **numeric column**: parsed once at build time, for range filtering
+    /// and histograms.
+    ///
+    /// A price slider is a range filter plus a histogram, and neither is expressible with the
+    /// interned string labels [`IndexBuilder::with_facet`] stores -- "9.99" and "10.00" sort and
+    /// bucket as text, not as numbers.
+    ///
+    /// Values are `f64`, not `f32`: `f32` carries 24 bits of mantissa, so a price in minor units
+    /// stops being exact above about 16.7 million. Eight bytes per document per column is the
+    /// price of not having to reason about where that boundary falls.
+    ///
+    /// Text that does not parse as a number becomes `NaN`, which no range contains -- an absent
+    /// value is excluded from every filter rather than silently treated as zero.
+    pub fn with_numeric(mut self, field: usize) -> Self {
+        assert!(self.set_numeric_field(field), "numeric field out of range");
+        self
+    }
+
+    /// Store field `field` as the document's **primary key**: the application's own identifier for
+    /// the row, kept verbatim so the row can be found again without knowing its dense ordinal.
+    ///
+    /// # Why this exists
+    ///
+    /// Every incremental operation an application actually performs is keyed on ITS id, not on
+    /// ours: *"the row with id 4172 changed"*. [`Searcher::delete`] takes a dense global ordinal,
+    /// which is assigned at insertion and is not something a database row carries — so without a
+    /// key there is no way to express an update or a delete arriving from a change stream. This is
+    /// the prerequisite for [`Searcher::upsert_segment`] and for the `index apply` CLI.
+    ///
+    /// Keys are **not tokenized and not interned**: unlike a facet, a key is expected to be unique
+    /// per document, so interning would store one label per row and buy nothing. They are stored in
+    /// document order and a sorted lookup is derived at load, exactly like `numeric_order`.
+    ///
+    /// **Not to be confused with the internal->external id map deliberately absent from `Index`.**
+    /// That one is a docID *reordering* permutation for ranking performance, measured worse in
+    /// `p7`; this is an application identifier and touches no ranking.
+    ///
+    /// A document whose key field is empty has **no key**: it can be searched and deleted by
+    /// ordinal, but a change stream can never address it. That is a real hazard for a table with a
+    /// nullable id, so it is reported by `IndexBuilder::build` rather than silently tolerated.
+    pub fn with_key(mut self, field: usize) -> Self {
+        assert!(self.set_key_field(field), "key field out of range");
+        self
+    }
+
+    /// Non-consuming [`IndexBuilder::with_key`], for the C ABI. Returns `false` for an
+    /// out-of-range field or once a document has been added, rather than panicking.
+    pub fn set_key_field(&mut self, field: usize) -> bool {
+        if field >= MAX_FIELD || !self.key_store.is_empty() || !self.doc_len.is_empty() {
+            return false;
+        }
+        self.key_field = Some(field);
+        true
+    }
+
+    /// The designated key field, if any.
+    pub fn key_field(&self) -> Option<usize> {
+        self.key_field
+    }
+
+    /// Non-consuming [`IndexBuilder::with_numeric`], for the C ABI. See
+    /// [`IndexBuilder::set_facet_field`] for why the ABI cannot use the consuming form.
+    pub fn set_numeric_field(&mut self, field: usize) -> bool {
+        if field >= MAX_FIELD || !self.numeric_store.is_empty() {
+            return false;
+        }
+        if !self.numeric_field.contains(&field) {
+            self.numeric_field.push(field);
+        }
+        true
+    }
+
+    /// The designated numeric fields, in slot order.
+    pub fn numeric_field(&self) -> &[usize] {
+        &self.numeric_field
+    }
+
+    /// Non-consuming [`IndexBuilder::with_facet`]. Returns `false` for an out-of-range field
+    /// instead of panicking, because the C ABI must be able to reject bad input from a host
+    /// without trapping — a trap kills the whole WASM instance.
+    /// Call it once per field to facet on. Order is the slot order the query API uses, and a
+    /// repeated field is ignored rather than duplicated -- two slots over one field would double
+    /// the storage to answer identical questions.
+    pub fn set_facet_field(&mut self, field: usize) -> bool {
+        if field >= MAX_FIELD || !self.facet_store.is_empty() {
+            return false;
+        }
+        if !self.facet_field.contains(&field) {
+            self.facet_field.push(field);
+        }
+        true
     }
 
     /// Learn a query-expansion table from a **facet field** — a low-cardinality field like a
@@ -291,7 +520,20 @@ impl IndexBuilder {
             if self.expansion_cfg.is_some_and(|(f, _)| f == fi) {
                 facet = tok.iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
             }
-            for t in tok {
+            for (at, t) in tok.into_iter().enumerate() {
+                if self.position_on {
+                    // Positions above `u16::MAX` are dropped rather than wrapped: `doc_len` is
+                    // already `u16`, so a field that long is truncated everywhere else too, and a
+                    // wrapped position would place a token at a phrase offset it does not occupy.
+                    if let Ok(at) = u16::try_from(at) {
+                        self.term_pos
+                            .entry(t.text.clone())
+                            .or_default()
+                            .entry(id)
+                            .or_default()
+                            .push(pack_position(fi, at));
+                    }
+                }
                 let e = self.term_post.entry(t.text).or_default().entry(id).or_insert([0; MAX_FIELD]);
                 e[fi] = e[fi].saturating_add(1);
             }
@@ -300,6 +542,28 @@ impl IndexBuilder {
         self.raw_prior.push(1.0);
         self.first_text.push(first);
         self.facet_text.push(facet);
+        if let Some(f) = self.key_field {
+            self.key_store
+                .push(doc.field_text.get(f).map(|t| t.trim().to_string()).unwrap_or_default());
+        }
+        self.facet_store.push(
+            self.facet_field
+                .iter()
+                .map(|&f| doc.field_text.get(f).map(|t| t.trim().to_string()).unwrap_or_default())
+                .collect(),
+        );
+        self.numeric_store.push(
+            self.numeric_field
+                .iter()
+                .map(|&f| {
+                    doc.field_text
+                        .get(f)
+                        .and_then(|t| t.trim().parse::<f64>().ok())
+                        .filter(|v| v.is_finite())
+                        .unwrap_or(f64::NAN)
+                })
+                .collect(),
+        );
         id
     }
 
@@ -400,12 +664,29 @@ impl IndexBuilder {
 
         let mut posting: Vec<Vec<Posting>> = Vec::with_capacity(self.term_post.len());
         let mut posting_tf: Vec<Vec<[u16; MAX_FIELD]>> = Vec::with_capacity(self.term_post.len());
-        for per_doc in self.term_post.into_values() {
+        // Positions are flattened into ONE array indexed by global posting slot, rather than a
+        // `Vec<Vec<u32>>` per term: at a million documents the per-posting `Vec` headers cost more
+        // than the positions they point at, and the flat form serializes as two spans.
+        let mut term_pos = self.term_pos;
+        let mut position: Vec<u32> = Vec::new();
+        let mut position_at: Vec<u64> = match self.position_on {
+            true => vec![0],
+            false => Vec::new(),
+        };
+        for (text, per_doc) in self.term_post {
+            let mut pos_of = term_pos.remove(&text).unwrap_or_default();
             let mut pl = Vec::with_capacity(per_doc.len());
             let mut tl = Vec::with_capacity(per_doc.len());
             for (doc, tf) in per_doc {
                 pl.push(Posting { doc, sat: 0.0 });
                 tl.push(tf);
+                if self.position_on {
+                    // Ascending, so the phrase verifier can binary-search for `start + i`.
+                    let mut p = pos_of.remove(&doc).unwrap_or_default();
+                    p.sort_unstable();
+                    position.extend_from_slice(&p);
+                    position_at.push(position.len() as u64);
+                }
             }
             posting.push(pl);
             posting_tf.push(tl);
@@ -421,6 +702,50 @@ impl IndexBuilder {
         // Computed before the struct literal takes ownership of `posting`.
         let expansion =
             Self::derive_expansion(self.expansion_cfg, &self.facet_text, &term, &posting);
+
+        // Intern facet values. Sorted labels so lookup is a binary search and serialization is
+        // deterministic; `u32::MAX` marks a document with no facet, which is also what every
+        // document gets when no facet field was designated.
+        // One label set and one id column per slot. Sorted labels so lookup is a binary search
+        // and serialization is deterministic; `u32::MAX` marks a document with no value there.
+        let mut facet_label: Vec<Vec<String>> = Vec::new();
+        let mut facet_id: Vec<Vec<u32>> = Vec::new();
+        for slot in 0..self.facet_field.len() {
+            let mut label: Vec<String> = self
+                .facet_store
+                .iter()
+                .filter_map(|v| v.get(slot))
+                .filter(|v| !v.is_empty())
+                .cloned()
+                .collect();
+            label.sort_unstable();
+            label.dedup();
+            let id = self
+                .facet_store
+                .iter()
+                .map(|v| match v.get(slot) {
+                    Some(x) if !x.is_empty() => {
+                        label.binary_search(x).map(|i| i as u32).unwrap_or(u32::MAX)
+                    }
+                    _ => u32::MAX,
+                })
+                .collect();
+            facet_label.push(label);
+            facet_id.push(id);
+        }
+        let facet_field = self.facet_field;
+
+        // Numeric columns, transposed to slot-major so a range scan walks one contiguous column.
+        let mut numeric_value: Vec<Vec<f64>> = Vec::new();
+        for slot in 0..self.numeric_field.len() {
+            numeric_value.push(
+                self.numeric_store
+                    .iter()
+                    .map(|v| v.get(slot).copied().unwrap_or(f64::NAN))
+                    .collect(),
+            );
+        }
+        let numeric_field = self.numeric_field;
 
         let mut ix = Index {
             schema: self.schema,
@@ -447,9 +772,21 @@ impl IndexBuilder {
                     })
                     .collect()
             },
+            facet_field,
+            facet_label,
+            facet_id,
+            numeric_field,
+            numeric_value,
             doc_len: self.doc_len,
             avg_len,
             doc_count,
+            position,
+            position_at,
+            posting_base: Vec::new(),
+            numeric_order: Vec::new(),
+            doc_key: self.key_store,
+            key_field: self.key_field.unwrap_or(usize::MAX),
+            key_order: Vec::new(),
         };
         ix.rebuild_meta();
         Ok(ix)
@@ -517,6 +854,16 @@ pub struct Index {
     /// Empty unless [`IndexBuilder::learn_expansion`] was called. See that method for the
     /// measurements this exists to deliver and for why the trigger is strict.
     expansion: Vec<(String, Vec<u32>)>,
+    /// Schema field behind each facet slot, in slot order.
+    facet_field: Vec<usize>,
+    /// Sorted, deduplicated facet values per slot. Empty when the index has no facet field.
+    facet_label: Vec<Vec<String>>,
+    /// Per-slot, per-document index into `facet_label[slot]`, or `u32::MAX` for "no value".
+    facet_id: Vec<Vec<u32>>,
+    /// Schema field behind each numeric slot, in slot order.
+    numeric_field: Vec<usize>,
+    /// Per-slot, per-document numeric value. `NaN` marks absent.
+    numeric_value: Vec<Vec<f64>>,
     /// Per-document static prior in `(0, 1]`, or **empty** when every document has the default.
     ///
     /// # Why the range is (0, 1] and not "any boost"
@@ -565,9 +912,57 @@ pub struct Index {
     doc_len: Vec<[u16; MAX_FIELD]>,
     avg_len: [f32; MAX_FIELD],
     doc_count: usize,
+    /// Packed token positions for every posting, concatenated in posting order. **Empty unless the
+    /// index was built with [`IndexBuilder::with_position`]** -- an index with no phrase queries
+    /// pays nothing.
+    position: Vec<u32>,
+    /// `total posting count + 1` cumulative offsets into [`Index::position`]. Global posting slot
+    /// `s` owns `position[position_at[s]..position_at[s + 1]]`. Empty when positions are off.
+    position_at: Vec<u64>,
+    /// The application's primary key per document, in document order. **Empty unless the index
+    /// was built with [`IndexBuilder::with_key`]**; an entry may be empty for a row whose key field
+    /// was blank, and such a row has no key rather than a key of `""`.
+    doc_key: Vec<String>,
+    /// Which schema field `doc_key` came from. `usize::MAX` when there is no key.
+    key_field: usize,
+    /// Document ordinals sorted by key, so a key resolves by binary search.
+    ///
+    /// **Derived, never serialized**, like `numeric_order` and `posting_base`: it is a sort of data
+    /// the index already holds, and a stored copy could disagree with it.
+    key_order: Vec<u32>,
+    /// Per numeric slot, every document that HAS a finite value there, ascending by value.
+    ///
+    /// **Derived, never serialized**, exactly like `block_max`: it is a sort of a column the index
+    /// already stores, and a stored copy could disagree with that column. Four bytes per document
+    /// per numeric slot, and only for documents with a value.
+    ///
+    /// This is what lets [`Index::search_sorted`] stop early. See `bench/roadmap/p46-sort-tail.md`.
+    numeric_order: Vec<Vec<u32>>,
+    /// `term_count + 1` cumulative posting counts, so `(term, index within its list)` maps to the
+    /// global posting slot `position_at` is indexed by. **Derived, never serialized** -- it is a
+    /// prefix sum of lengths the posting lists already carry, and storing it would be a second
+    /// copy of the same fact that could disagree with the first.
+    posting_base: Vec<u64>,
 }
 
 impl Index {
+    /// `1.0` when field 0 is exactly the query, [`INEXACT_FIELD_KEEP`] otherwise.
+    ///
+    /// "Exactly" means the same number of tokens **and** every query group matched, which is what
+    /// `bucket == 0` already says. Order is not checked, so `"Toothpaste Colgate"` counts as exact
+    /// for `"Colgate Toothpaste"` -- the tokenizer is bag-of-words everywhere else and pretending
+    /// otherwise here would be inconsistent.
+    #[inline]
+    fn exact_field_factor(&self, doc: u32, bucket: u32, group_count: usize) -> f32 {
+        let exact = bucket == 0
+            && self.doc_len.get(doc as usize).is_some_and(|l| l[0] as usize == group_count);
+        if exact {
+            1.0
+        } else {
+            INEXACT_FIELD_KEEP
+        }
+    }
+
     /// `1.0` when anchored or when anchoring does not apply, [`UNANCHORED_KEEP`] otherwise.
     #[inline]
     fn anchor_factor(&self, doc: u32, anchor: &[u32]) -> f32 {
@@ -664,6 +1059,22 @@ impl Index {
         self.expansion = expansion;
     }
 
+    pub(crate) fn set_numeric(&mut self, field: Vec<usize>, value: Vec<Vec<f64>>) {
+        self.numeric_field = field;
+        self.numeric_value = value;
+    }
+
+    pub(crate) fn set_facet(
+        &mut self,
+        field: Vec<usize>,
+        label: Vec<Vec<String>>,
+        id: Vec<Vec<u32>>,
+    ) {
+        self.facet_field = field;
+        self.facet_label = label;
+        self.facet_id = id;
+    }
+
     pub(crate) fn set_deleted(&mut self, deleted: Vec<u64>) {
         self.deleted_count = deleted.iter().map(|w| w.count_ones() as usize).sum();
         self.deleted = deleted;
@@ -691,19 +1102,136 @@ impl std::fmt::Debug for Index {
 ///
 /// Found by `block_max_pruning_agrees_with_exhaustive_or_at_scale`, which returned identical
 /// document *sets* with two adjacent entries transposed.
+/// Kept although nothing compares against it any more: it records the tolerance the quantized grid
+/// replaced, and `the_score_grid_matches_the_documented_tolerance` asserts the grid still sits near
+/// it. Deleting the constant would delete the only statement of how coarse the grid is meant to be.
+#[allow(dead_code)]
 const SCORE_TIE_REL: f32 = 1e-6;
+
+/// Low mantissa bits dropped by [`canon_score`], chosen so the grid is about [`SCORE_TIE_REL`].
+///
+/// `f32` has 23 mantissa bits, so dropping `k` leaves a relative step of `2^-(23-k)`. `k = 3` gives
+/// `2^-20`, about `9.5e-7` — the same order as the `1e-6` tolerance this replaces.
+const SCORE_TIE_BITS: u32 = 3;
+
+/// Round a score onto a coarse grid, so that comparing two scores is TRANSITIVE.
+///
+/// # Why this exists rather than a tolerance
+///
+/// The comparator used to ask `(a - b).abs() <= SCORE_TIE_REL * scale` and call that equal. That is
+/// not an equivalence relation: `a ~ b` and `b ~ c` does not imply `a ~ c`, so the derived ordering
+/// is not a total order. Rust's sort detects the violation and **panics** — which it did, on the
+/// first long-document corpus the engine ever saw (`bench/roadmap/p42-alec-surface.md`). Short
+/// fields never produced enough near-ties in one result set to expose it; 1,000-character bodies
+/// did immediately.
+///
+/// Quantizing instead makes the comparison a pure function of each value, so transitivity holds by
+/// construction. Rounding is to nearest rather than truncating, which halves how often two scores
+/// that were meant to tie land either side of a grid boundary.
+///
+/// The original intent is preserved: two paths that compute the same document's score with
+/// different float accumulation orders still agree, because the difference is far below the grid.
+#[inline]
+pub(crate) fn canon_score(x: f32) -> f32 {
+    // Only positive, finite scores reach the grid. Anything else is passed through: `total_cmp`
+    // orders it consistently, and BM25 sums of positive terms cannot produce it anyway.
+    if !x.is_finite() || x < 0.0 {
+        return x;
+    }
+    let half = 1u32 << (SCORE_TIE_BITS - 1);
+    let mask = !((1u32 << SCORE_TIE_BITS) - 1);
+    // The bit pattern of a non-negative float increases monotonically with its value, so adding a
+    // constant and masking is monotone non-decreasing — the grid never reorders two values.
+    f32::from_bits(x.to_bits().wrapping_add(half) & mask)
+}
+
+/// One clause of a filter bar: a slot, the values that satisfy it, and whether to invert.
+///
+/// Values inside a clause are **OR**-ed ("Colgate or Oral-B"); clauses are **AND**-ed. That is how
+/// every storefront filter bar behaves — ticking two brands widens the result, ticking a brand and
+/// a category narrows it.
+///
+/// An unknown value is ignored rather than fatal, because a filter bar built from one segment's
+/// labels can name a value another segment has never seen. The two ends of that rule are
+/// deliberately opposite:
+///
+/// - **include** with *every* value unknown matches **nothing** — nobody can satisfy it;
+/// - **exclude** with *every* value unknown excludes **nothing** — there is nothing to remove.
+///
+/// Getting those the wrong way round is how a filter silently returns the entire corpus.
+///
+/// A document with no value in the slot is **kept by an exclude** and dropped by an include, which
+/// is what "not Colgate" should do to an unbranded row.
+#[derive(Clone, Copy, Debug)]
+pub struct FacetClause<'a> {
+    /// Facet slot, in [`IndexBuilder::with_facet`] call order.
+    pub slot: usize,
+    /// Values that satisfy this clause, OR-ed together.
+    pub value: &'a [&'a str],
+    /// Invert: keep documents whose value is **not** among `value`.
+    pub exclude: bool,
+}
+
+impl<'a> FacetClause<'a> {
+    /// A clause satisfied by any of `value`.
+    pub fn any(slot: usize, value: &'a [&'a str]) -> Self {
+        FacetClause { slot, value, exclude: false }
+    }
+
+    /// A clause satisfied by documents matching none of `value`.
+    pub fn none(slot: usize, value: &'a [&'a str]) -> Self {
+        FacetClause { slot, value, exclude: true }
+    }
+}
+
+/// Everything one scan needs beyond the index itself.
+///
+/// `search_opt` reached eight positional parameters, most of them empty slices whose meaning was
+/// invisible at the call site. A struct with a `Default` makes each entry point say only what it
+/// changes — `Scan { query, k, offset, ..Scan::default() }` reads as "a page", and nothing else
+/// has to be repeated.
+struct Scan<'a> {
+    query: &'a str,
+    k: usize,
+    /// Rows to skip before the page. Cost grows with this; see [`Index::search_page`].
+    offset: usize,
+    /// Typeahead semantics on the last token.
+    prefix_last: bool,
+    /// Dictionary expansions permitted per query token.
+    cap: usize,
+    /// Resolved facet clauses: `(slot, sorted label ids, exclude)`.
+    facet: &'a [(usize, Vec<u32>, bool)],
+    /// Half-open numeric ranges: `(slot, lo, hi)`.
+    range: &'a [(usize, f64, f64)],
+    /// Term ids that must appear as consecutive tokens of one field. Empty means no constraint.
+    phrase: &'a [u32],
+}
+
+impl<'a> Scan<'a> {
+    fn new(query: &'a str, k: usize) -> Self {
+        Scan {
+            query,
+            k,
+            offset: 0,
+            prefix_last: false,
+            cap: MAX_EXPANSION,
+            facet: &[],
+            range: &[],
+            phrase: &[],
+        }
+    }
+}
 
 /// The single ranking comparator, used by both the pruned and the exhaustive path.
 #[inline]
 pub(crate) fn rank_cmp(a: &Hit, b: &Hit) -> std::cmp::Ordering {
-    a.typo_bucket.cmp(&b.typo_bucket).then_with(|| {
-        let scale = a.score.abs().max(b.score.abs()).max(1.0);
-        if (a.score - b.score).abs() <= SCORE_TIE_REL * scale {
-            std::cmp::Ordering::Equal
-        } else {
-            b.score.total_cmp(&a.score)
-        }
-    }).then(a.doc.cmp(&b.doc))
+    // Lexicographic on (bucket, quantized score descending, doc). Every component is a total
+    // order and they are chained, so the whole is one — which `sort_by` requires and which the
+    // previous tolerance-based form did not provide.
+    a.typo_bucket
+        .cmp(&b.typo_bucket)
+        .then_with(|| canon_score(b.score).total_cmp(&canon_score(a.score)))
+        .then_with(|| a.doc.cmp(&b.doc))
 }
 
 /// A candidate in the top-k min-heap, ordered by score so the *worst* is always at the root.
@@ -716,6 +1244,11 @@ pub(crate) fn rank_cmp(a: &Hit, b: &Hit) -> std::cmp::Ordering {
 /// the second of two hidden linear factors `bench/roadmap/p7-scale.md` exposed.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Candidate {
+    /// `score - bucket * scale`, with `scale` larger than any achievable score — so it reproduces
+    /// the final ranking's `(bucket asc, score desc)` order exactly rather than approximating it.
+    ///
+    /// Used by the **ranking pool**, not the scoring pool. See `RankCandidate`.
+    eff: f32,
     score: f32,
     doc: u32,
     bucket: u32,
@@ -743,6 +1276,97 @@ impl PartialOrd for Candidate {
     }
 }
 
+/// Is score-based pruning currently SOUND?
+///
+/// It is exactly when the ranking pool is full **and its worst member has bucket 0**. Then no
+/// unseen document can have a better bucket, so entering the answer requires beating a *score* —
+/// which is what block-max skipping and the non-essential bail actually test.
+///
+/// The moment the ranking pool's worst member has a bucket above 0, a document matching more of the
+/// query enters regardless of how it scores, and skipping it on a score bound discards a document
+/// the ranking would have kept. That is the defect `bench/roadmap/p22-prune-consistency.md`
+/// reproduces from 512 decoys and `p23-pool-audit.md` measures at 9.33 % of real presyo queries.
+#[inline]
+fn prune_is_sound(rank_pool: &std::collections::BinaryHeap<RankCandidate>, rank_cap: usize) -> bool {
+    rank_pool.len() >= rank_cap && rank_pool.peek().is_some_and(|w| w.0.bucket == 0)
+}
+
+/// Offer a scored candidate to both pools.
+///
+/// The scoring pool keeps the best by score and owns the pruning threshold; the ranking pool keeps
+/// the best by final rank. Each evicts independently, so a document can be in one, both, or neither.
+#[inline]
+fn admit(
+    score_pool: &mut std::collections::BinaryHeap<Candidate>,
+    rank_pool: &mut std::collections::BinaryHeap<RankCandidate>,
+    threshold: &mut f32,
+    pool: usize,
+    rank_cap: usize,
+    c: Candidate,
+) {
+    if score_pool.len() < pool {
+        score_pool.push(c);
+        if score_pool.len() == pool {
+            *threshold = score_pool.peek().map_or(f32::NEG_INFINITY, |x| x.score);
+        }
+    } else if c.score > *threshold {
+        // O(log pool): pop the worst, push the new one, read the new worst.
+        score_pool.pop();
+        score_pool.push(c);
+        *threshold = score_pool.peek().map_or(f32::NEG_INFINITY, |x| x.score);
+    }
+
+    if rank_pool.len() < rank_cap {
+        rank_pool.push(RankCandidate(c));
+    } else if rank_pool.peek().is_some_and(|w| c.eff > w.0.eff) {
+        rank_pool.pop();
+        rank_pool.push(RankCandidate(c));
+    }
+}
+
+/// A candidate in the **ranking pool**, ordered so the root is the worst *by final rank*.
+///
+/// # Why there are two pools
+///
+/// `bench/roadmap/p22-prune-consistency.md` reproduced a real defect: the scoring pool evicts by
+/// **score**, the final answer is ordered by **bucket then score**, and a document matching more of
+/// the query could be thrown away before the ranking ran.
+///
+/// `bench/roadmap/p23-pool-audit.md` then measured it on production data and found it is not
+/// hypothetical: on **28.2 % of real presyo product queries** the returned top-10 contained a
+/// document that matched *less* of the query than one the pool had discarded.
+///
+/// Ordering a single pool by `eff` fixes it completely and costs 10–30× (measured: typo p99 at 1 M
+/// went 6.0 ms to 57.5 ms), because the pruning threshold is the pool's worst member and an `eff`
+/// threshold sits below every score, so block skipping never engages. So there are two pools over
+/// the same scored candidates:
+///
+///   - the **scoring pool** keeps the best by score and supplies the pruning threshold, exactly as
+///     before, so skipping and latency are largely unchanged;
+///   - the **ranking pool**, sized `k`, keeps the best by `eff`, so a document the final ordering
+///     would rank highly cannot be lost merely for scoring poorly.
+///
+/// They are merged and deduplicated at the end. A document can still be missed if pruning skipped
+/// it *before scoring*, which is a strictly smaller hole and is what `p22` still records as red.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RankCandidate(Candidate);
+
+impl Eq for RankCandidate {}
+
+impl Ord for RankCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Root is evicted, so "greater" means "worse by final rank": lower `eff` first, and among
+        // equals the HIGHER document id — matching `Candidate` so the two pools agree on ties.
+        other.0.eff.total_cmp(&self.0.eff).then(self.0.doc.cmp(&other.0.doc))
+    }
+}
+
+impl PartialOrd for RankCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// A borrowed view of an index's internals, for serialization only.
 pub(crate) struct Snapshot<'a> {
     pub doc_count: usize,
@@ -762,6 +1386,24 @@ pub(crate) struct Snapshot<'a> {
     pub deleted: &'a [u64],
     /// Learned query expansion; empty unless it was asked for.
     pub expansion: &'a [(String, Vec<u32>)],
+    /// Schema field behind each facet slot.
+    pub facet_field: &'a [usize],
+    /// Interned facet labels per slot, sorted; empty unless a facet field was designated.
+    pub facet_label: &'a [Vec<String>],
+    /// Per-slot, per-document label id; empty exactly when `facet_label` is.
+    pub facet_id: &'a [Vec<u32>],
+    /// The application's primary key per document; empty unless a key field was designated.
+    pub doc_key: &'a [String],
+    /// Schema field `doc_key` came from; meaningless when `doc_key` is empty.
+    pub key_field: usize,
+    /// Packed token positions; empty unless the index was built with positions.
+    pub position: &'a [u32],
+    /// Cumulative offsets into `position`, one per posting plus a terminator; empty when off.
+    pub position_at: &'a [u64],
+    /// Schema field behind each numeric slot.
+    pub numeric_field: &'a [usize],
+    /// Per-slot, per-document numeric value; empty unless a numeric column was designated.
+    pub numeric_value: &'a [Vec<f64>],
 }
 
 /// One expanded query term: a dictionary entry, the query token it came from, and its penalty.
@@ -819,7 +1461,52 @@ impl Index {
             first_term: &self.first_term,
             deleted: &self.deleted,
             expansion: &self.expansion,
+            facet_field: &self.facet_field,
+            facet_label: &self.facet_label,
+            facet_id: &self.facet_id,
+            numeric_field: &self.numeric_field,
+            numeric_value: &self.numeric_value,
+            position: &self.position,
+            position_at: &self.position_at,
+            doc_key: &self.doc_key,
+            key_field: self.key_field,
         }
+    }
+
+    /// Sort document ordinals by key, so a key resolves by binary search.
+    ///
+    /// Documents with an EMPTY key are excluded: a blank key field means the row has no key, not
+    /// that its key is the empty string, and admitting them would let a change stream address an
+    /// arbitrary one of them.
+    ///
+    /// Sorted by key then by ordinal, so a key duplicated INSIDE one index resolves to the last
+    /// document carrying it — the same newest-wins rule [`Searcher`] applies across segments, so
+    /// one rule covers both cases.
+    fn rebuild_key_order(&mut self) {
+        self.key_order = (0..self.doc_key.len() as u32)
+            .filter(|&d| !self.doc_key[d as usize].is_empty())
+            .collect();
+        self.key_order.sort_by(|&a, &b| {
+            self.doc_key[a as usize].cmp(&self.doc_key[b as usize]).then(a.cmp(&b))
+        });
+    }
+
+    /// Install deserialized keys. Crate-private, called only by [`Index::from_bytes`].
+    pub(crate) fn set_key(&mut self, field: usize, doc_key: Vec<String>) {
+        self.key_field = field;
+        self.doc_key = doc_key;
+        self.rebuild_key_order();
+    }
+
+    /// Install deserialized positions. Crate-private, called only by [`Index::from_bytes`].
+    ///
+    /// Validated there rather than here: `position_at` must have one entry per posting plus a
+    /// terminator, and must be non-decreasing and in bounds, or `position_of` would hand out a
+    /// slice of another posting's positions and the phrase verifier would confidently agree with
+    /// it.
+    pub(crate) fn set_position(&mut self, position: Vec<u32>, position_at: Vec<u64>) {
+        self.position = position;
+        self.position_at = position_at;
     }
 
     /// Rebuild from deserialized parts. Kept crate-private: the only supported way to construct an
@@ -870,6 +1557,23 @@ impl Index {
             deleted_count: 0,
             expansion: Vec::new(),
             first_term: Vec::new(),
+            // Positions are optional in exactly the same way, and are installed by
+            // `set_position` when the two spans are non-empty.
+            position: Vec::new(),
+            position_at: Vec::new(),
+            posting_base: Vec::new(),
+            numeric_order: Vec::new(),
+            // Installed by the caller via `set_key`, like every other optional section.
+            doc_key: Vec::new(),
+            key_field: usize::MAX,
+            key_order: Vec::new(),
+            // Set by the caller after construction via `set_facet`; the facet sections are
+            // optional, exactly like the prior and expansion sections above.
+            facet_field: Vec::new(),
+            facet_label: Vec::new(),
+            facet_id: Vec::new(),
+            numeric_field: Vec::new(),
+            numeric_value: Vec::new(),
             doc_len,
             avg_len,
             doc_count,
@@ -880,6 +1584,38 @@ impl Index {
 
     /// One pass over the whole index, at build or load time, to fill the retrieval metadata.
     fn rebuild_meta(&mut self) {
+        // The prefix sum that turns `(term, index in its list)` into the global posting slot
+        // `position_at` is keyed by. Derived here rather than serialized: it is a restatement of
+        // the posting lengths, and a stored copy could disagree with them after a format change.
+        self.posting_base = Vec::with_capacity(self.posting.len() + 1);
+        let mut acc = 0u64;
+        self.posting_base.push(0);
+        for list in &self.posting {
+            acc += list.len() as u64;
+            self.posting_base.push(acc);
+        }
+
+        self.rebuild_key_order();
+
+        // Value order per numeric column, so a sort can walk documents best-first instead of
+        // visiting every match. Absent values are excluded here rather than filtered later: a
+        // document with no price has no position in a price order, which is the same rule the
+        // range filter and the histogram already follow.
+        //
+        // `total_cmp` because `sort_by` requires a total order and `f64` does not provide one;
+        // NaN cannot reach here (it is filtered above) but `total_cmp` is total regardless.
+        self.numeric_order = self
+            .numeric_value
+            .iter()
+            .map(|column| {
+                let mut order: Vec<u32> = (0..column.len() as u32)
+                    .filter(|&d| column[d as usize].is_finite())
+                    .collect();
+                order.sort_by(|&a, &b| column[a as usize].total_cmp(&column[b as usize]));
+                order
+            })
+            .collect();
+
         // Fill each posting's saturated contribution first; everything else derives from it.
         let sat: Vec<Vec<f32>> = self
             .posting
@@ -974,14 +1710,18 @@ impl Index {
         if !any {
             return None;
         }
+        let bucket = Self::bucket_of(group_dist, group_is_quantity);
         Some(Hit {
             doc,
             // The prior scales the relevance score; it deliberately does NOT touch `typo_bucket`,
             // which stays the primary sort key. An important document with a misspelled match must
             // not outrank an exact match on an unimportant one — a prior expresses importance, not
-            // correctness.
-            score: score as f32 * self.prior_of(doc) * self.anchor_factor(doc, anchor),
-            typo_bucket: Self::bucket_of(group_dist, group_is_quantity),
+            // correctness. The same holds for the exact-field factor below.
+            score: score as f32
+                * self.prior_of(doc)
+                * self.anchor_factor(doc, anchor)
+                * self.exact_field_factor(doc, bucket, group_is_quantity.len().max(1)),
+            typo_bucket: bucket,
         })
     }
 
@@ -1040,7 +1780,7 @@ impl Index {
     ///
     /// `prefix_last` applies typeahead semantics to the final token only — Meilisearch's rule, and
     /// the right default for a search-as-you-type box.
-    fn plan(&self, query: &str, prefix_last: bool) -> (Vec<QueryTerm>, Vec<bool>, bool) {
+    fn plan(&self, query: &str, prefix_last: bool, cap: usize) -> (Vec<QueryTerm>, Vec<bool>, bool) {
         let mut tok = tokenize(query);
         apply_alias(&mut tok, &self.alias);
         // A group is a "quantity" group when its token parses as a real physical size. A bare
@@ -1076,7 +1816,7 @@ impl Index {
                         group_is_quantity
                             .push(numeric && crate::analyze::parse_quantity(&part).is_some());
                         let m = self.dict.expand_lazy(&part, numeric, false);
-                        self.emit(&mut out, m, gi);
+                        self.emit(&mut out, m, gi, cap);
                     }
                     continue;
                 }
@@ -1085,7 +1825,7 @@ impl Index {
             let gi = group_is_quantity.len() as u16;
             group_is_quantity
                 .push(t.is_numeric && crate::analyze::parse_quantity(&t.text).is_some());
-            self.emit(&mut out, matches, gi);
+            self.emit(&mut out, matches, gi, cap);
         }
 
         // --- learned expansion, fired STRICTLY.
@@ -1113,7 +1853,7 @@ impl Index {
                     .map(|&term_id| crate::dict::TermMatch { term_id, distance: EXPANSION_DISTANCE })
                     .collect();
                 for gi in 0..group_is_quantity.len() as u16 {
-                    self.emit(&mut out, extra.clone(), gi);
+                    self.emit(&mut out, extra.clone(), gi, cap);
                 }
                 expanded = true;
             }
@@ -1160,11 +1900,17 @@ impl Index {
 
     /// Turn a token's dictionary matches into weighted query terms for group `gi`, applying the
     /// expansion cap.
-    fn emit(&self, out: &mut Vec<QueryTerm>, mut matches: Vec<crate::dict::TermMatch>, gi: u16) {
-        if matches.len() > MAX_EXPANSION {
+    fn emit(
+        &self,
+        out: &mut Vec<QueryTerm>,
+        mut matches: Vec<crate::dict::TermMatch>,
+        gi: u16,
+        cap: usize,
+    ) {
+        if matches.len() > cap {
             // Closest first; among equals, the rarer term is the more discriminative one.
             matches.sort_by_key(|m| (m.distance, self.posting[m.term_id as usize].len()));
-            matches.truncate(MAX_EXPANSION);
+            matches.truncate(cap);
         }
         for m in matches {
             let df = self.posting[m.term_id as usize].len();
@@ -1214,19 +1960,805 @@ impl Index {
     /// score instead would break MaxScore's upper bounds; filtering on it would discard recall.
     /// So the candidate pool is deliberately over-fetched before the bucket sort is applied.
     pub fn search(&self, query: &str, k: usize) -> Vec<Hit> {
-        self.search_opt(query, k, false)
+        self.search_opt(Scan::new(query, k))
+    }
+
+    /// **Opt-in bounded-error search.** Identical to [`Index::search`] but caps how many dictionary
+    /// terms each query token may expand to, at `cap` instead of the default 16.
+    ///
+    /// This is the ONE knob that trades correctness for tail latency, and it exists because
+    /// `bench/roadmap/p27-group-seeding.md` closed the alternative: both pruning bounds are already
+    /// exact and have no slack, so the typo tail is not an optimization problem. It is the cost of
+    /// ranking every expansion of every token. The only remaining lever is to rank fewer of them.
+    ///
+    /// **The error is one-sided and predictable.** Expansions are ordered by edit distance first,
+    /// then document frequency ascending, so a lower cap discards the vaguest and least
+    /// discriminative matches first. It can only ever *lose* a hit that a rarer, more distant typo
+    /// correction would have found; it never invents one and never reorders what it keeps.
+    ///
+    /// `cap == 0` is treated as 1 — a token always contributes at least its closest match, so a
+    /// capped search still answers exact queries exactly.
+    ///
+    /// Measured tradeoff: `bench/roadmap/p29-expansion-cap.md`.
+    pub fn search_capped(&self, query: &str, k: usize, cap: usize) -> Vec<Hit> {
+        self.search_opt(Scan { cap: cap.max(1), ..Scan::new(query, k) })
+    }
+
+    /// **Which parts of `text` matched `query`** — byte ranges into `text`, ascending, non-overlapping.
+    ///
+    /// The index does not store field text, so the caller passes back the row it already has. That
+    /// is the right shape for an embedded engine: the application owns the rows, and keeping a
+    /// second copy purely to highlight them is the duplication this engine exists to avoid.
+    ///
+    /// Spans are computed through **the same analysis the index used**, so a typo-corrected hit
+    /// highlights correctly — querying `"Colgte"` marks `Colgate` — and an aliased token marks the
+    /// text that was actually written. A token matches when its term id is one the query planned,
+    /// which includes every typo expansion the search itself considered.
+    ///
+    /// Returns an empty vector when nothing matched; never panics on text it did not index.
+    pub fn highlight(&self, query: &str, text: &str) -> Vec<(usize, usize)> {
+        let (term, _, _) = self.plan(query, false, MAX_EXPANSION);
+        if term.is_empty() {
+            return Vec::new();
+        }
+        let mut want: Vec<u32> = term.iter().map(|t| t.term_id).collect();
+        want.sort_unstable();
+        want.dedup();
+
+        let mut tok = crate::analyze::tokenize_span(text);
+        // The alias table rewrites token text in place, so spans stay aligned with their tokens.
+        // Applying it matters: the index stored the canonical form, and a highlight that skipped
+        // this step would fail to mark exactly the words an alias exists to catch.
+        let mut just: Vec<Token> = tok.iter().map(|(t, _, _)| t.clone()).collect();
+        apply_alias(&mut just, &self.alias);
+        for (i, t) in just.into_iter().enumerate() {
+            tok[i].0 = t;
+        }
+
+        let mut span: Vec<(usize, usize)> = tok
+            .iter()
+            .filter(|(t, _, _)| {
+                self.term_id_of(&t.text).is_some_and(|id| want.binary_search(&id).is_ok())
+            })
+            .map(|(_, a, b)| (*a, *b))
+            .collect();
+
+        // Merge touching or overlapping spans so a caller can wrap each one in a tag without
+        // producing `<b>Col</b><b>gate</b>`.
+        span.sort_unstable();
+        let mut out: Vec<(usize, usize)> = Vec::with_capacity(span.len());
+        for (a, b) in span {
+            match out.last_mut() {
+                Some(prev) if a <= prev.1 => prev.1 = prev.1.max(b),
+                _ => out.push((a, b)),
+            }
+        }
+        out
+    }
+
+    /// **Faceted search**: [`Index::search`] restricted to documents whose stored facet value is
+    /// exactly `value`. Returns empty if the index has no facet field or the value is unknown.
+    ///
+    /// This is filter-then-rank, not rank-then-filter: the filter is applied before a document is
+    /// admitted to the pool, so asking for 10 hits in a rare category returns 10 if 10 exist,
+    /// rather than however many survive from a global top-10.
+    pub fn search_facet(&self, query: &str, k: usize, value: &str) -> Vec<Hit> {
+        self.search_facet_all(query, k, &[(0, value)])
+    }
+
+    /// [`Index::search_facet`] against a specific facet slot.
+    pub fn search_facet_at(&self, query: &str, k: usize, slot: usize, value: &str) -> Vec<Hit> {
+        self.search_facet_all(query, k, &[(slot, value)])
+    }
+
+    /// **Conjunctive faceted search**: every `(slot, value)` pair must hold.
+    ///
+    /// This is what a storefront actually asks — brand *and* category *and* whatever else — and it
+    /// is one pass, not an intersection of separate result sets. An unknown value in any pair
+    /// returns empty, because a filter nobody can satisfy has no results; returning everything
+    /// would be the dangerous reading.
+    pub fn search_facet_all(&self, query: &str, k: usize, want: &[(usize, &str)]) -> Vec<Hit> {
+        self.search_filtered(query, k, want, &[])
+    }
+
+    /// [`Index::search_clause`] without ranges or paging.
+    pub fn search_any(&self, query: &str, k: usize, clause: &[FacetClause]) -> Vec<Hit> {
+        self.search_clause(query, k, 0, clause, &[])
+    }
+
+    /// Search restricted to a numeric range on one column: `lo <= value < hi`.
+    ///
+    /// Half-open on purpose. Adjacent buckets in a price filter must not both contain the boundary,
+    /// or the counts beside them add up to more than the result set.
+    pub fn search_range(&self, query: &str, k: usize, slot: usize, lo: f64, hi: f64) -> Vec<Hit> {
+        self.search_filtered(query, k, &[], &[(slot, lo, hi)])
+    }
+
+    /// **The full filter**: every facet pair and every numeric range must hold, in one pass.
+    ///
+    /// This is a storefront's whole filter bar -- brand, category and a price slider -- evaluated
+    /// against each candidate once, rather than as an intersection of separately ranked result sets.
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        k: usize,
+        want: &[(usize, &str)],
+        range: &[(usize, f64, f64)],
+    ) -> Vec<Hit> {
+        let clause: Vec<FacetClause> =
+            want.iter().map(|(slot, v)| FacetClause::any(*slot, std::slice::from_ref(v))).collect();
+        self.search_clause(query, k, 0, &clause, range)
+    }
+
+    /// **The full filter bar**: OR within a clause, AND across clauses, plus numeric ranges, plus
+    /// an offset for paging.
+    ///
+    /// This is the entry point every other faceted search here is sugar over.
+    pub fn search_clause(
+        &self,
+        query: &str,
+        k: usize,
+        offset: usize,
+        clause: &[FacetClause],
+        range: &[(usize, f64, f64)],
+    ) -> Vec<Hit> {
+        let Some(filter) = self.resolve_clause(clause) else { return Vec::new() };
+        if range.iter().any(|&(slot, _, _)| slot >= self.numeric_value.len()) {
+            return Vec::new();
+        }
+        self.search_opt(Scan { offset, facet: &filter, range, ..Scan::new(query, k) })
+    }
+
+    /// [`Index::search`] starting at `offset` — page `n` is `offset = n * k`.
+    ///
+    /// **Cost grows with `offset`, not with `k`.** The engine over-fetches `offset + k` and drops
+    /// the prefix, because rank order is only known once everything above the page is scored. That
+    /// is true of every engine without a stored cursor; it is stated here rather than discovered.
+    /// For deep paging, filter instead of paging.
+    pub fn search_page(&self, query: &str, offset: usize, k: usize) -> Vec<Hit> {
+        self.search_opt(Scan { offset, ..Scan::new(query, k) })
+    }
+
+    /// **Sort by a numeric column** instead of by relevance: "price, low to high".
+    ///
+    /// Returns the `k` matching documents with the smallest (or largest) value in `slot`. Documents
+    /// with no value there are excluded, exactly as they are from a range filter -- there is no
+    /// position in a price order for a product with no price.
+    ///
+    /// # This is not a ranked search, and it costs accordingly
+    ///
+    /// Relevance ordering is what makes pruning possible: the engine can skip a document once no
+    /// unseen document can beat the pool. **A numeric order gives it nothing to prune with** -- the
+    /// cheapest item in the corpus may match the query worst, so every matching document has to be
+    /// visited. The cost therefore tracks the query's *match count*, like [`Index::facet_tally`],
+    /// not `k`.
+    ///
+    /// `score` and `typo_bucket` are still populated honestly, so a host can display relevance
+    /// alongside a price sort; they simply do not determine the order.
+    pub fn search_sorted(&self, query: &str, k: usize, slot: usize, ascending: bool) -> Vec<Hit> {
+        self.search_sorted_filtered(query, k, slot, ascending, &[], &[])
+    }
+
+    /// [`Index::search_sorted`] with the full filter bar applied first.
+    pub fn search_sorted_filtered(
+        &self,
+        query: &str,
+        k: usize,
+        slot: usize,
+        ascending: bool,
+        want: &[(usize, &str)],
+        range: &[(usize, f64, f64)],
+    ) -> Vec<Hit> {
+        if k == 0 {
+            return Vec::new();
+        }
+        let Some(column) = self.numeric_value.get(slot) else { return Vec::new() };
+        let clause: Vec<FacetClause> =
+            want.iter().map(|(slot, v)| FacetClause::any(*slot, std::slice::from_ref(v))).collect();
+        let Some(filter) = self.resolve_clause(&clause) else { return Vec::new() };
+
+        let (term, group_is_quantity, _) = self.plan(query, false, MAX_EXPANSION);
+        if term.is_empty() {
+            return Vec::new();
+        }
+
+        // ---- Which arm? -------------------------------------------------------------------
+        //
+        // `p32` established that a numeric order gives the scan nothing to stop on, and measured
+        // the consequence: 8x the tail of a ranked search, because every matching document must be
+        // visited. That is true of the SCAN. It is not true of the problem.
+        //
+        // Walking the value order instead lets the sort stop after `k` matches -- but then the cost
+        // is "documents examined before `k` of them match", which is ruinous for a selective query
+        // and excellent for a broad one. The scan is the mirror image. So both are kept, and the
+        // cheaper is chosen from numbers the index already has:
+        //
+        //   scan   ~ sum of the query terms' document frequencies (every posting is visited)
+        //   walk   ~ k * live / matches * terms (documents tried before k of them match)
+        //
+        // `sum(df)` OVER-estimates the match count whenever terms overlap, which makes the walk
+        // look worse than it is and biases the choice toward the scan. That is the conservative
+        // direction: the scan is the arm that has always been correct here.
+        //
+        // The two arms must agree exactly, ties included. `sorted_arms_agree_document_for_document`
+        // is the differential test that says so, and is the only reason this is safe to ship.
+        let df: usize = term.iter().map(|t| self.posting[t.term_id as usize].len()).sum();
+        let live = self.live_count().max(1);
+        let order = self.numeric_order.get(slot).map(Vec::as_slice).unwrap_or(&[]);
+        let walk_cost = match df {
+            0 => usize::MAX,
+            _ => order.len().min(k.saturating_mul(live) / df + k).saturating_mul(term.len().max(1)),
+        };
+        match !order.is_empty() && walk_cost < df {
+            true => self
+                .sorted_by_walk(order, k, ascending, &term, &group_is_quantity, column, &filter, range),
+            false => self
+                .sorted_by_scan(k, ascending, &term, &group_is_quantity, column, &filter, range),
+        }
+    }
+
+    /// Sort-by-value by scanning every posting. The arm `p32` shipped, unchanged.
+    ///
+    /// Cost tracks the query's MATCH COUNT, not `k`: with a numeric order there is nothing to
+    /// prune on, so every matching document is visited and scored. That is not an implementation
+    /// shortcut left to be optimised away -- it is what sorting by an unrelated column means for a
+    /// posting scan. `sorted_by_walk` beats it only by giving up the posting scan entirely.
+    #[allow(clippy::too_many_arguments)]
+    fn sorted_by_scan(
+        &self,
+        k: usize,
+        ascending: bool,
+        term: &[QueryTerm],
+        group_is_quantity: &[bool],
+        column: &[f64],
+        filter: &[(usize, Vec<u32>, bool)],
+        range: &[(usize, f64, f64)],
+    ) -> Vec<Hit> {
+        let group_count = group_is_quantity.len().max(1);
+        let mut acc: BTreeMap<u32, (f64, Vec<u8>)> = BTreeMap::new();
+        for t in term {
+            for p in &self.posting[t.term_id as usize] {
+                if self.is_deleted(p.doc) {
+                    continue;
+                }
+                // Filter before accumulating: a rejected document should cost one comparison, not
+                // an allocation and a scoring pass.
+                if !self.facet_allows(p.doc, filter) || !self.range_allows(p.doc, range) {
+                    continue;
+                }
+                if !column.get(p.doc as usize).is_some_and(|v| v.is_finite()) {
+                    continue;
+                }
+                let e = acc.entry(p.doc).or_insert_with(|| (0.0, vec![u8::MAX; group_count]));
+                e.0 += (t.weight * p.sat) as f64;
+                let g = t.group as usize;
+                e.1[g] = e.1[g].min(t.distance);
+            }
+        }
+
+        let mut hit: Vec<(f64, Hit)> = acc
+            .into_iter()
+            .map(|(doc, (score, gd))| {
+                let v = column[doc as usize];
+                (
+                    v,
+                    Hit {
+                        doc,
+                        score: score as f32,
+                        typo_bucket: Self::bucket_of(&gd, group_is_quantity),
+                    },
+                )
+            })
+            .collect();
+        // Ties broken by rank, then by doc id, so a page of equally priced items is still ordered
+        // by how well it matches and is stable across runs.
+        hit.sort_by(|a, b| {
+            let primary = if ascending { a.0.total_cmp(&b.0) } else { b.0.total_cmp(&a.0) };
+            primary.then_with(|| rank_cmp(&a.1, &b.1))
+        });
+        hit.truncate(k);
+        hit.into_iter().map(|(_, h)| h).collect()
+    }
+
+    /// Sort-by-value that STOPS EARLY, by walking the value order instead of the postings.
+    ///
+    /// The scan arm visits every matching document because a numeric order gives it no bound to
+    /// prune on. This arm inverts the loop: documents are visited best-value-first, and once `k`
+    /// of them have matched, no unvisited document can displace one -- every remaining document
+    /// has a worse value by construction.
+    ///
+    /// **Except at a tie.** `p32` fixed that ties break by relevance and then by document id, so
+    /// stopping at exactly `k` would return an arbitrary subset of the documents sharing the `k`-th
+    /// value. The walk therefore continues while the value is unchanged, sorts the whole boundary
+    /// group, and only then truncates. That is the one place this arm is not O(k).
+    ///
+    /// Matching is tested by binary search in each query term's posting list, which is why the
+    /// choice between arms weighs `terms` against the postings the scan would have walked.
+    #[allow(clippy::too_many_arguments)]
+    fn sorted_by_walk(
+        &self,
+        order: &[u32],
+        k: usize,
+        ascending: bool,
+        term: &[QueryTerm],
+        group_is_quantity: &[bool],
+        column: &[f64],
+        filter: &[(usize, Vec<u32>, bool)],
+        range: &[(usize, f64, f64)],
+    ) -> Vec<Hit> {
+        let group_count = group_is_quantity.len().max(1);
+        let mut hit: Vec<(f64, Hit)> = Vec::with_capacity(k + 1);
+        let mut boundary: Option<f64> = None;
+
+        // `order` is ascending by value, so a descending sort walks it backwards. One array serves
+        // both directions; storing a second reversed copy would be the same fact twice.
+        let step: Box<dyn Iterator<Item = &u32>> = match ascending {
+            true => Box::new(order.iter()),
+            false => Box::new(order.iter().rev()),
+        };
+
+        for &doc in step {
+            let value = column[doc as usize];
+            // Past the boundary value, the group that could tie for `k`-th place is complete.
+            if let Some(edge) = boundary {
+                if value != edge {
+                    break;
+                }
+            }
+            if self.is_deleted(doc)
+                || !self.facet_allows(doc, filter)
+                || !self.range_allows(doc, range)
+            {
+                continue;
+            }
+
+            // Does the query match, and with what score? Same arithmetic as the scan arm, reached
+            // from the other side: there, postings are walked and documents accumulated; here, a
+            // document is fixed and its entry in each term's list is looked up.
+            let mut score = 0.0f64;
+            let mut group_dist = vec![u8::MAX; group_count];
+            let mut matched = false;
+            for t in term {
+                let list = &self.posting[t.term_id as usize];
+                if let Ok(i) = list.binary_search_by_key(&doc, |p| p.doc) {
+                    matched = true;
+                    score += (t.weight * list[i].sat) as f64;
+                    let g = t.group as usize;
+                    group_dist[g] = group_dist[g].min(t.distance);
+                }
+            }
+            if !matched {
+                continue;
+            }
+
+            hit.push((
+                value,
+                Hit {
+                    doc,
+                    score: score as f32,
+                    typo_bucket: Self::bucket_of(&group_dist, group_is_quantity),
+                },
+            ));
+            // The `k`-th match fixes the boundary value; everything sharing it must still be seen.
+            if hit.len() == k {
+                boundary = Some(value);
+            }
+        }
+
+        hit.sort_by(|a, b| {
+            let primary = if ascending { a.0.total_cmp(&b.0) } else { b.0.total_cmp(&a.0) };
+            primary.then_with(|| rank_cmp(&a.1, &b.1))
+        });
+        hit.truncate(k);
+        hit.into_iter().map(|(_, h)| h).collect()
+    }
+
+    /// Run one sort arm explicitly. **For differential testing and benchmarking only** —
+    /// production code should call [`Index::search_sorted`], which picks the cheaper arm.
+    ///
+    /// It is public because the claim that the two arms return the same answer is only worth
+    /// anything if it can be checked at scale, on a real corpus, by `bench/roadmap/p46`'s
+    /// `sort-tail` bin — and neither arm is reachable from outside otherwise, since the chooser
+    /// deliberately never runs both.
+    ///
+    /// `walk = true` is the value-order walk that stops early; `false` is the posting scan `p32`
+    /// shipped. Filters are not exposed here: the arms are compared on the query, and the filter
+    /// path is asserted separately.
+    pub fn search_sorted_arm(
+        &self,
+        query: &str,
+        k: usize,
+        slot: usize,
+        ascending: bool,
+        walk: bool,
+    ) -> Vec<Hit> {
+        if k == 0 {
+            return Vec::new();
+        }
+        let Some(column) = self.numeric_value.get(slot) else { return Vec::new() };
+        let (term, group_is_quantity, _) = self.plan(query, false, MAX_EXPANSION);
+        if term.is_empty() {
+            return Vec::new();
+        }
+        let order = self.numeric_order.get(slot).map(Vec::as_slice).unwrap_or(&[]);
+        match walk {
+            true => self
+                .sorted_by_walk(order, k, ascending, &term, &group_is_quantity, column, &[], &[]),
+            false => self.sorted_by_scan(k, ascending, &term, &group_is_quantity, column, &[], &[]),
+        }
+    }
+
+    /// Does `doc` fall inside every `(slot, lo, hi)` half-open range?
+    ///
+    /// A `NaN` value fails every comparison, so a document with no value in that column is excluded
+    /// rather than treated as zero.
+    #[inline]
+    fn range_allows(&self, doc: u32, range: &[(usize, f64, f64)]) -> bool {
+        range.iter().all(|&(slot, lo, hi)| {
+            self.numeric_value
+                .get(slot)
+                .and_then(|c| c.get(doc as usize))
+                .is_some_and(|&v| v >= lo && v < hi)
+        })
+    }
+
+    /// Histogram: how many documents matching `query` fall in each bucket of `edge`.
+    ///
+    /// Returns `edge.len() - 1` counts, bucket `i` being `edge[i] <= v < edge[i+1]`. Counted over
+    /// **every** matching document, like [`Index::facet_tally`], because a price slider showing
+    /// "12 items under 100" has to mean 12 results exist.
+    pub fn range_tally(&self, query: &str, slot: usize, edge: &[f64]) -> Vec<usize> {
+        if edge.len() < 2 {
+            return Vec::new();
+        }
+        let Some(column) = self.numeric_value.get(slot) else { return Vec::new() };
+        let (term, _, _) = self.plan(query, false, MAX_EXPANSION);
+        let mut seen = vec![false; self.doc_count];
+        let mut count = vec![0usize; edge.len() - 1];
+        for t in &term {
+            for p in &self.posting[t.term_id as usize] {
+                let d = p.doc as usize;
+                if seen[d] || self.is_deleted(p.doc) {
+                    continue;
+                }
+                seen[d] = true;
+                let Some(&v) = column.get(d) else { continue };
+                // `partition_point` over the edges: the bucket is the last edge not exceeding `v`.
+                // NaN fails every comparison, lands at 0, and is then rejected by the `v >= edge[0]`
+                // guard -- absent values are counted nowhere.
+                if !(v >= edge[0] && v < edge[edge.len() - 1]) {
+                    continue;
+                }
+                let b = edge.partition_point(|&e| e <= v) - 1;
+                count[b] += 1;
+            }
+        }
+        count
+    }
+
+    /// Does `doc` satisfy every clause? Values within a clause are OR-ed, clauses are AND-ed.
+    #[inline]
+    fn facet_allows(&self, doc: u32, filter: &[(usize, Vec<u32>, bool)]) -> bool {
+        filter.iter().all(|(slot, id, exclude)| {
+            let has = self
+                .facet_id
+                .get(*slot)
+                .and_then(|c| c.get(doc as usize))
+                .is_some_and(|v| id.binary_search(v).is_ok());
+            has != *exclude
+        })
+    }
+
+    /// Whether this index carries application keys.
+    pub fn has_key(&self) -> bool {
+        !self.doc_key.is_empty()
+    }
+
+    /// The schema field the key was taken from, if any.
+    pub fn key_field(&self) -> Option<usize> {
+        (self.key_field != usize::MAX).then_some(self.key_field)
+    }
+
+    /// The application's key for `doc`, or `None` if it has none.
+    pub fn key_of(&self, doc: u32) -> Option<&str> {
+        self.doc_key.get(doc as usize).map(String::as_str).filter(|k| !k.is_empty())
+    }
+
+    /// The document carrying `key`, or `None`.
+    ///
+    /// **Deleted documents are still found.** Resolution answers "which ordinal is this row",
+    /// which a caller needs precisely in order to delete it; filtering here would make deleting an
+    /// already-deleted row indistinguishable from deleting a row that never existed.
+    ///
+    /// When a key appears more than once in one index the LAST document carrying it wins, matching
+    /// the newest-wins rule [`Searcher`] applies across segments.
+    pub fn doc_of_key(&self, key: &str) -> Option<u32> {
+        if key.is_empty() {
+            return None;
+        }
+        // `key_order` is sorted by (key, ordinal), so the last entry of an equal run is the winner.
+        let at = self
+            .key_order
+            .partition_point(|&d| self.doc_key[d as usize].as_str() <= key)
+            .checked_sub(1)?;
+        let doc = *self.key_order.get(at)?;
+        (self.doc_key[doc as usize] == key).then_some(doc)
+    }
+
+    /// Every key in this index, ascending, with the document that owns it. Used by compaction and
+    /// by the shadow-tombstoning in [`Searcher::push`].
+    pub fn key_iter(&self) -> impl Iterator<Item = (&str, u32)> + '_ {
+        self.key_order.iter().map(move |&d| (self.doc_key[d as usize].as_str(), d))
+    }
+
+    /// How many documents carry a key. Less than `doc_count` when some key fields were blank —
+    /// which is worth surfacing, because those rows can never be addressed by a change stream.
+    pub fn keyed_count(&self) -> usize {
+        self.key_order.len()
+    }
+
+    /// Whether this index can answer a phrase query. False unless it was built with
+    /// [`IndexBuilder::with_position`].
+    pub fn has_position(&self) -> bool {
+        !self.position_at.is_empty()
+    }
+
+    /// The packed positions at which `term` occurs in `doc`, or `None` if it does not occur.
+    ///
+    /// Ascending, so the phrase verifier can binary-search them.
+    fn position_of(&self, term: u32, doc: u32) -> Option<&[u32]> {
+        let list = self.posting.get(term as usize)?;
+        let i = list.binary_search_by_key(&doc, |p| p.doc).ok()?;
+        let slot = (*self.posting_base.get(term as usize)? as usize) + i;
+        let lo = *self.position_at.get(slot)? as usize;
+        let hi = *self.position_at.get(slot + 1)? as usize;
+        self.position.get(lo..hi)
+    }
+
+    /// Does `doc` contain `phrase` as CONSECUTIVE tokens of a single field?
+    ///
+    /// Anchored on the phrase's **rarest** term rather than its first: the loop is
+    /// `occurrences of the anchor x phrase length`, and a phrase like `"the toothpaste"` has orders
+    /// of magnitude more occurrences of `the` than of `toothpaste` to walk from.
+    ///
+    /// An empty phrase is vacuously satisfied, which is what makes `Scan`'s default -- no phrase --
+    /// mean "no phrase constraint" rather than "match nothing".
+    fn phrase_allows(&self, doc: u32, phrase: &[u32]) -> bool {
+        if phrase.is_empty() {
+            return true;
+        }
+        let mut at: Vec<&[u32]> = Vec::with_capacity(phrase.len());
+        for &t in phrase {
+            match self.position_of(t, doc) {
+                Some(p) if !p.is_empty() => at.push(p),
+                // A term absent from the document ends it: every phrase term must occur.
+                _ => return false,
+            }
+        }
+        let anchor = (0..at.len()).min_by_key(|&i| at[i].len()).unwrap_or(0);
+        at[anchor].iter().any(|&a| {
+            // Where the phrase would start if the anchor sits at `a`.
+            let index = a & POSITION_INDEX_MASK;
+            if (index as usize) < anchor {
+                return false;
+            }
+            let start = a - anchor as u32;
+            at.iter().enumerate().all(|(i, p)| {
+                // The field is packed into the high bits, so `start + i` crossing a field boundary
+                // simply fails to be found -- but only if it cannot WRAP into the next field's low
+                // positions, which is why the index is bounded explicitly.
+                let want_index = (start & POSITION_INDEX_MASK) as usize + i;
+                want_index <= POSITION_INDEX_MASK as usize
+                    && p.binary_search(&(start + i as u32)).is_ok()
+            })
+        })
+    }
+
+    /// Resolve clauses to per-slot label ids, or `None` when the filter cannot be satisfied at all.
+    fn resolve_clause(&self, clause: &[FacetClause]) -> Option<Vec<(usize, Vec<u32>, bool)>> {
+        let mut out = Vec::with_capacity(clause.len());
+        for c in clause {
+            let Some(label) = self.facet_label.get(c.slot) else {
+                // A slot this index does not have is the unknown-value rule one level up, and it
+                // takes the same two answers rather than collapsing both to "empty". A slot with
+                // no values has, by definition, no KNOWN value: an include nobody can satisfy is
+                // empty, an exclude with nothing to remove is vacuous.
+                //
+                // Collapsing the exclude to empty is not merely inconsistent, it is wrong across
+                // segments: a newer delta may carry a slot an older segment was built without, and
+                // "not discontinued" would then silently delete every older row from the results.
+                if c.exclude {
+                    continue;
+                }
+                return None;
+            };
+            let mut id: Vec<u32> = c
+                .value
+                .iter()
+                .filter_map(|v| label.binary_search_by(|l| l.as_str().cmp(v)).ok())
+                .map(|i| i as u32)
+                .collect();
+            id.sort_unstable();
+            id.dedup();
+            if id.is_empty() {
+                // See `FacetClause`: an include nobody can satisfy is empty; an exclude with
+                // nothing to exclude is vacuous and simply drops out of the conjunction.
+                if c.exclude {
+                    continue;
+                }
+                return None;
+            }
+            out.push((c.slot, id, c.exclude));
+        }
+        Some(out)
+    }
+
+    /// **Facet tally**: how many documents matching `query` carry each facet value.
+    ///
+    /// Counted over **every** document the query touches, not over the top `k`. That is the only
+    /// count a shopper can act on -- "Snacks (412)" has to mean 412 results exist, not 412 within
+    /// a page. It costs a walk of the query's posting lists with no pruning, because pruning exists
+    /// to avoid scoring documents that cannot rank, and every one of them still counts.
+    ///
+    /// Deleted documents are excluded. Documents with no facet value are omitted rather than
+    /// bucketed under an empty label. Returned sorted by count descending, then value ascending.
+    pub fn facet_tally(&self, query: &str) -> Vec<(&str, usize)> {
+        self.facet_tally_at(query, 0)
+    }
+
+    /// [`Index::facet_tally`] for a specific slot.
+    pub fn facet_tally_at(&self, query: &str, slot: usize) -> Vec<(&str, usize)> {
+        let (Some(label), Some(column)) = (self.facet_label.get(slot), self.facet_id.get(slot))
+        else {
+            return Vec::new();
+        };
+        let (term, _, _) = self.plan(query, false, MAX_EXPANSION);
+        let mut seen = vec![false; self.doc_count];
+        let mut count = vec![0usize; label.len()];
+        for t in &term {
+            for p in &self.posting[t.term_id as usize] {
+                let d = p.doc as usize;
+                if seen[d] || self.is_deleted(p.doc) {
+                    continue;
+                }
+                seen[d] = true;
+                if let Some(&f) = column.get(d) {
+                    if f != u32::MAX {
+                        count[f as usize] += 1;
+                    }
+                }
+            }
+        }
+        let mut out: Vec<(&str, usize)> = count
+            .iter()
+            .enumerate()
+            .filter(|(_, &c)| c > 0)
+            .map(|(i, &c)| (label[i].as_str(), c))
+            .collect();
+        out.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        out
+    }
+
+    /// The distinct values of facet slot 0, sorted. Empty when the index has no facet field.
+    pub fn facet_label(&self) -> &[String] {
+        self.facet_label_at(0)
+    }
+
+    /// The distinct values of a facet slot, sorted.
+    pub fn facet_label_at(&self, slot: usize) -> &[String] {
+        self.facet_label.get(slot).map_or(&[], |l| l.as_slice())
+    }
+
+    /// How many facet slots this index carries.
+    pub fn facet_slot_count(&self) -> usize {
+        self.facet_label.len()
+    }
+
+    /// The schema field behind each facet slot, in slot order.
+    pub fn facet_field(&self) -> &[usize] {
+        &self.facet_field
+    }
+
+    /// How many numeric columns this index carries.
+    pub fn numeric_slot_count(&self) -> usize {
+        self.numeric_value.len()
+    }
+
+    /// The schema field behind each numeric slot, in slot order.
+    pub fn numeric_field(&self) -> &[usize] {
+        &self.numeric_field
+    }
+
+    /// The numeric value of a document in a given column, if it has a finite one.
+    pub fn numeric_of(&self, doc: u32, slot: usize) -> Option<f64> {
+        self.numeric_value.get(slot)?.get(doc as usize).copied().filter(|v| v.is_finite())
+    }
+
+    /// The stored facet value of a document in slot 0, if it has one.
+    pub fn facet_of(&self, doc: u32) -> Option<&str> {
+        self.facet_of_at(doc, 0)
+    }
+
+    /// The stored facet value of a document in a given slot, if it has one.
+    pub fn facet_of_at(&self, doc: u32, slot: usize) -> Option<&str> {
+        match self.facet_id.get(slot)?.get(doc as usize) {
+            Some(&f) if f != u32::MAX => {
+                self.facet_label.get(slot)?.get(f as usize).map(|s| s.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve `query` to the ordered term ids a phrase must match, or `None` if it cannot match.
+    ///
+    /// **A phrase is exact.** Quoting is the user asserting these words in this order, so no token
+    /// is typo-corrected, prefix-expanded or alias-split here -- correcting inside a phrase would
+    /// silently answer a different question than the one asked.
+    ///
+    /// A token absent from the dictionary therefore returns `None`, and the query matches
+    /// **nothing**. That is the same direction as an include clause whose values are all unknown
+    /// (see [`FacetClause`]): a constraint nobody can satisfy is empty, never everything.
+    fn phrase_term(&self, query: &str) -> Option<Vec<u32>> {
+        let mut tok = crate::analyze::tokenize(query);
+        crate::analyze::apply_alias(&mut tok, &self.alias);
+        tok.iter().map(|t| self.dict.exact(&t.text)).collect()
+    }
+
+    /// **Phrase query**: the query's tokens, consecutive and in order, within one field.
+    ///
+    /// Requires an index built with [`IndexBuilder::with_position`]; without positions there is
+    /// nothing to verify against and this returns nothing rather than silently degrading to a
+    /// bag-of-words search that would look like it worked.
+    ///
+    /// Ranking is unchanged -- BM25F over the same terms. The phrase is a FILTER applied after
+    /// scoring and before admission, exactly like a facet clause, so it costs no pruning soundness
+    /// and adds no ranking signal: `"ice cream"` ranks its matches the way `ice cream` would, and
+    /// merely refuses the documents where the two words are apart.
+    ///
+    /// A single-token phrase is a plain term query with the same answer, and is allowed rather
+    /// than special-cased.
+    pub fn search_phrase(&self, query: &str, k: usize) -> Vec<Hit> {
+        if !self.has_position() {
+            return Vec::new();
+        }
+        match self.phrase_term(query) {
+            Some(t) if !t.is_empty() => {
+                self.search_opt(Scan { phrase: &t, ..Scan::new(query, k) })
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// [`Index::search_phrase`] with an offset. Cost grows with `offset`; see
+    /// [`Index::search_page`].
+    pub fn search_phrase_page(&self, query: &str, offset: usize, k: usize) -> Vec<Hit> {
+        if !self.has_position() {
+            return Vec::new();
+        }
+        match self.phrase_term(query) {
+            Some(t) if !t.is_empty() => {
+                self.search_opt(Scan { phrase: &t, offset, ..Scan::new(query, k) })
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// [`Index::search`] with typeahead semantics on the last token.
     pub fn search_prefix(&self, query: &str, k: usize) -> Vec<Hit> {
-        self.search_opt(query, k, true)
+        self.search_opt(Scan { prefix_last: true, ..Scan::new(query, k) })
     }
 
-    fn search_opt(&self, query: &str, k: usize, prefix_last: bool) -> Vec<Hit> {
+    fn search_opt(&self, scan: Scan) -> Vec<Hit> {
+        let Scan { query, k, offset, prefix_last, cap, facet, range, phrase } = scan;
+        // Deep paging is served by over-fetching and dropping: rank order is only known once
+        // everything above the page has been scored, so the pool must hold `offset + k`. Cost
+        // therefore grows with `offset`, which is true of every engine without a stored cursor and
+        // is stated in `search_page`'s docs rather than left to be discovered.
+        let k = k.saturating_add(offset);
         if k == 0 {
             return Vec::new();
         }
-        let (mut term, group_is_quantity, expanded) = self.plan(query, prefix_last);
+        let (mut term, group_is_quantity, expanded) = self.plan(query, prefix_last, cap);
         if term.is_empty() {
             return Vec::new();
         }
@@ -1242,14 +2774,22 @@ impl Index {
             true => term.iter().filter(|t| t.group == 0).map(|t| t.term_id).collect(),
             false => Vec::new(),
         };
-        // Over-fetch so the typo-bucket sort has material to reorder.
+        // The SCORING pool. **It no longer carries recall, and that is `p47`.**
         //
-        // This number is a direct latency/recall lever and is deliberately modest. The pruning
-        // threshold is the *pool's* worst score, not the top-k's, so every extra pool slot lowers
-        // the threshold and weakens block skipping. presyo's own SQL uses
-        // `candidate_limit = max(100, limit*5)`; measured here, 3x/32 retains identical recall on
-        // both production corpora (`real-corpus` stays at 100 %) while cutting tail latency at a
-        // million documents. Raise it only with a measurement.
+        // It used to: it was `max(3k, 32)` so that the typo-bucket sort had material to reorder,
+        // and the comment here priced that width against `real-corpus` recall. Since `p47` made
+        // `eff` exactly the final comparator, the RANKING pool provably holds the top `k` by that
+        // comparator, so no document reaching the answer depends on this pool at all.
+        //
+        // Its only remaining job is to supply `threshold` — and for that job a *smaller* pool is
+        // strictly better, because the threshold is the pool's worst score and every extra slot
+        // lowers it and weakens block skipping. Sized to `k`, measured on `scale`: exact p50 at
+        // 1 M fell 35 % (820 us -> 529 us) and typo p50 22 %, with `pool-audit` still reading
+        // 0.00 % in all six cells and `real-corpus` still at 100 % recall@10.
+        //
+        // The EXPANDED branch is left alone. `p21` widened it because a learned expansion adds
+        // many terms whose matches are scoring competitors, and that fix was measured against
+        // precision@10 on profstopick; it has not been re-swept under the new reasoning.
         // When a learned expansion fires, the pool must grow with it.
         //
         // The pool is ordered by SCORE; the final ranking is ordered by `typo_bucket` FIRST. A
@@ -1265,9 +2805,11 @@ impl Index {
         // Tied to expansion firing rather than raised globally: `real-corpus` and `sisia-catalog`
         // never expand, and a wider pool would cost them tail latency for nothing.
         let pool = match expanded {
-            true => (k * 24).max(256),
-            false => (k * 3).max(32),
+            true => (k * EXPANDED_POOL_MULT).max(EXPANDED_POOL_MIN),
+            false => k.max(1),
         };
+        // Everything below still reads `pool` as "the scoring pool's capacity"; only its size and
+        // the reason for that size have changed.
         let group_count = group_is_quantity.len().max(1);
 
         // MaxScore requires terms ordered by ascending maximum contribution.
@@ -1277,12 +2819,82 @@ impl Index {
             prefix_sum[i + 1] = prefix_sum[i] + term[i].max_score;
         }
 
+        // Larger than any score this query can produce: every term contributes at most its
+        // `max_score`, and prior/anchor factors are <= 1. One unit of bucket therefore outweighs
+        // every possible score difference, which is what makes `eff` exactly lexicographic.
+        // ---- Bucket floor of an unenumerated document (p25) --------------------------------
+        // Demoting a prefix of `term` to non-essential removes those postings from the candidate
+        // enumeration, so a document appearing in NO essential term is never scored. Such a
+        // document misses every query group lying wholly inside the essential set, and `bucket_of`
+        // charges a fixed penalty per missed group — so its bucket has a computable FLOOR.
+        //
+        // `bucket_floor[f]` = the least bucket any document can have if it matches none of
+        // `term[f..]`. It is non-increasing in `f` (demoting more terms leaves fewer groups wholly
+        // essential), which is what lets it sit in the same monotone `while` as `prefix_sum`.
+        //
+        // A group with no surviving term at all is charged at every `f`: every document misses it
+        // equally, including the ranking pool's worst member it is compared against.
+        let mut group_min = vec![usize::MAX; group_count];
+        for (i, t) in term.iter().enumerate() {
+            let g = t.group as usize;
+            if g < group_min.len() && i < group_min[g] {
+                group_min[g] = i;
+            }
+        }
+        let mut bucket_floor = vec![0u32; term.len() + 1];
+        for (g, &mi) in group_min.iter().enumerate() {
+            let pen = if group_is_quantity.get(g).copied().unwrap_or(false) {
+                MISSING_QUANTITY_PENALTY
+            } else {
+                MISSING_TERM_PENALTY
+            };
+            // Group `g` is wholly inside `term[f..]` exactly while `f <= min index of g`.
+            let upto = if mi == usize::MAX { term.len() } else { mi };
+            for slot in bucket_floor.iter_mut().take(upto + 1) {
+                *slot += pen;
+            }
+        }
+
+        let bucket_scale = prefix_sum[term.len()] + 1.0;
+        // `eff` is the FINAL comparator expressed as one number, and it has to be exactly that
+        // rather than approximately that.
+        //
+        // It used to be built from the raw score while `rank_cmp` compares the QUANTIZED score
+        // (`canon_score`, the grid that makes two accumulation orders of the same document agree).
+        // Those two disagree whenever raw scores differ but quantize equal: `eff` then prefers the
+        // higher raw score and `rank_cmp` prefers the lower document id. So the ranking pool could
+        // evict a document the final ordering would have kept, and the union with the scoring pool
+        // was what quietly covered for it.
+        //
+        // Quantizing here closes that gap, and the consequence is much larger than the gap:
+        // **the ranking pool now provably holds the top `k` by the final comparator**, so a range
+        // that cannot enter it cannot enter the answer -- which is what lets the block skip below
+        // stop waiting on the scoring threshold. See `bench/roadmap/p47-typo-tail.md`.
+        let eff_of = |score: f32, bucket: u32| canon_score(score) - bucket as f32 * bucket_scale;
+
         let mut cursor: Vec<usize> = vec![0; term.len()];
         let mut heap: std::collections::BinaryHeap<Candidate> =
             std::collections::BinaryHeap::with_capacity(pool + 1);
+        // The ranking pool. Sized `k`, not `pool`: its only job is to guarantee the final top-`k`
+        // by rank survives, and holding `pool` of them is wasted heap traffic on every candidate.
+        //
+        // **Exactly `k`, and the tightness matters twice over.** `p23` swept it from `k` to `16k`
+        // against real presyo queries and got byte-identical degradation — the pool saturates at
+        // `k`, which was itself the proof that what remained was skipped BEFORE scoring (no pool
+        // can retain a document it never sees). `p25` then found where, and the demotion bound it
+        // added compares against **this pool's worst member**: a bigger pool has a worse worst
+        // member, which makes that bound harder to satisfy and suppresses demotion for no gain.
+        // Shrinking `k.max(16)` to `k.max(1)` cut typo p99 at 1 M from 30.2 ms to 16.9 ms with the
+        // audit still at 0.00 %. See `bench/roadmap/p25-essential-gate.md`.
+        let rank_cap = k.max(1);
+        let mut rank_pool: std::collections::BinaryHeap<RankCandidate> =
+            std::collections::BinaryHeap::with_capacity(rank_cap + 1);
         let mut threshold = f32::NEG_INFINITY;
         // Per-group best distance for the document currently being scored.
         let mut group_dist = vec![u8::MAX; group_count];
+        // Scratch for the block-range bucket floor (p26). Hoisted: the block-skip test runs on
+        // every candidate and must not allocate.
+        let mut group_reachable = vec![false; group_count];
 
         // ---- Champion seeding ---------------------------------------------------------------
         // Prime the heap from precomputed high-scoring documents so the threshold is already high
@@ -1313,16 +2925,21 @@ impl Index {
                 };
                 // Champions of a single term are distinct documents, so no dedup is needed.
                 seeded.push(doc);
-                if heap.len() < pool {
-                    heap.push(Candidate { score: hit.score, doc, bucket: hit.typo_bucket });
-                    if heap.len() == pool {
-                        threshold = heap.peek().map_or(f32::NEG_INFINITY, |c| c.score);
-                    }
-                } else if hit.score > threshold {
-                    heap.pop();
-                    heap.push(Candidate { score: hit.score, doc, bucket: hit.typo_bucket });
-                    threshold = heap.peek().map_or(f32::NEG_INFINITY, |c| c.score);
+                // Seeded documents enter the pools directly, so the filter applies here too.
+                // `seeded` still records the document: the main loop must skip it either way.
+                if !self.facet_allows(doc, facet)
+                    || !self.range_allows(doc, range)
+                    || !self.phrase_allows(doc, phrase)
+                {
+                    continue;
                 }
+                let c = Candidate {
+                    eff: eff_of(hit.score, hit.typo_bucket),
+                    score: hit.score,
+                    doc,
+                    bucket: hit.typo_bucket,
+                };
+                admit(&mut heap, &mut rank_pool, &mut threshold, pool, rank_cap, c);
             }
         }
         seeded.sort_unstable();
@@ -1331,9 +2948,44 @@ impl Index {
             // The non-essential prefix is the longest run of terms whose combined maximum score
             // cannot, on its own, reach the current threshold.
             let mut first_essential = 0usize;
+            // **Gated on the BUCKET FLOOR, not on `prune_is_sound`** — see
+            // `bench/roadmap/p25-essential-gate.md`.
+            //
+            // This site does not skip documents, it stops generating them, so the question is not
+            // "can an unseen document beat the pool on score?" but "can it beat the pool on
+            // BUCKET?". Demotion is safe once a document matching none of the remaining essential
+            // terms is guaranteed a bucket strictly worse than the ranking pool's worst member:
+            // it then cannot enter the ranking pool however it scores, and the `prefix_sum` test
+            // beside it covers the scoring pool.
+            //
+            // Reusing `prune_is_sound` here is correct and costs 20.7x, because it is false
+            // whenever the pool's worst member has a bucket above 0 — the common case — which
+            // pins `first_essential` at 0 and turns MaxScore into a full OR scan. The floor is
+            // *true* in exactly that case: a pool full of high-bucket documents is easy to beat.
+            // The ranking pool's worst `eff`, once it is full. `eff` is exactly lexicographic
+            // `(bucket, score)`, so one number decides admission and the bounds below can be
+            // compared against it directly instead of against bucket and score separately.
+            let rank_worst_eff = if rank_pool.len() >= rank_cap {
+                rank_pool.peek().map(|w| w.0.eff)
+            } else {
+                None
+            };
             if heap.len() >= pool {
-                while first_essential < term.len() && prefix_sum[first_essential + 1] <= threshold {
-                    first_essential += 1;
+                if let Some(worst_eff) = rank_worst_eff {
+                    // A document matching none of `term[f..]` has `bucket >= bucket_floor[f]` and
+                    // `score <= prefix_sum[f]`, so its `eff` is at most
+                    // `prefix_sum[f] - bucket_floor[f] * bucket_scale`. Demotion is safe once that
+                    // cannot beat the ranking pool's worst member. Both terms are monotone in `f`
+                    // (score bound up, bucket floor down), so the bound only tightens and this
+                    // stays a single forward scan.
+                    while first_essential < term.len()
+                        && prefix_sum[first_essential + 1] <= threshold
+                        && canon_score(prefix_sum[first_essential + 1])
+                            - bucket_floor[first_essential + 1] as f32 * bucket_scale
+                            <= worst_eff
+                    {
+                        first_essential += 1;
+                    }
                 }
                 if first_essential == term.len() {
                     break; // nothing left can qualify
@@ -1374,7 +3026,94 @@ impl Index {
                     range_bound += term[i].weight * self.block_max[tid][blk];
                     range_end = range_end.min(self.block_last[tid][blk].saturating_add(1));
                 }
-                if range_bound <= threshold {
+                // Two independent reasons this range can be skipped, and the second is what
+                // keeps typo tail latency finite (p26).
+                //
+                //   1. `prune_is_sound` -- the ranking pool is full of bucket-0 documents, so
+                //      entering it requires beating a SCORE, which `range_bound` bounds.
+                //   2. The range has a BUCKET FLOOR worse than the pool's worst member. A group is
+                //      unreachable inside `[candidate, range_end)` when every one of its terms has
+                //      its cursor already past `range_end`; no document in the range can match it,
+                //      so all of them pay its penalty. Same argument as p25's demotion bound,
+                //      applied to a document range instead of a term suffix.
+                //
+                // Reason 2 matters precisely where reason 1 fails: a pool whose worst member has a
+                // high bucket is easy to beat on bucket. With only reason 1, a typo query whose
+                // pool never saturates at bucket 0 skips nothing and scans every posting.
+                let mut can_skip = range_bound <= threshold && prune_is_sound(&rank_pool, rank_cap);
+                // Reason 2 is NOT gated on the scoring threshold, and that is `p47`.
+                //
+                // It used to be, which made it useless in exactly the case it was built for: a typo
+                // query whose pool never saturates at bucket 0 also has a low score threshold, so
+                // `range_bound <= threshold` was false and the bucket test was never reached. The
+                // two conditions failed together.
+                //
+                // Dropping the gate is sound because `eff` is now exactly the final comparator, so
+                // the ranking pool holds the top `k` by that comparator and nothing else can reach
+                // the answer. Skipping a range that cannot enter the ranking pool can therefore
+                // only cost the SCORING pool candidates -- and the scoring pool contributes no
+                // document that survives the final truncation.
+                if !can_skip {
+                    if let Some(worst_eff) = rank_worst_eff {
+                        // How many groups must be UNREACHABLE in this range for a skip to hold.
+                        //
+                        // The exact test is `canon(range_bound) - floor * bucket_scale <= worst_eff`,
+                        // so it needs `floor >= (canon(range_bound) - worst_eff) / bucket_scale`.
+                        // Computing that first turns both common outcomes into two float ops:
+                        //
+                        //   need <= 0           -> the range loses on SCORE alone; skip, no loop.
+                        //   need > group_count  -> no floor can reach it; do not look.
+                        //
+                        // Only the band between them pays for the reachability loop. Without this,
+                        // ungating the test ran an O(terms) loop on every candidate and cost more
+                        // than it saved: 16.4 ms against a 13.3 ms baseline, which is how it was
+                        // found. The bound is unchanged; only the order of evaluation is.
+                        let need = (canon_score(range_bound) - worst_eff) / bucket_scale;
+                        if need <= 0.0 {
+                            can_skip = true;
+                        } else if need <= group_count as f32 {
+                            // A group is unreachable inside `[candidate, range_end)` when every one
+                            // of its terms has its cursor already past `range_end`: no document in
+                            // the range can match it, so all of them pay its penalty. Same argument
+                            // as p25's demotion bound, applied to a document range instead of a
+                            // term suffix.
+                            group_reachable.iter_mut().for_each(|r| *r = false);
+                            for (i, t) in term.iter().enumerate() {
+                                let list = &self.posting[t.term_id as usize];
+                                if cursor[i] < list.len() && list[cursor[i]].doc < range_end {
+                                    let g = t.group as usize;
+                                    if g < group_reachable.len() {
+                                        group_reachable[g] = true;
+                                    }
+                                }
+                            }
+                            let mut range_floor = 0u32;
+                            for (g, &reachable) in group_reachable.iter().enumerate() {
+                                if !reachable {
+                                    range_floor +=
+                                        if group_is_quantity.get(g).copied().unwrap_or(false) {
+                                            MISSING_QUANTITY_PENALTY
+                                        } else {
+                                            MISSING_TERM_PENALTY
+                                        };
+                                }
+                            }
+                            // Exact: a document in the range has `bucket >= range_floor` and
+                            // `score <= range_bound`, so its `eff` is at most
+                            // `canon(range_bound) - range_floor * bucket_scale`.
+                            //
+                            // The strict form `range_floor > worst_bucket` was tried first (p26) and
+                            // fires on 0.02 % of evaluations, because floor and worst bucket are
+                            // almost always EQUAL. Equality is the common case and it is decidable:
+                            // on a bucket tie the comparison falls through to score, which is
+                            // exactly what `eff` encodes.
+                            can_skip = canon_score(range_bound)
+                                - range_floor as f32 * bucket_scale
+                                <= worst_eff;
+                        }
+                    }
+                }
+                if can_skip {
                     debug_assert!(range_end > candidate, "block skip must make progress");
                     for i in first_essential..term.len() {
                         let tid = term[i].term_id;
@@ -1402,7 +3141,9 @@ impl Index {
             // Walk the non-essential lists in reverse, bailing as soon as even the optimistic
             // remainder cannot lift this document over the threshold.
             for i in (0..first_essential).rev() {
-                if score as f32 + prefix_sum[i + 1] <= threshold {
+                if score as f32 + prefix_sum[i + 1] <= threshold
+                    && prune_is_sound(&rank_pool, rank_cap)
+                {
                     break;
                 }
                 // Cursors on non-essential lists lag; seek forward to the candidate, skipping
@@ -1422,11 +3163,13 @@ impl Index {
             // score against the threshold, which is conservative in the right direction: the prior
             // can only shrink the score, so bailing on the unprimed value bails no earlier than it
             // should and never discards a document it should have kept.
+            // The bucket is needed BEFORE the score is finalised, because the exact-field factor
+            // depends on it: only a document that matched every group can be "exactly the query".
+            let bucket = Self::bucket_of(&group_dist, &group_is_quantity);
             let score = score as f32
                 * self.prior_of(candidate)
-                * self.anchor_factor(candidate, &anchor);
-
-            let bucket = Self::bucket_of(&group_dist, &group_is_quantity);
+                * self.anchor_factor(candidate, &anchor)
+                * self.exact_field_factor(candidate, bucket, group_count);
 
             // A champion-seeded document is already in the heap; re-scoring it is harmless but
             // re-inserting it would duplicate a result.
@@ -1442,20 +3185,43 @@ impl Index {
             if self.is_deleted(candidate) {
                 continue;
             }
-            if heap.len() < pool {
-                heap.push(Candidate { score, doc: candidate, bucket });
-                if heap.len() == pool {
-                    threshold = heap.peek().map_or(f32::NEG_INFINITY, |c| c.score);
-                }
-            } else if score > threshold {
-                // O(log pool): pop the worst, push the new one, read the new worst.
-                heap.pop();
-                heap.push(Candidate { score, doc: candidate, bucket });
-                threshold = heap.peek().map_or(f32::NEG_INFINITY, |c| c.score);
+            // Admission and eviction are both in EFF space, so the pool keeps exactly the
+            // documents the final ranking would keep. The pruning tests above compare a
+            // score-space upper bound against this threshold, which is sound because the best
+            // reachable `eff` for an unscored document is its score bound at bucket 0 — never
+            // more. When the pool still holds poor buckets the threshold is very negative and
+            // little is pruned; as good matches arrive it rises and skipping re-engages.
+            // Facet filter. Applied AFTER scoring and BEFORE admission, which is what keeps
+            // pruning sound: the thresholds are then derived from admitted (allowed) documents
+            // only, and a block-max bound over all documents is still an upper bound over the
+            // allowed subset of them. Filtering earlier -- skipping the posting entirely -- would
+            // be faster and would break `first_essential`'s accounting, which assumes every
+            // enumerated document is scored.
+            //
+            // The phrase constraint joins them here for the same reason and with the same cost
+            // shape: it is a predicate on an already-scored document, so it narrows the result
+            // without touching a single pruning bound.
+            if !self.facet_allows(candidate, facet)
+                || !self.range_allows(candidate, range)
+                || !self.phrase_allows(candidate, phrase)
+            {
+                continue;
             }
+            let c = Candidate { eff: eff_of(score, bucket), score, doc: candidate, bucket };
+            admit(&mut heap, &mut rank_pool, &mut threshold, pool, rank_cap, c);
         }
 
-        let mut heap: Vec<Hit> = heap
+        // Union of the two pools, deduplicated by document. The ranking pool contributes exactly
+        // the documents the scoring pool would have dropped for being cheap-but-correct.
+        // Concatenate, then sort-and-dedup by document. An earlier version binary-searched a
+        // vector it was simultaneously pushing to, so the tail was unsorted and the same document
+        // could be admitted twice — caught immediately by
+        // `block_max_pruning_agrees_with_exhaustive_or_at_scale` as duplicate hits.
+        let mut merged: Vec<Candidate> = heap.into_iter().collect();
+        merged.extend(rank_pool.into_iter().map(|RankCandidate(c)| c));
+        merged.sort_unstable_by_key(|c| c.doc);
+        merged.dedup_by_key(|c| c.doc);
+        let mut heap: Vec<Hit> = merged
             .into_iter()
             .map(|c| Hit { doc: c.doc, score: c.score, typo_bucket: c.bucket })
             .collect();
@@ -1464,6 +3230,9 @@ impl Index {
         // tiebreak (presyo pins exactly this property in its contract test).
         heap.sort_by(rank_cmp);
         heap.truncate(k);
+        if offset > 0 {
+            heap.drain(..offset.min(heap.len()));
+        }
         heap
     }
 
@@ -1472,7 +3241,7 @@ impl Index {
     /// Returns `(hits, query_terms, postings_scored)`. Exists because three separate optimization
     /// attempts were made on hypotheses about where time went, and only measurement settled it.
     pub fn search_stat(&self, query: &str, k: usize) -> (Vec<Hit>, usize, u64) {
-        let (term, _, _) = self.plan(query, false);
+        let (term, _, _) = self.plan(query, false, MAX_EXPANSION);
         let total: u64 = term.iter().map(|t| self.posting[t.term_id as usize].len() as u64).sum();
         (self.search(query, k), term.len(), total)
     }
@@ -1489,8 +3258,48 @@ impl Index {
     /// Conflating the two hides a real tradeoff: shrinking the pool tightens the pruning threshold
     /// and cuts tail latency, but a document with a better typo bucket and a lower score can fall
     /// out of the pool before the bucket sort ever sees it.
+    /// Brute-force reference ordering: score every matching document, sort by [`rank_cmp`], done.
+    ///
+    /// **No pool, no pruning, no block skipping.** This is the ground truth that neither
+    /// [`Self::search`] nor [`Self::search_exhaustive`] can provide, because both apply the same
+    /// candidate pool — and the pool is exactly what
+    /// `bench/roadmap/p21-pool-eviction.md` needs to test. It exists for differential testing and
+    /// is O(all postings); do not put it in a query path.
+    pub fn search_exhaustive_unpooled(&self, query: &str, k: usize) -> Vec<Hit> {
+        let (term, group_is_quantity, _) = self.plan(query, false, MAX_EXPANSION);
+        let group_count = group_is_quantity.len().max(1);
+        let mut acc: BTreeMap<u32, (f64, Vec<u8>)> = BTreeMap::new();
+        for t in &term {
+            for p in &self.posting[t.term_id as usize] {
+                if self.is_deleted(p.doc) {
+                    continue;
+                }
+                let e = acc.entry(p.doc).or_insert_with(|| (0.0, vec![u8::MAX; group_count]));
+                e.0 += (t.weight * p.sat) as f64;
+                let g = t.group as usize;
+                e.1[g] = e.1[g].min(t.distance);
+            }
+        }
+        let mut hit: Vec<Hit> = acc
+            .into_iter()
+            .map(|(doc, (score, gd))| {
+                let bucket = Self::bucket_of(&gd, &group_is_quantity);
+                Hit {
+                    doc,
+                    score: score as f32
+                        * self.prior_of(doc)
+                        * self.exact_field_factor(doc, bucket, group_count),
+                    typo_bucket: bucket,
+                }
+            })
+            .collect();
+        hit.sort_by(rank_cmp);
+        hit.truncate(k);
+        hit
+    }
+
     pub fn search_exhaustive(&self, query: &str, k: usize) -> Vec<Hit> {
-        let (term, group_is_quantity, _) = self.plan(query, false);
+        let (term, group_is_quantity, _) = self.plan(query, false, MAX_EXPANSION);
         let group_count = group_is_quantity.len().max(1);
         let mut acc: BTreeMap<u32, (f64, Vec<u8>)> = BTreeMap::new();
         for t in &term {
@@ -1503,21 +3312,27 @@ impl Index {
         }
         let mut hit: Vec<Hit> = acc
             .into_iter()
-            .map(|(doc, (score, gd))| Hit {
-                doc,
-                score: score as f32,
-                typo_bucket: Self::bucket_of(&gd, &group_is_quantity),
+            .map(|(doc, (score, gd))| {
+                let bucket = Self::bucket_of(&gd, &group_is_quantity);
+                Hit {
+                    doc,
+                    // No prior here by long-standing design (see this function's docs); the
+                    // exact-field factor IS applied, because it is part of the ranking contract
+                    // rather than an importance signal, and an oracle that skipped it would
+                    // disagree with `search` about ordering for reasons unrelated to pruning.
+                    score: score as f32 * self.exact_field_factor(doc, bucket, group_count),
+                    typo_bucket: bucket,
+                }
             })
             .collect();
         // Mirror `search`'s pool semantics exactly: best `pool` by score, then bucket sort.
         let pool = (k * 3).max(32);
         hit.sort_by(|a, b| {
-            let scale = a.score.abs().max(b.score.abs()).max(1.0);
-            if (a.score - b.score).abs() <= SCORE_TIE_REL * scale {
-                a.doc.cmp(&b.doc)
-            } else {
-                b.score.total_cmp(&a.score)
-            }
+            // Same quantization as `rank_cmp`, and for the same reason: a tolerance compare
+            // is not transitive and `sort_by` is entitled to panic on it.
+            canon_score(b.score)
+                .total_cmp(&canon_score(a.score))
+                .then_with(|| a.doc.cmp(&b.doc))
         });
         hit.truncate(pool);
         hit.sort_by(rank_cmp);
@@ -1759,6 +3574,114 @@ mod tests {
     /// corpus large enough to span many blocks, with a deliberately Zipf-ish vocabulary so common
     /// terms produce long posting lists and rare ones produce short, then asserts that pruned and
     /// exhaustive retrieval return **identical** results on hundreds of generated queries.
+    #[test]
+    fn highlight_marks_the_words_that_matched_including_typos() {
+        let mut b = IndexBuilder::new(Schema::new(vec![Field::new("name", 3.0, 0.4)]));
+        b.add(&Doc::new(vec!["Colgate Total Toothpaste 150g"]));
+        b.add(&Doc::new(vec!["Safeguard Soap"]));
+        let ix = b.build().unwrap();
+        let text = "Colgate Total Toothpaste 150g";
+
+        let mark = |q: &str| -> Vec<&str> {
+            ix.highlight(q, text).into_iter().map(|(a, b)| &text[a..b]).collect()
+        };
+
+        assert_eq!(mark("Colgate"), vec!["Colgate"]);
+        assert_eq!(mark("Toothpaste Colgate"), vec!["Colgate", "Toothpaste"], "ascending order");
+        // The point of doing this through the query planner: a typo highlights the real word.
+        assert_eq!(mark("Colgte"), vec!["Colgate"], "a typo marks the corrected word");
+        assert!(mark("Safeguard").is_empty(), "a term that is not in THIS text marks nothing");
+        assert!(mark("").is_empty(), "an empty query marks nothing");
+
+        // Spans are usable directly for wrapping, without overlap or reordering.
+        let span = ix.highlight("Colgate Toothpaste", text);
+        assert!(span.windows(2).all(|w| w[0].1 <= w[1].0), "non-overlapping and ascending");
+
+        // Highlighting text the index never saw must not panic.
+        assert!(ix.highlight("Colgate", "some other product entirely").is_empty());
+        assert_eq!(ix.highlight("Colgate", "colgate cheap").len(), 1, "case folds");
+    }
+
+    /// The test that would have caught the panic in `p42`.
+    ///
+    /// `sort_by` requires a total order and is entitled to panic when it does not get one — which
+    /// it did, on the first corpus with enough near-tied scores in a single result set. The old
+    /// comparator asked `(a - b).abs() <= eps`, which is not transitive.
+    ///
+    /// Checked exhaustively over a ladder of scores spaced FINER than the grid, which is precisely
+    /// where a tolerance-based comparator loses transitivity: adjacent pairs each compare equal
+    /// while the ends do not.
+    #[test]
+    fn rank_cmp_is_a_total_order() {
+        use std::cmp::Ordering;
+        let mut hit = Vec::new();
+        // Scores a hair apart, so many adjacent pairs quantize together.
+        let mut x = 1.0f32;
+        for i in 0..40u32 {
+            hit.push(Hit { doc: i, score: x, typo_bucket: i % 3 });
+            x = f32::from_bits(x.to_bits() + 1);
+        }
+        // ... plus a few far apart, so the set is not uniformly tied.
+        for (i, s) in [0.0f32, 0.5, 2.0, 1e6].iter().enumerate() {
+            hit.push(Hit { doc: 100 + i as u32, score: *s, typo_bucket: i as u32 % 3 });
+        }
+
+        // Antisymmetry and totality.
+        for a in &hit {
+            for b in &hit {
+                let ab = rank_cmp(a, b);
+                let ba = rank_cmp(b, a);
+                assert_eq!(ab, ba.reverse(), "asymmetric on {a:?} vs {b:?}");
+                if a.doc == b.doc {
+                    assert_eq!(ab, Ordering::Equal);
+                }
+            }
+        }
+        // Transitivity — the property the old comparator actually violated.
+        for a in &hit {
+            for b in &hit {
+                for c in &hit {
+                    let (ab, bc, ac) = (rank_cmp(a, b), rank_cmp(b, c), rank_cmp(a, c));
+                    if ab != Ordering::Greater && bc != Ordering::Greater {
+                        assert_ne!(ac, Ordering::Greater, "not transitive: {a:?} {b:?} {c:?}");
+                    }
+                    if ab == Ordering::Equal && bc == Ordering::Equal {
+                        assert_eq!(ac, Ordering::Equal, "equality not transitive");
+                    }
+                }
+            }
+        }
+        // And the thing that panicked: sorting must simply work.
+        let mut v = hit.clone();
+        v.sort_by(rank_cmp);
+        assert_eq!(v.len(), hit.len());
+    }
+
+    /// The quantization grid must stay near the tolerance it replaced, or the documented reason for
+    /// it — absorbing `f32` non-associativity between the pruned and exhaustive paths — stops
+    /// holding. This is what keeps `SCORE_TIE_REL` meaningful now that nothing compares against it
+    /// directly.
+    #[test]
+    fn the_score_grid_matches_the_documented_tolerance() {
+        for at in [1.0f32, 16.0, 1024.0] {
+            let step = f32::from_bits(at.to_bits() + (1 << SCORE_TIE_BITS)) - at;
+            let rel = step / at;
+            assert!(
+                (SCORE_TIE_REL / 4.0..=SCORE_TIE_REL * 4.0).contains(&rel),
+                "grid at {at} is {rel} relative, tolerance is {SCORE_TIE_REL}"
+            );
+        }
+        // Quantization must be monotone, or it could reorder two scores.
+        let mut prev = canon_score(0.0);
+        let mut x = 0.5f32;
+        for _ in 0..2000 {
+            let q = canon_score(x);
+            assert!(q >= prev, "canon_score went backwards at {x}");
+            prev = q;
+            x = f32::from_bits(x.to_bits() + 7);
+        }
+    }
+
     #[test]
     fn block_max_pruning_agrees_with_exhaustive_or_at_scale() {
         fn mix(state: &mut u64) -> u64 {

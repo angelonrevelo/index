@@ -22,8 +22,13 @@
 use crate::analyze::AliasTable;
 use crate::index::{Field, Index, Schema};
 
-/// `"IDXTEXT1"` — magic plus format version in eight bytes.
-pub const MAGIC: [u8; 8] = *b"IDXTEXT2";
+/// `"IDXTEXT5"` — magic plus format version in eight bytes.
+///
+/// The trailing digit has moved 1 -> 5 as sections were added: priors (`2`), facets (`3`),
+/// multi-slot facets (`4`, same span count but a different encoding), numeric columns (`5`),
+/// token positions (`6`), document keys (`7`).
+/// Every bump is forced by the `TABLE_BYTE` assertion in the tests rather than remembered.
+pub const MAGIC: [u8; 8] = *b"IDXTEXT7";
 
 /// Byte offset and length of one section. All `u64`, all absolute from the start of the file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,12 +69,57 @@ pub struct SectionTable {
     pub deleted: Span,
     /// Learned query expansion, or a **zero-length span** when none was learned.
     pub expansion: Span,
+    /// Interned facet labels, per **slot**: `u64` slot count, then per slot a `u32` schema field
+    /// index, a `u64` label count, and that many length-prefixed strings, sorted.
+    /// **Zero-length span** when the index has no facet field.
+    ///
+    /// Added in `IDXTEXT3`, and the magic was bumped for the same reason `IDXTEXT2` bumped it: a
+    /// reader expecting eleven spans would read a thirteen-span table's first two facet offsets as
+    /// section data. A wrong offset into a posting section fails as plausible garbage results, not
+    /// as an error, which is the failure mode this format spends bytes to avoid.
+    pub facet_label: Span,
+    /// `slot count` × `doc_count` × `u32` label ids, slot-major, `u32::MAX` for "no value".
+    /// Zero-length span when absent.
+    ///
+    /// The span count did not change from `IDXTEXT3` to `IDXTEXT4` — the *encoding* of these two
+    /// spans did, when faceting grew from one field to many. `ABI_VERSION` and `MAGIC` both moved
+    /// anyway: the rule this format follows is "bump on any incompatible change", not "bump when
+    /// the table gets wider", and a reader that parsed the old single-slot layout would read a slot
+    /// count as a label count and produce plausible garbage.
+    pub facet_id: Span,
+    /// Numeric column fields: `u64` slot count then that many `u32` schema field indices.
+    /// **Zero-length span** when the index has no numeric column.
+    pub numeric_field: Span,
+    /// `slot count` x `doc_count` x `f64` values, slot-major, `NaN` for absent.
+    /// Zero-length span when absent.
+    pub numeric_value: Span,
+    /// `total posting count + 1` `u64` cumulative offsets into `position`, in POSITION units, not
+    /// bytes. **Zero-length span** when the index was built without positions, which is the
+    /// default -- an index that answers no phrase query stores none.
+    ///
+    /// Added in `IDXTEXT6`. Two spans rather than one because the offsets are what make the
+    /// variable-length position runs addressable, and a reader must be able to reject a
+    /// `position_at` that does not have exactly one entry per posting plus a terminator: a
+    /// short one would hand the phrase verifier another posting's positions, and it would agree
+    /// with them. That is a wrong answer that looks like a working phrase search.
+    pub position_at: Span,
+    /// One `u32` per token OCCURRENCE, `field << 16 | token_index`, ascending within each posting
+    /// run. Zero-length span when positions are off.
+    pub position: Span,
+    /// The application's primary key per document: a `u32` schema field index, then `doc_count`
+    /// length-prefixed strings in document order. An empty string means that row has no key.
+    /// **Zero-length span** when the index was built without one.
+    ///
+    /// Added in `IDXTEXT7`. Length-prefixed rather than NUL-separated for the same reason the facet
+    /// tally is: a primary key may legitimately contain any byte, and this format need not assume
+    /// even that it contains no NUL.
+    pub doc_key: Span,
 }
 
 /// Bytes on the wire for one posting: `u32` doc id + `MAX_FIELD` × `u16` term frequency.
 const POSTING_BYTE: usize = 4 + 2 * crate::index::MAX_FIELD;
-/// Section table is 11 spans × 2 × u64.
-const TABLE_BYTE: usize = 11 * 16;
+/// Section table is 18 spans × 2 × u64.
+const TABLE_BYTE: usize = 18 * 16;
 
 struct Writer {
     buf: Vec<u8>,
@@ -87,6 +137,9 @@ impl Writer {
     }
     fn u64(&mut self, v: u64) {
         self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn f64(&mut self, v: f64) {
+        self.buf.extend_from_slice(&v.to_bits().to_le_bytes());
     }
     fn f32(&mut self, v: f32) {
         self.buf.extend_from_slice(&v.to_le_bytes());
@@ -115,11 +168,14 @@ impl<'a> Reader<'a> {
     fn new(b: &'a [u8]) -> Self {
         Reader { b, p: 0 }
     }
+    /// `checked_add`, not `+`: a corrupt length prefix arrives here as a near-`usize::MAX` `n`,
+    /// and `self.p + n` then overflows and PANICS -- which this format explicitly promises not to
+    /// do. Found by `corrupt_input_errors_rather_than_panics` when the facet sections gave it a
+    /// second length-prefixed section to reach; `expansion` had the same latent path.
     fn need(&self, n: usize) -> Result<(), String> {
-        if self.p + n > self.b.len() {
-            Err(format!("truncated: want {n} bytes at {} of {}", self.p, self.b.len()))
-        } else {
-            Ok(())
+        match self.p.checked_add(n) {
+            Some(end) if end <= self.b.len() => Ok(()),
+            _ => Err(format!("truncated: want {n} bytes at {} of {}", self.p, self.b.len())),
         }
     }
     fn u16(&mut self) -> Result<u16, String> {
@@ -139,6 +195,9 @@ impl<'a> Reader<'a> {
         let v = u64::from_le_bytes(self.b[self.p..self.p + 8].try_into().unwrap());
         self.p += 8;
         Ok(v)
+    }
+    fn f64(&mut self) -> Result<f64, String> {
+        Ok(f64::from_bits(self.u64()?))
     }
     fn f32(&mut self) -> Result<f32, String> {
         self.need(4)?;
@@ -162,7 +221,7 @@ impl<'a> Reader<'a> {
 /// Read the section table from the head of a serialized index.
 ///
 /// **This is the range-read entry point**: a browser or edge reader fetches only
-/// `MAGIC.len() + 176` bytes to learn where everything else lives.
+/// `MAGIC.len() + 288` bytes to learn where everything else lives.
 pub fn read_section_table(head: &[u8]) -> Result<SectionTable, String> {
     if head.len() < MAGIC.len() + TABLE_BYTE {
         return Err(format!("need {} head bytes, got {}", MAGIC.len() + TABLE_BYTE, head.len()));
@@ -186,6 +245,13 @@ pub fn read_section_table(head: &[u8]) -> Result<SectionTable, String> {
         first_term: span()?,
         deleted: span()?,
         expansion: span()?,
+        facet_label: span()?,
+        facet_id: span()?,
+        numeric_field: span()?,
+        numeric_value: span()?,
+        position_at: span()?,
+        position: span()?,
+        doc_key: span()?,
     })
 }
 
@@ -322,6 +388,81 @@ impl Index {
         }
         let expansion = w.span_from(start);
 
+        // Facets are a query capability, not a ranking signal, so dropping them fails LOUDLY --
+        // a filtered search returns nothing and a tally returns empty. That is the one optional
+        // section whose absence is obvious, and it still round-trips for the same reason as the
+        // rest: an artifact that answers differently from the index it was built from is worse
+        // than one that fails to load.
+        let (facet_label_src, facet_id_src) = (s.facet_label, s.facet_id);
+        let start = w.here();
+        if !facet_label_src.is_empty() {
+            w.u64(facet_label_src.len() as u64);
+            for (slot, label) in facet_label_src.iter().enumerate() {
+                w.u32(s.facet_field.get(slot).copied().unwrap_or(0) as u32);
+                w.u64(label.len() as u64);
+                for v in label.iter() {
+                    w.str(v);
+                }
+            }
+        }
+        let facet_label = w.span_from(start);
+
+        let start = w.here();
+        if !facet_label_src.is_empty() {
+            for column in facet_id_src.iter() {
+                for v in column.iter() {
+                    w.u32(*v);
+                }
+            }
+        }
+        let facet_id = w.span_from(start);
+
+        // Numeric columns. Written as raw IEEE-754 bits so a NaN -- the marker for "this document
+        // has no value here" -- survives verbatim rather than being normalised by a text or decimal
+        // round trip.
+        let start = w.here();
+        if !s.numeric_value.is_empty() {
+            w.u64(s.numeric_value.len() as u64);
+            for slot in 0..s.numeric_value.len() {
+                w.u32(s.numeric_field.get(slot).copied().unwrap_or(0) as u32);
+            }
+        }
+        let numeric_field = w.span_from(start);
+
+        let start = w.here();
+        for column in s.numeric_value.iter() {
+            for v in column.iter() {
+                w.f64(*v);
+            }
+        }
+        let numeric_value = w.span_from(start);
+
+        // Both spans are empty unless the index carries positions, and they are written together:
+        // offsets without data, or data without offsets, is not a state a reader should have to
+        // have an opinion about.
+        let start = w.here();
+        for v in s.position_at.iter() {
+            w.u64(*v);
+        }
+        let position_at = w.span_from(start);
+
+        let start = w.here();
+        for v in s.position.iter() {
+            w.u32(*v);
+        }
+        let position = w.span_from(start);
+
+        // Keys. The field index is written even though nothing reads it at query time, because a
+        // host rebuilding the index from its source rows needs to know WHICH column was the key.
+        let start = w.here();
+        if !s.doc_key.is_empty() {
+            w.u32(s.key_field as u32);
+            for k in s.doc_key.iter() {
+                w.str(k);
+            }
+        }
+        let doc_key = w.span_from(start);
+
         let mut t = Vec::with_capacity(TABLE_BYTE);
         for sp in [
             meta,
@@ -335,6 +476,13 @@ impl Index {
             first_term,
             deleted,
             expansion,
+            facet_label,
+            facet_id,
+            numeric_field,
+            numeric_value,
+            position_at,
+            position,
+            doc_key,
         ] {
             t.extend_from_slice(&sp.offset.to_le_bytes());
             t.extend_from_slice(&sp.len.to_le_bytes());
@@ -411,6 +559,9 @@ impl Index {
         let term_count = off.len() / 8 - 1;
         let get = |k: usize| -> u64 { u64::from_le_bytes(off[k * 8..k * 8 + 8].try_into().unwrap()) };
         let post_bytes = &buf[table.posting.range()];
+        // Total postings across every term -- the count `position_at` must have one entry for,
+        // plus a terminator. Taken from the offset array so it cannot drift from what was read.
+        let posting_count = post_bytes.len() / POSTING_BYTE;
         let mut posting = Vec::with_capacity(term_count);
         for i in 0..term_count {
             let (a, b) = (get(i) as usize, get(i + 1) as usize);
@@ -499,6 +650,11 @@ impl Index {
         if table.expansion.len > 0 {
             let mut r = Reader::new(&buf[table.expansion.range()]);
             let n = r.u64()? as usize;
+            // Bound the count by what the span can physically hold before allocating for it:
+            // each entry writes at least a 4-byte string length and a 4-byte term count.
+            if n > table.expansion.len as usize / 8 {
+                return Err(format!("expansion claims {n} entries, span holds at most {}", table.expansion.len / 8));
+            }
             let mut e = Vec::with_capacity(n);
             for _ in 0..n {
                 let value = r.str()?;
@@ -511,6 +667,143 @@ impl Index {
             }
             ix.set_expansion(e);
         }
+        // Positions. Validated hard, because every failure here is silent: a `position_at` one
+        // entry short makes `position_of` return the NEXT posting's run, and the phrase verifier
+        // agrees with whatever it is handed. A phrase search that answers confidently from the
+        // wrong document is worse than one that refuses to load.
+        if table.position_at.len > 0 || table.position.len > 0 {
+            if table.position_at.len == 0 {
+                return Err("position data with no offset array".into());
+            }
+            let want = posting_count + 1;
+            if table.position_at.len as usize != want * 8 {
+                return Err(format!(
+                    "position_at is {} bytes, expected {} for {posting_count} postings",
+                    table.position_at.len,
+                    want * 8
+                ));
+            }
+            if table.position.len % 4 != 0 {
+                return Err(format!("position section {} is not a whole number of u32", table.position.len));
+            }
+            let entry = table.position.len / 4;
+            let mut r = Reader::new(&buf[table.position_at.range()]);
+            let mut at = Vec::with_capacity(want);
+            let mut last = 0u64;
+            for i in 0..want {
+                let v = r.u64()?;
+                // Non-decreasing and in bounds. Either violated makes `lo..hi` a panic or a slice
+                // of somebody else's positions.
+                if v < last || v > entry {
+                    return Err(format!("position_at[{i}] = {v} is out of order or past {entry}"));
+                }
+                last = v;
+                at.push(v);
+            }
+            if last != entry {
+                return Err(format!("position_at ends at {last} but {entry} positions were written"));
+            }
+            let mut r = Reader::new(&buf[table.position.range()]);
+            let mut pos = Vec::with_capacity(entry as usize);
+            for _ in 0..entry {
+                pos.push(r.u32()?);
+            }
+            ix.set_position(pos, at);
+        }
+        // Keys. Validated against `doc_count` rather than trusted, because a short key array would
+        // silently shift every key onto the wrong document: `doc_of_key` would then resolve a real
+        // key to a real-but-wrong row, and a change stream would update the wrong record. That is a
+        // corruption that looks exactly like working software.
+        if table.doc_key.len > 0 {
+            let mut r = Reader::new(&buf[table.doc_key.range()]);
+            let field = r.u32()? as usize;
+            if field >= crate::index::MAX_FIELD {
+                return Err(format!("key field {field} out of range"));
+            }
+            let mut key = Vec::with_capacity(doc_count);
+            for _ in 0..doc_count {
+                key.push(r.str()?);
+            }
+            ix.set_key(field, key);
+        }
+        if table.facet_label.len > 0 {
+            let mut r = Reader::new(&buf[table.facet_label.range()]);
+            // A slot costs at least a u32 field index and a u64 label count on the wire.
+            let slot_n = r.u64()? as usize;
+            if slot_n > table.facet_label.len as usize / 12 {
+                return Err(format!(
+                    "facet claims {slot_n} slots, span holds at most {}",
+                    table.facet_label.len / 12
+                ));
+            }
+            let mut field = Vec::with_capacity(slot_n);
+            let mut label = Vec::with_capacity(slot_n);
+            for _ in 0..slot_n {
+                field.push(r.u32()? as usize);
+                let n = r.u64()? as usize;
+                if n > table.facet_label.len as usize / 4 {
+                    return Err(format!(
+                        "facet slot claims {n} labels, span holds at most {}",
+                        table.facet_label.len / 4
+                    ));
+                }
+                let mut l = Vec::with_capacity(n);
+                for _ in 0..n {
+                    l.push(r.str()?);
+                }
+                label.push(l);
+            }
+            // The id section is slot-major, per-document and fixed width, so a length mismatch is a
+            // corrupt artifact rather than an older one -- the magic already excludes older writers.
+            if table.facet_id.len as usize != slot_n * doc_count * 4 {
+                return Err(format!(
+                    "facet id section is {} bytes, expected {} for {slot_n} slots x {doc_count} documents",
+                    table.facet_id.len,
+                    slot_n * doc_count * 4
+                ));
+            }
+            let mut r = Reader::new(&buf[table.facet_id.range()]);
+            let mut id = Vec::with_capacity(slot_n);
+            for _ in 0..slot_n {
+                let mut column = Vec::with_capacity(doc_count);
+                for _ in 0..doc_count {
+                    column.push(r.u32()?);
+                }
+                id.push(column);
+            }
+            ix.set_facet(field, label, id);
+        }
+        if table.numeric_field.len > 0 {
+            let mut r = Reader::new(&buf[table.numeric_field.range()]);
+            let slot_n = r.u64()? as usize;
+            if slot_n > table.numeric_field.len as usize / 4 {
+                return Err(format!(
+                    "numeric claims {slot_n} slots, span holds at most {}",
+                    table.numeric_field.len / 4
+                ));
+            }
+            let mut field = Vec::with_capacity(slot_n);
+            for _ in 0..slot_n {
+                field.push(r.u32()? as usize);
+            }
+            if table.numeric_value.len as usize != slot_n * doc_count * 8 {
+                return Err(format!(
+                    "numeric value section is {} bytes, expected {} for {slot_n} slots x {doc_count} documents",
+                    table.numeric_value.len,
+                    slot_n * doc_count * 8
+                ));
+            }
+            let mut r = Reader::new(&buf[table.numeric_value.range()]);
+            let mut value = Vec::with_capacity(slot_n);
+            for _ in 0..slot_n {
+                let mut column = Vec::with_capacity(doc_count);
+                for _ in 0..doc_count {
+                    column.push(r.f64()?);
+                }
+                value.push(column);
+            }
+            ix.set_numeric(field, value);
+        }
         Ok(ix)
     }
 }
@@ -518,7 +811,7 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{Doc, IndexBuilder};
+    use crate::index::{Doc, FacetClause, Hit, IndexBuilder};
 
     fn built() -> Index {
         let schema = Schema::new(vec![
@@ -636,11 +929,17 @@ mod tests {
 
     #[test]
     fn every_offset_in_the_table_is_u64() {
-        // The section table is 11 spans of two u64s. If this size ever changes, the format version
+        // The section table is 18 spans of two u64s. If this size ever changes, the format version
         // in MAGIC must change with it — it went 7 -> 8 and `IDXTEXT1` -> `IDXTEXT2` when static
-        // priors were added, because a reader expecting seven spans would mis-parse the eighth as
-        // posting data and fail as garbage results rather than as an error.
-        assert_eq!(TABLE_BYTE, 176);
+        // priors were added, 11 -> 13 and `IDXTEXT2` -> `IDXTEXT3` when facets were, and 15 -> 17
+        // and `IDXTEXT5` -> `IDXTEXT6` when token positions were, and 17 -> 18 and `IDXTEXT6` ->
+        // `IDXTEXT7` when document keys were, because a reader expecting the old count mis-parses
+        // the extra offsets as posting data and fails as garbage results rather than as an error.
+        //
+        // **This assertion is the mechanism.** It failed on the facet change and again on the
+        // position change, and that is what forced each magic bump; without it the format would
+        // have grown silently.
+        assert_eq!(TABLE_BYTE, 288);
         let bytes = built().to_bytes();
         let t = read_section_table(&bytes).unwrap();
         // Sections appear in ascending order and tile the file without gaps after the head.
@@ -657,6 +956,13 @@ mod tests {
             t.first_term,
             t.deleted,
             t.expansion,
+            t.facet_label,
+            t.facet_id,
+            t.numeric_field,
+            t.numeric_value,
+            t.position_at,
+            t.position,
+            t.doc_key,
         ] {
             assert_eq!(s.offset, at, "sections must tile contiguously");
             at += s.len;
@@ -707,6 +1013,729 @@ mod tests {
         assert_eq!(round.expansion_of("baking needs"), ix.expansion_of("baking needs"));
         let after: Vec<u32> = round.search("baking needs", 5).iter().map(|h| h.doc).collect();
         assert_eq!(after, before, "serialization must not change what a facet query returns");
+    }
+
+    #[test]
+    fn facets_survive_a_round_trip() {
+        let mut b = IndexBuilder::new(Schema::new(vec![
+            Field::new("name", 3.0, 0.4),
+            Field::new("brand", 1.0, 0.6),
+        ]))
+        .with_facet(1);
+        for (name, brand) in [
+            ("Colgate Total Toothpaste 150g", "Colgate"),
+            ("Colgate Fresh Gel 100g", "Colgate"),
+            ("Safeguard Pure White Soap 135g", "Safeguard"),
+            ("Lucky Me Pancit Canton 60g", "Lucky Me"),
+        ] {
+            b.add(&Doc::new(vec![name, brand]));
+        }
+        let ix = b.build().unwrap();
+
+        // Values are stored VERBATIM: "Lucky Me" is one facet, not two terms.
+        assert_eq!(ix.facet_label(), ["Colgate", "Lucky Me", "Safeguard"]);
+        assert_eq!(ix.facet_of(0), Some("Colgate"));
+        assert_eq!(ix.facet_of(3), Some("Lucky Me"));
+
+        let before_tally = ix.facet_tally("Colgate");
+        let before_filtered: Vec<u32> =
+            ix.search_facet("Colgate", 10, "Colgate").iter().map(|h| h.doc).collect();
+        assert_eq!(before_tally.first().map(|x| x.1), Some(2), "both Colgate rows counted");
+        assert_eq!(before_filtered.len(), 2);
+
+        let back = Index::from_bytes(&ix.to_bytes()).unwrap();
+        assert_eq!(back.facet_label(), ix.facet_label(), "labels survive");
+        for d in 0..ix.doc_count() as u32 {
+            assert_eq!(back.facet_of(d), ix.facet_of(d), "doc {d} facet survives");
+        }
+        assert_eq!(back.facet_tally("Colgate"), before_tally, "tally survives");
+        let after: Vec<u32> =
+            back.search_facet("Colgate", 10, "Colgate").iter().map(|h| h.doc).collect();
+        assert_eq!(after, before_filtered, "filtered search survives");
+
+        // An unknown value is empty, not everything -- the failure mode that matters for a filter.
+        assert!(back.search_facet("Colgate", 10, "Nestle").is_empty());
+    }
+
+    #[test]
+    fn two_facet_slots_filter_conjunctively_and_survive_a_round_trip() {
+        let mut b = IndexBuilder::new(Schema::new(vec![
+            Field::new("name", 3.0, 0.4),
+            Field::new("brand", 1.0, 0.6),
+            Field::new("category", 0.0, 0.6),
+        ]))
+        .with_facet(1)
+        .with_facet(2);
+        for (name, brand, cat) in [
+            ("Colgate Total Toothpaste 150g", "Colgate", "Oral Care"),
+            ("Colgate Mouthwash 500ml", "Colgate", "Oral Care"),
+            ("Colgate Toothbrush Soft", "Colgate", "Accessory"),
+            ("Oral B Toothbrush Medium", "Oral B", "Accessory"),
+        ] {
+            b.add(&Doc::new(vec![name, brand, cat]));
+        }
+        let ix = b.build().unwrap();
+
+        assert_eq!(ix.facet_slot_count(), 2);
+        assert_eq!(ix.facet_field(), [1, 2]);
+        assert_eq!(ix.facet_label_at(0), ["Colgate", "Oral B"]);
+        assert_eq!(ix.facet_label_at(1), ["Accessory", "Oral Care"]);
+        assert_eq!(ix.facet_of_at(0, 1), Some("Oral Care"));
+
+        // A query that reaches BOTH brands, so each filter alone is strictly larger than the
+        // conjunction. "Colgate" alone never matches the Oral B row, which would make the
+        // conjunction equal to one of its own operands and demonstrate nothing.
+        let q = "Colgate Toothbrush";
+
+        // The point of the feature: brand AND category, in one pass.
+        let both: Vec<u32> =
+            ix.search_facet_all(q, 10, &[(0, "Colgate"), (1, "Accessory")]).iter().map(|h| h.doc).collect();
+        assert_eq!(both, vec![2], "only the Colgate accessory satisfies both");
+
+        // Each filter alone is strictly larger, which is what makes the conjunction meaningful.
+        assert_eq!(ix.search_facet_at(q, 10, 0, "Colgate").len(), 3);
+        assert_eq!(ix.search_facet_at(q, 10, 1, "Accessory").len(), 2);
+
+        // An unsatisfiable pair is empty, NOT everything -- the dangerous reading of a filter.
+        assert!(ix.search_facet_all(q, 10, &[(0, "Oral B"), (1, "Oral Care")]).is_empty());
+        assert!(ix.search_facet_all(q, 10, &[(0, "Nestle")]).is_empty());
+        assert!(ix.search_facet_all(q, 10, &[(9, "Colgate")]).is_empty(), "bad slot");
+
+        let t0 = ix.facet_tally_at(q, 0);
+        let t1 = ix.facet_tally_at(q, 1);
+        assert_eq!(t0, vec![("Colgate", 3), ("Oral B", 1)]);
+        assert_eq!(t1, vec![("Accessory", 2), ("Oral Care", 2)]);
+
+        let back = Index::from_bytes(&ix.to_bytes()).unwrap();
+        assert_eq!(back.facet_field(), ix.facet_field(), "slot -> field mapping survives");
+        assert_eq!(back.facet_slot_count(), 2);
+        for slot in 0..2 {
+            assert_eq!(back.facet_label_at(slot), ix.facet_label_at(slot));
+            for d in 0..ix.doc_count() as u32 {
+                assert_eq!(back.facet_of_at(d, slot), ix.facet_of_at(d, slot));
+            }
+            assert_eq!(back.facet_tally_at(q, slot), ix.facet_tally_at(q, slot));
+        }
+        let after: Vec<u32> = back
+            .search_facet_all(q, 10, &[(0, "Colgate"), (1, "Accessory")])
+            .iter()
+            .map(|h| h.doc)
+            .collect();
+        assert_eq!(after, both, "the conjunction survives a round trip");
+    }
+
+    #[test]
+    fn a_numeric_range_filters_tallies_and_survives_a_round_trip() {
+        let mut b = IndexBuilder::new(Schema::new(vec![
+            Field::new("name", 3.0, 0.4),
+            Field::new("brand", 1.0, 0.6),
+            Field::new("size", 0.0, 0.6),
+        ]))
+        .with_facet(1)
+        .with_numeric(2);
+        for (name, brand, size) in [
+            ("Colgate Toothpaste Small", "Colgate", "50"),
+            ("Colgate Toothpaste Medium", "Colgate", "100"),
+            ("Colgate Toothpaste Large", "Colgate", "150"),
+            ("Colgate Toothpaste Family", "Colgate", "300"),
+            ("Colgate Toothpaste Sample", "Colgate", "not a number"),
+        ] {
+            b.add(&Doc::new(vec![name, brand, size]));
+        }
+        let ix = b.build().unwrap();
+        let q = "Colgate Toothpaste";
+
+        assert_eq!(ix.numeric_slot_count(), 1);
+        assert_eq!(ix.numeric_field(), [2]);
+        assert_eq!(ix.numeric_of(0, 0), Some(50.0));
+        assert_eq!(ix.numeric_of(4, 0), None, "unparseable text has no value");
+
+        // Half-open: [100, 300) is docs 1 and 2, and NOT doc 3 at exactly 300.
+        let mid: Vec<u32> =
+            ix.search_range(q, 10, 0, 100.0, 300.0).iter().map(|h| h.doc).collect();
+        let mut sorted = mid.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![1, 2], "300 is excluded by the open upper bound");
+
+        // The document with no value is in no range at all, including a maximal one.
+        let all: Vec<u32> =
+            ix.search_range(q, 10, 0, f64::MIN, f64::MAX).iter().map(|h| h.doc).collect();
+        assert!(!all.contains(&4), "an absent value is excluded, not treated as zero");
+        assert_eq!(all.len(), 4);
+
+        // A histogram must partition: adjacent buckets share a boundary and must not double count.
+        let edge = [0.0, 100.0, 200.0, 400.0];
+        let hist = ix.range_tally(q, 0, &edge);
+        assert_eq!(hist, vec![1, 2, 1], "50 | 100,150 | 300");
+        assert_eq!(hist.iter().sum::<usize>(), 4, "the absent value is counted nowhere");
+
+        // Facet AND range in one pass.
+        let both: Vec<u32> = ix
+            .search_filtered(q, 10, &[(0, "Colgate")], &[(0, 100.0, 300.0)])
+            .iter()
+            .map(|h| h.doc)
+            .collect();
+        let mut bs = both.clone();
+        bs.sort_unstable();
+        assert_eq!(bs, vec![1, 2]);
+        assert!(
+            ix.search_filtered(q, 10, &[(0, "Nestle")], &[(0, 0.0, 999.0)]).is_empty(),
+            "an unsatisfiable facet still empties the whole filter"
+        );
+        assert!(ix.search_range(q, 10, 9, 0.0, 1.0).is_empty(), "unknown numeric slot is empty");
+
+        let back = Index::from_bytes(&ix.to_bytes()).unwrap();
+        assert_eq!(back.numeric_field(), ix.numeric_field());
+        for d in 0..ix.doc_count() as u32 {
+            assert_eq!(back.numeric_of(d, 0), ix.numeric_of(d, 0), "doc {d} value survives");
+        }
+        assert_eq!(back.range_tally(q, 0, &edge), hist, "the histogram survives");
+        let after: Vec<u32> =
+            back.search_range(q, 10, 0, 100.0, 300.0).iter().map(|h| h.doc).collect();
+        assert_eq!(after, mid, "the range filter survives, in the same order");
+    }
+
+    #[test]
+    fn sorting_by_a_numeric_column_orders_filters_and_excludes_absent_values() {
+        let mut b = IndexBuilder::new(Schema::new(vec![
+            Field::new("name", 3.0, 0.4),
+            Field::new("brand", 1.0, 0.6),
+            Field::new("size", 0.0, 0.6),
+        ]))
+        .with_facet(1)
+        .with_numeric(2);
+        for (name, brand, size) in [
+            ("Colgate Toothpaste Large", "Colgate", "150"),
+            ("Colgate Toothpaste Small", "Colgate", "50"),
+            ("Colgate Toothpaste Family", "Colgate", "300"),
+            ("Oral B Toothpaste Medium", "Oral B", "100"),
+            ("Colgate Toothpaste Sample", "Colgate", ""),
+        ] {
+            b.add(&Doc::new(vec![name, brand, size]));
+        }
+        let ix = b.build().unwrap();
+        let q = "Toothpaste";
+
+        // Ascending is by VALUE, not by relevance: doc 1 (50) first even though the corpus and the
+        // relevance order both start elsewhere.
+        let asc: Vec<u32> = ix.search_sorted(q, 10, 0, true).iter().map(|h| h.doc).collect();
+        assert_eq!(asc, vec![1, 3, 0, 2], "50, 100, 150, 300");
+
+        let desc: Vec<u32> = ix.search_sorted(q, 10, 0, false).iter().map(|h| h.doc).collect();
+        let mut reversed = asc.clone();
+        reversed.reverse();
+        assert_eq!(desc, reversed, "descending is the exact reverse here, all values distinct");
+
+        // The row with no size has no position in a price order.
+        assert!(!asc.contains(&4), "an absent value is excluded, not sorted as zero");
+
+        // `k` truncates AFTER ordering, so it returns the k cheapest, not k arbitrary matches.
+        assert_eq!(
+            ix.search_sorted(q, 2, 0, true).iter().map(|h| h.doc).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+
+        // Score and bucket are still populated honestly even though they do not order the result.
+        assert!(ix.search_sorted(q, 10, 0, true).iter().all(|h| h.score > 0.0));
+
+        // The filter bar applies first, then the sort.
+        let filtered: Vec<u32> = ix
+            .search_sorted_filtered(q, 10, 0, true, &[(0, "Colgate")], &[(0, 0.0, 200.0)])
+            .iter()
+            .map(|h| h.doc)
+            .collect();
+        assert_eq!(filtered, vec![1, 0], "Colgate only, under 200, cheapest first");
+        assert!(
+            ix.search_sorted_filtered(q, 10, 0, true, &[(0, "Nestle")], &[]).is_empty(),
+            "an unsatisfiable filter is empty, not unsorted-everything"
+        );
+        assert!(ix.search_sorted(q, 10, 9, true).is_empty(), "unknown slot is empty");
+        assert!(ix.search_sorted(q, 0, 0, true).is_empty(), "k = 0 is empty");
+
+        // Survives a round trip like every other query capability.
+        let back = Index::from_bytes(&ix.to_bytes()).unwrap();
+        assert_eq!(
+            back.search_sorted(q, 10, 0, true).iter().map(|h| h.doc).collect::<Vec<_>>(),
+            asc
+        );
+    }
+
+    #[test]
+    fn sorting_ties_break_by_rank_then_doc() {
+        let mut b = IndexBuilder::new(Schema::new(vec![
+            Field::new("name", 3.0, 0.4),
+            Field::new("size", 0.0, 0.6),
+        ]))
+        .with_numeric(1);
+        // Three documents at the SAME value: the order among them must be deterministic and must
+        // be the relevance order, not insertion order.
+        b.add(&Doc::new(vec!["Toothpaste Colgate Mint Fresh Clean", "100"]));
+        b.add(&Doc::new(vec!["Toothpaste", "100"]));
+        b.add(&Doc::new(vec!["Toothpaste Colgate", "100"]));
+        let ix = b.build().unwrap();
+
+        let a: Vec<u32> = ix.search_sorted("Toothpaste", 10, 0, true).iter().map(|h| h.doc).collect();
+        let b2: Vec<u32> = ix.search_sorted("Toothpaste", 10, 0, true).iter().map(|h| h.doc).collect();
+        assert_eq!(a, b2, "a tie order is stable across runs");
+        assert_eq!(a.len(), 3);
+        // The shortest field scores highest under BM25 length normalisation, so doc 1 leads.
+        assert_eq!(a[0], 1, "among equal values, the best match comes first");
+    }
+
+    #[test]
+    fn an_index_without_numeric_columns_costs_no_numeric_bytes() {
+        let ix = built();
+        let t = read_section_table(&ix.to_bytes()).unwrap();
+        assert_eq!(t.numeric_field.len, 0);
+        assert_eq!(t.numeric_value.len, 0);
+        assert_eq!(ix.numeric_slot_count(), 0);
+        assert!(ix.range_tally("anything", 0, &[0.0, 1.0]).is_empty());
+    }
+
+    /// OR inside a clause, AND across clauses, NOT, and the two opposite unknown-value rules.
+    ///
+    /// The unknown-value rules are the dangerous part: getting them backwards makes a filter
+    /// silently return the whole corpus, which looks like a working search.
+    #[test]
+    fn facet_clauses_or_within_and_across_and_negate() {
+        let mut b = IndexBuilder::new(Schema::new(vec![
+            Field::new("name", 3.0, 0.4),
+            Field::new("brand", 1.0, 0.6),
+            Field::new("kind", 0.0, 0.6),
+        ]))
+        .with_facet(1)
+        .with_facet(2);
+        for (n, brand, kind) in [
+            ("Colgate Toothpaste Large", "Colgate", "paste"),
+            ("Oral B Toothpaste Mini", "Oral B", "paste"),
+            ("Aquafresh Toothpaste Twin", "Aquafresh", "paste"),
+            ("Colgate Toothbrush Soft", "Colgate", "brush"),
+        ] {
+            b.add(&Doc::new(vec![n, brand, kind]));
+        }
+        let ix = b.build().unwrap();
+        let q = "Toothpaste Toothbrush";
+        let docs = |h: Vec<Hit>| {
+            let mut d: Vec<u32> = h.iter().map(|x| x.doc).collect();
+            d.sort_unstable();
+            d
+        };
+
+        // OR within a clause widens.
+        assert_eq!(
+            docs(ix.search_any(q, 10, &[FacetClause::any(0, &["Colgate", "Oral B"])])),
+            vec![0, 1, 3]
+        );
+        // AND across clauses narrows.
+        assert_eq!(
+            docs(ix.search_any(
+                q,
+                10,
+                &[FacetClause::any(0, &["Colgate", "Oral B"]), FacetClause::any(1, &["paste"])]
+            )),
+            vec![0, 1]
+        );
+        // NOT.
+        assert_eq!(docs(ix.search_any(q, 10, &[FacetClause::none(0, &["Colgate"])])), vec![1, 2]);
+        // NOT combined with OR inside the negated clause.
+        assert_eq!(
+            docs(ix.search_any(q, 10, &[FacetClause::none(0, &["Colgate", "Oral B"])])),
+            vec![2]
+        );
+
+        // The two opposite rules for unknown values.
+        assert!(
+            ix.search_any(q, 10, &[FacetClause::any(0, &["Nestle"])]).is_empty(),
+            "include with every value unknown matches NOTHING"
+        );
+        assert_eq!(
+            docs(ix.search_any(q, 10, &[FacetClause::none(0, &["Nestle"])])),
+            vec![0, 1, 2, 3],
+            "exclude with every value unknown excludes NOTHING"
+        );
+        // A partially-known include keeps the known part rather than failing.
+        assert_eq!(
+            docs(ix.search_any(q, 10, &[FacetClause::any(0, &["Nestle", "Colgate"])])),
+            vec![0, 3]
+        );
+        // An unknown SLOT is empty, not unfiltered -- the dangerous reading of a bad filter.
+        // A slot the index does not have takes the SAME two answers as an unknown value, not a
+        // blanket empty -- otherwise "not discontinued" deletes every row from a segment that was
+        // built before the slot existed.
+        assert!(ix.search_any(q, 10, &[FacetClause::any(9, &["Colgate"])]).is_empty());
+        assert_eq!(
+            docs(ix.search_any(q, 10, &[FacetClause::none(9, &["Colgate"])])),
+            docs(ix.search(q, 10)),
+            "an exclude on a slot that does not exist removes nothing"
+        );
+    }
+
+    /// A document with no value in the slot is kept by an exclude and dropped by an include.
+    #[test]
+    fn a_missing_facet_value_is_kept_by_not_and_dropped_by_any() {
+        let mut b = IndexBuilder::new(Schema::new(vec![
+            Field::new("name", 3.0, 0.4),
+            Field::new("brand", 1.0, 0.6),
+        ]))
+        .with_facet(1);
+        b.add(&Doc::new(vec!["Colgate Toothpaste", "Colgate"]));
+        b.add(&Doc::new(vec!["Generic Toothpaste", ""])); // no brand at all
+        let ix = b.build().unwrap();
+
+        let d = |h: Vec<Hit>| h.iter().map(|x| x.doc).collect::<Vec<_>>();
+        assert_eq!(d(ix.search_any("Toothpaste", 10, &[FacetClause::any(0, &["Colgate"])])), vec![0]);
+        assert_eq!(
+            d(ix.search_any("Toothpaste", 10, &[FacetClause::none(0, &["Colgate"])])),
+            vec![1],
+            "an unbranded row survives \"not Colgate\""
+        );
+    }
+
+    /// Paging must partition the ranking: page 0 then page 1 equals a single longer request.
+    /// Phrase queries: the words consecutive, in order, in ONE field.
+    ///
+    /// The corpus is chosen so a bag-of-words search cannot tell the cases apart -- every document
+    /// contains every word of the phrase. Only adjacency separates them, which is the whole claim.
+    #[test]
+    fn a_phrase_matches_only_consecutive_tokens_in_one_field() {
+        let mut b = IndexBuilder::new(Schema::new(vec![
+            Field::new("name", 3.0, 0.4),
+            Field::new("brand", 1.0, 0.6),
+        ]))
+        .with_position();
+        b.add(&Doc::new(["Vanilla Ice Cream Tub", "Selecta"])); // 0: the phrase
+        b.add(&Doc::new(["Ice Crushed Cream Soda", "Selecta"])); // 1: both words, not adjacent
+        b.add(&Doc::new(["Cream Ice Bar", "Selecta"])); // 2: both words, wrong order
+        b.add(&Doc::new(["Chocolate Ice", "Cream Co"])); // 3: adjacent ACROSS a field boundary
+        let ix = b.build().unwrap();
+
+        let docs = |h: Vec<Hit>| h.iter().map(|x| x.doc).collect::<Vec<_>>();
+
+        // Every one of the four contains both words, so the plain search returns all of them.
+        assert_eq!(docs(ix.search("Ice Cream", 10)).len(), 4, "all four match as a bag of words");
+
+        assert_eq!(
+            docs(ix.search_phrase("Ice Cream", 10)),
+            vec![0],
+            "only the document with the words adjacent and in order matches"
+        );
+        assert!(
+            docs(ix.search_phrase("Cream Ice", 10)).contains(&2),
+            "the reversed phrase matches the reversed document"
+        );
+        assert!(
+            !docs(ix.search_phrase("Ice Cream", 10)).contains(&3),
+            "a phrase must not span a field boundary: name ending 'Ice' plus brand starting 'Cream'"
+        );
+
+        // A word no document has cannot be part of any phrase, and the safety direction is the
+        // same as an all-unknown include: nothing, never everything.
+        assert!(ix.search_phrase("Ice Sorbet", 10).is_empty(), "an unknown word matches nothing");
+        assert!(ix.search_phrase("", 10).is_empty(), "an empty phrase is not a match-everything");
+
+        // A single-token phrase is an ordinary term query, not a special case.
+        assert_eq!(
+            docs(ix.search_phrase("Vanilla", 10)),
+            docs(ix.search("Vanilla", 10)),
+            "a one-word phrase agrees with a one-word search"
+        );
+
+        // The phrase constrains but does not re-rank: it is a filter, like a facet clause.
+        let phrase = ix.search_phrase("Ice Cream", 10);
+        let plain: Vec<Hit> = ix.search("Ice Cream", 10).into_iter().filter(|h| h.doc == 0).collect();
+        assert_eq!(phrase, plain, "a phrase hit keeps the score the same query gave it");
+    }
+
+    /// Positions must survive a round trip, and an index WITHOUT them must keep working.
+    #[test]
+    fn positions_round_trip_and_are_optional() {
+        let row = ["Vanilla Ice Cream Tub", "Ice Crushed Cream Soda", "Cream Ice Bar"];
+
+        let mut with = IndexBuilder::new(Schema::new(vec![Field::new("name", 3.0, 0.4)]))
+            .with_position();
+        let mut without = IndexBuilder::new(Schema::new(vec![Field::new("name", 3.0, 0.4)]));
+        for r in row {
+            with.add(&Doc::new([r]));
+            without.add(&Doc::new([r]));
+        }
+        let with = with.build().unwrap();
+        let without = without.build().unwrap();
+
+        assert!(with.has_position());
+        assert!(!without.has_position());
+        // An index built without positions REFUSES the query rather than degrading to a
+        // bag-of-words match that would look like a working phrase search.
+        assert!(without.search_phrase("Ice Cream", 10).is_empty());
+        assert_eq!(without.search("Ice Cream", 10).len(), 3, "ordinary search is unaffected");
+
+        let bytes = with.to_bytes();
+        let back = Index::from_bytes(&bytes).unwrap();
+        assert!(back.has_position(), "the position spans survive serialization");
+        assert_eq!(
+            back.search_phrase("Ice Cream", 10),
+            with.search_phrase("Ice Cream", 10),
+            "the reopened index answers the phrase identically"
+        );
+
+        // The cost is stated rather than assumed: positions are the only build option that grows
+        // with token occurrences instead of with documents.
+        let plain = without.to_bytes();
+        assert!(
+            bytes.len() > plain.len(),
+            "positions cost bytes: {} with, {} without",
+            bytes.len(),
+            plain.len()
+        );
+    }
+
+    /// **`eff` must BE the final comparator, not merely resemble it.**
+    ///
+    /// `p47` sized the scoring pool down to `k` and ungated the block skip, and both are sound only
+    /// because the ranking pool provably holds the top `k` by the final ordering. That proof rests
+    /// entirely on `eff = canon_score(score) - bucket * bucket_scale` inducing exactly the order
+    /// `rank_cmp` does.
+    ///
+    /// It did not, before `p47`: `eff` used the RAW score while `rank_cmp` compares the quantized
+    /// one, so two documents whose scores differ but quantize equal were ordered by score in the
+    /// pool and by document id in the answer. This pins the property so that gap cannot reopen
+    /// silently -- if it does, a pruning bound stops being an upper bound.
+    #[test]
+    fn eff_induces_exactly_the_final_ranking() {
+        use crate::index::canon_score;
+
+        // Scores deliberately include pairs that differ by less than the quantization grid, which
+        // is the only case where the two orders could ever disagree.
+        let base = 3.25f32;
+        let mut score = vec![0.0f32, 0.5, 1.0, base, base + f32::EPSILON, base + 2.0 * f32::EPSILON];
+        score.push(base * (1.0 + 1e-7));
+        let bucket = [0u32, 1, 3, 7];
+        // Larger than any score here, which is the condition the real `bucket_scale` satisfies.
+        let bucket_scale = 100.0f32;
+        let eff = |h: &Hit| canon_score(h.score) - h.typo_bucket as f32 * bucket_scale;
+
+        let mut hit: Vec<Hit> = Vec::new();
+        for (i, &s) in score.iter().enumerate() {
+            for (j, &b) in bucket.iter().enumerate() {
+                hit.push(Hit { doc: (i * bucket.len() + j) as u32, score: s, typo_bucket: b });
+            }
+        }
+
+        for a in &hit {
+            for b in &hit {
+                if a.doc == b.doc {
+                    continue;
+                }
+                let by_rank = crate::index::rank_cmp(a, b);
+                let by_eff = eff(b).total_cmp(&eff(a)).then(a.doc.cmp(&b.doc));
+                assert_eq!(
+                    by_rank, by_eff,
+                    "eff and rank_cmp disagree on {a:?} vs {b:?} (eff {} vs {})",
+                    eff(a),
+                    eff(b)
+                );
+            }
+        }
+    }
+
+    /// **The differential test that makes two sort arms safe to ship.**
+    ///
+    /// `search_sorted` now picks between a posting scan and a value-order walk on a cost estimate.
+    /// Two implementations of one answer is a bug factory unless they are held to being the SAME
+    /// answer, so both are forced over the same queries and required to agree document for
+    /// document, score for score, bucket for bucket.
+    ///
+    /// The corpus is built for the case that separates them: heavy ties in the numeric column, so
+    /// a walk that stopped at exactly `k` would return an arbitrary subset of the boundary group
+    /// and still look plausible.
+    #[test]
+    fn sorted_arms_agree_document_for_document() {
+        let mut b = IndexBuilder::new(Schema::new(vec![
+            Field::new("name", 3.0, 0.4),
+            Field::new("price", 0.0, 0.6),
+        ]))
+        .with_numeric(1);
+        // Three price levels over sixty rows: every k lands inside a tie group.
+        for i in 0..60 {
+            let price = [10.0, 20.0, 30.0][i % 3];
+            let name = match i % 4 {
+                0 => format!("Colgate Toothpaste Variant {i}"),
+                1 => format!("Colgate Total Toothpaste {i}"),
+                2 => format!("Oral B Toothbrush {i}"),
+                _ => format!("Colgate Toothpaste Gel Extra Long Name Number {i}"),
+            };
+            b.add(&Doc::new([name, format!("{price}")]));
+        }
+        // A row with no price at all: it has no position in a price order, in either arm.
+        b.add(&Doc::new(["Colgate Toothpaste Unpriced", "not a number"]));
+        let ix = b.build().unwrap();
+
+        for q in ["Colgate", "Toothpaste", "Colgate Toothpaste", "Colgte", "Oral B", "qzxwv"] {
+            for k in [1usize, 2, 3, 5, 10, 25, 100] {
+                for asc in [true, false] {
+                    let walk = ix.search_sorted_arm(q, k, 0, asc, true);
+                    let scan = ix.search_sorted_arm(q, k, 0, asc, false);
+                    assert_eq!(
+                        walk, scan,
+                        "arms disagree on q={q:?} k={k} ascending={asc}\n walk={walk:?}\n scan={scan:?}"
+                    );
+                    // And the public entry point must return whichever it chose, unchanged.
+                    assert_eq!(ix.search_sorted(q, k, 0, asc), scan, "the chooser changed the answer");
+                }
+            }
+        }
+
+        // The stopping rule is the point: the walk must not return more than k, and must return
+        // exactly k when that many priced matches exist.
+        assert_eq!(ix.search_sorted_arm("Colgate", 5, 0, true, true).len(), 5);
+
+        // The filtered entry point takes the same fork, so the filter must survive it. Checked
+        // against the unfiltered answer narrowed by hand rather than against the other arm, so
+        // this cannot pass by both arms being wrong the same way.
+        let ranged = ix.search_sorted_filtered("Colgate", 50, 0, true, &[], &[(0, 10.0, 25.0)]);
+        let by_hand: Vec<Hit> = ix
+            .search_sorted("Colgate", 1000, 0, true)
+            .into_iter()
+            .filter(|h| ix.numeric_of(h.doc, 0).is_some_and(|v| (10.0..25.0).contains(&v)))
+            .collect();
+        assert_eq!(ranged, by_hand, "the range filter survives whichever arm was chosen");
+        assert!(
+            ix.search_sorted("Colgate Toothpaste Unpriced", 10, 0, true)
+                .iter()
+                .all(|h| h.doc != 60),
+            "a row with no value is excluded from the order by both arms"
+        );
+    }
+
+    /// Keys must survive a round trip, and an index without them must cost nothing.
+    #[test]
+    fn keys_round_trip_and_are_optional() {
+        let mut b = IndexBuilder::new(Schema::new(vec![
+            Field::new("sku", 0.0, 0.6),
+            Field::new("name", 3.0, 0.4),
+        ]))
+        .with_key(0);
+        for (sku, name) in [
+            ("sku-1", "Colgate Total Toothpaste 150g"),
+            ("sku-2", "Aquafresh Mini Toothpaste 50g"),
+            ("", "Unkeyed Toothpaste"),
+        ] {
+            b.add(&Doc::new([sku, name]));
+        }
+        let ix = b.build().unwrap();
+        let back = Index::from_bytes(&ix.to_bytes()).unwrap();
+
+        assert!(back.has_key());
+        assert_eq!(back.key_field(), Some(0));
+        assert_eq!(back.keyed_count(), 2);
+        assert_eq!(back.doc_of_key("sku-2"), Some(1), "the key lookup is rebuilt on load");
+        assert_eq!(back.key_of(0), Some("sku-1"));
+        assert_eq!(back.key_of(2), None, "a blank key stays no key across the round trip");
+        assert_eq!(back.search("Toothpaste", 10).len(), ix.search("Toothpaste", 10).len());
+
+        // The default costs nothing: no key field, no key section.
+        let plain = built().to_bytes();
+        let t = read_section_table(&plain).unwrap();
+        assert_eq!(t.doc_key.len, 0, "an index without keys stores no key bytes");
+        assert!(!Index::from_bytes(&plain).unwrap().has_key());
+    }
+
+    /// A key array shorter than the corpus must be REFUSED.
+    ///
+    /// Keys are positional, so one short entry shifts every later key onto the wrong document:
+    /// `doc_of_key` then resolves a real key to a real-but-wrong row, and a change stream updates
+    /// the wrong record. That is corruption that looks exactly like working software, which is why
+    /// the reader counts rather than trusts.
+    #[test]
+    fn a_short_key_array_is_refused() {
+        let mut b = IndexBuilder::new(Schema::new(vec![
+            Field::new("sku", 0.0, 0.6),
+            Field::new("name", 3.0, 0.4),
+        ]))
+        .with_key(0);
+        b.add(&Doc::new(["sku-1", "Colgate Total Toothpaste"]));
+        b.add(&Doc::new(["sku-2", "Aquafresh Mini Toothpaste"]));
+        let bytes = b.build().unwrap().to_bytes();
+        assert!(Index::from_bytes(&bytes).is_ok());
+
+        // Shrink the doc_key span so the last key is unreadable. It is the 18th (last) span.
+        let t = read_section_table(&bytes).unwrap();
+        let mut bad = bytes.clone();
+        let at = MAGIC.len() + 17 * 16;
+        bad[at + 8..at + 16].copy_from_slice(&(t.doc_key.len - 4).to_le_bytes());
+        assert!(
+            Index::from_bytes(&bad).is_err(),
+            "a truncated key array must error, not shift keys onto the wrong rows"
+        );
+    }
+
+    /// The default must be free. Positions are the one option whose cost scales with token
+    /// occurrences, so "off by default" has to mean zero bytes, not a small header.
+    #[test]
+    fn an_index_without_positions_costs_no_position_bytes() {
+        let bytes = built().to_bytes();
+        let t = read_section_table(&bytes).unwrap();
+        assert_eq!(t.position_at.len, 0, "no offsets");
+        assert_eq!(t.position.len, 0, "no positions");
+    }
+
+    /// A truncated offset array must be REFUSED, not tolerated. One entry short and `position_of`
+    /// returns the next posting's run; the verifier then agrees with positions belonging to
+    /// another term, which is a wrong phrase answer that looks exactly like a right one.
+    #[test]
+    fn a_truncated_position_offset_array_is_refused() {
+        let mut b = IndexBuilder::new(Schema::new(vec![Field::new("name", 3.0, 0.4)]))
+            .with_position();
+        b.add(&Doc::new(["Vanilla Ice Cream Tub"]));
+        b.add(&Doc::new(["Ice Crushed Cream Soda"]));
+        let bytes = b.build().unwrap().to_bytes();
+        assert!(Index::from_bytes(&bytes).is_ok(), "the unmodified bytes must load");
+
+        // Shorten `position_at` by exactly one u64 and fix up the table so nothing else notices.
+        let t = read_section_table(&bytes).unwrap();
+        let mut bad = bytes.clone();
+        let at = MAGIC.len() + 15 * 16; // the position_at span is the 16th
+        let len = (t.position_at.len - 8).to_le_bytes();
+        bad[at + 8..at + 16].copy_from_slice(&len);
+        assert!(
+            Index::from_bytes(&bad).is_err(),
+            "an offset array one entry short must be an error, not a silent aliasing"
+        );
+    }
+
+    #[test]
+    fn pages_partition_the_ranking_without_gaps_or_repeats() {
+        let mut b = IndexBuilder::new(Schema::new(vec![Field::new("name", 3.0, 0.4)]));
+        for i in 0..40 {
+            b.add(&Doc::new(vec![format!("Toothpaste variant {i}")]));
+        }
+        let ix = b.build().unwrap();
+        let q = "Toothpaste";
+
+        let all: Vec<u32> = ix.search(q, 30).iter().map(|h| h.doc).collect();
+        let mut paged: Vec<u32> = Vec::new();
+        for page in 0..3 {
+            paged.extend(ix.search_page(q, page * 10, 10).iter().map(|h| h.doc));
+        }
+        assert_eq!(paged, all, "three pages of 10 must equal one request for 30");
+
+        let mut seen = paged.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), paged.len(), "no document appears on two pages");
+
+        // Past the end is empty, not an error, and not a wrapped page.
+        assert!(ix.search_page(q, 10_000, 10).is_empty());
+        assert_eq!(ix.search_page(q, 0, 5).len(), 5);
+    }
+
+    #[test]
+    fn an_index_without_facets_costs_no_facet_bytes() {
+        let ix = built();
+        let t = read_section_table(&ix.to_bytes()).unwrap();
+        assert_eq!(t.facet_label.len, 0, "no facet field means no facet label bytes");
+        assert_eq!(t.facet_id.len, 0, "and no per-document ids");
+        assert!(ix.facet_label().is_empty());
+        assert!(ix.facet_tally("anything").is_empty());
     }
 
     #[test]
