@@ -3,8 +3,9 @@
 //! `bench/roadmap/p45-phrase.md` shipped phrase queries on an opt-in positional index. Two claims
 //! were made about it and neither is safe to assert from a unit test:
 //!
-//! 1. **Positions cost one `u32` per token OCCURRENCE**, so the artifact grows with total tokens
-//!    rather than with documents. A four-document unit test can only say "bigger".
+//! 1. **What positions cost.** `p45` shipped them fixed-width and measured +74.7 % of artifact
+//!    size, with the OFFSET array costing 2.2x the positions it addressed. `p54` delta-varint
+//!    encoded both; this is what tracks that. A four-document unit test can only say "bigger".
 //! 2. **The phrase verifier is correct on real text**, not just on a corpus built to exercise it.
 //!
 //! The second is the one that needs an independent arm. This project's sharpest methodological
@@ -112,7 +113,7 @@ fn main() {
     println!("    delta               {:>12} bytes", b - a);
     println!("    rough token count   {token:>12}");
     println!(
-        "    delta / token       {:>12.2} bytes  (4 = one u32, plus the offset array)",
+        "    delta / token       {:>12.2} bytes  (was 12.64 with fixed-width offsets, p45)",
         (b - a) as f64 / token as f64
     );
 

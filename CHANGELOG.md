@@ -62,7 +62,7 @@ hashing, video retrieval, and the face-recognition licence and legal landscape.
   InsightFace's face weights are research-only despite its MIT code badge; EU AI Act Art. 5(1)(e)
   absolutely prohibits building facial-recognition databases by untargeted scraping; and the UK
   Upper Tribunal named *clustering facial vectors* as the triggering processing step. See
-  [`bench/roadmap/p55-face-cluster.md`](bench/roadmap/p55-face-cluster.md).
+  [`bench/roadmap/p64-face-cluster.md`](bench/roadmap/p64-face-cluster.md).
 
 ### Measured, on a real 17,311-file web scrape
 
@@ -72,7 +72,7 @@ Baseline committed under [`bench/runs/2026-09-06-baseline/`](bench/runs/2026-09-
 
 - **0 panics, 0 unreadable, 0 decode failures** across all 17,311 files, including the 5,304 that
   are not images at all.
-- Cheap tier **2.049 ms p50 / 112.0 B per image** — both `p48` budgets hold.
+- Cheap tier **2.049 ms p50 / 112.0 B per image** — both `p57` budgets hold.
 - **100% EXIF stripping**: 6 files in 17,311 carry an APP1 block, none parse to non-empty EXIF.
   This confirms the research prediction exactly.
 - **29.82% of all files are redundant exact copies** (42.69% among images alone). That lands on the
@@ -82,11 +82,11 @@ Baseline committed under [`bench/runs/2026-09-06-baseline/`](bench/runs/2026-09-
 - Fused query over 12,007 documents, 100 queries at k=20: **0 short pages, 0 filter leaks, 0
   uncorroborated hits.**
 - Latency at 12,007 documents: text **2 µs** p50 (flat from 1,000 docs), vector **192 µs**, fused
-  **623 µs**. The vector arm scaling linearly is what an exact scan predicts and what `p49` chose
+  **623 µs**. The vector arm scaling linearly is what an exact scan predicts and what `p58` chose
   over a graph deliberately.
 - Index is **2,938.8 B/image**, 14.96% of the bytes it indexes.
 
-**The `p49` recall verdict is withheld, not passed.** The benchmark ships no encoder, so its default
+**The `p58` recall verdict is withheld, not passed.** The benchmark ships no encoder, so its default
 vectors are seeded noise; it prints `[HELD]` and states that a recall figure over synthetic vectors
 would measure the arithmetic rather than the retrieval. That number stays `UNVERIFIED` until a real
 encoder runs against this corpus.
@@ -109,9 +109,9 @@ tier, reported as the regression it is.
 
 ### Roadmap
 
-New rows `p48`–`p56` under [`ROADMAP.md`](ROADMAP.md) Part III, each with a falsifiable benchmark:
+New rows `p57`–`p65` under [`ROADMAP.md`](ROADMAP.md) Part III, each with a falsifiable benchmark:
 cheap tier, vector column, fusion, real corpus, content address, image ABI, video-as-shots, the
-face primitive, and `p56` — the field-budget collision the corpus run surfaced, where an image
+face primitive, and `p65` — the field-budget collision the corpus run surfaced, where an image
 document wants seven columns and `index_text::MAX_FIELD` allows four.
 
 

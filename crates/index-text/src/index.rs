@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 /// This is deliberately not the limit on how many columns a document may carry — see
 /// [`MAX_COLUMN`] and [`Schema::with_column`]. Raising *this* constant would widen
 /// `[u16; MAX_FIELD]` on every posting of every existing index, which
-/// `bench/roadmap/p56-field-budget.md` rejects: it taxes four shipping consumers to serve one new
+/// `bench/roadmap/p65-field-budget.md` rejects: it taxes four shipping consumers to serve one new
 /// corpus.
 pub const MAX_FIELD: usize = 4;
 
@@ -114,7 +114,7 @@ impl Schema {
     /// Before this, a facet or a numeric column was declared *by scored-field index*
     /// (`with_facet(field)`), so `Field::new("width", 0.0, 0.75)` — boost 0.0, meaning "never
     /// scored" — still consumed a [`MAX_FIELD`] slot **and** a `u16` field length on every posting
-    /// that nobody would ever read. `bench/roadmap/p56-field-budget.md` measured the alternative
+    /// that nobody would ever read. `bench/roadmap/p65-field-budget.md` measured the alternative
     /// and rejected it: widening the per-posting array to eight taxes presyo's 241,677 products,
     /// sisia and profstopick to serve one image corpus.
     ///
@@ -415,7 +415,7 @@ impl IndexBuilder {
     ///
     /// [`MAX_FIELD`] is the floor rather than the bound, so a schema that declares fewer than four
     /// scored fields and no unscored column keeps accepting exactly the indices it accepted before
-    /// `p56` — a two-field schema could always `with_facet(3)` and store the empty string, and
+    /// `p65` — a two-field schema could always `with_facet(3)` and store the empty string, and
     /// tightening that would be a silent behaviour change dressed as a refactor.
     fn column_limit(&self) -> usize {
         self.schema.column_count().max(MAX_FIELD)
@@ -4238,7 +4238,7 @@ mod tests {
         }
     }
 
-    /// `p56`: the seven-column image document that surfaced this row -- one scored text field and
+    /// `p65`: the seven-column image document that surfaced this row -- one scored text field and
     /// six unscored columns -- builds, facets and ranges, on a `MAX_FIELD` that did not move.
     #[test]
     fn a_seven_column_schema_fits_in_four_scored_fields() {
@@ -4297,7 +4297,7 @@ mod tests {
     }
 
     /// The old index-by-scored-field path keeps working unchanged, because shipping benchmarks use
-    /// it. `p56` adds a road, it does not close one.
+    /// it. `p65` adds a road, it does not close one.
     #[test]
     fn declaring_a_facet_by_scored_field_index_still_works() {
         let schema =

@@ -106,6 +106,17 @@ const EXAMPLE_MAX: usize = 5;
 const BYTE_RANGE_LO: f64 = 2048.0;
 const BYTE_RANGE_HI: f64 = 1.0e9;
 
+/// The other two numeric-range predicates: width and height, in pixels. 200 px is the floor for the
+/// same reason 2 KiB is — the census's own width histogram puts a bucket below it, and that bucket
+/// is icons, spacers and tracking pixels rather than pictures. The ceiling is above anything
+/// `MAX_PIXEL` admits, so it bounds the range without silently excluding a real image.
+///
+/// These two exist because `p56` gave them a column. Under the old four-scored-field packing there
+/// was no numeric slot left for either, so "at least 200 px on a side" — the most ordinary image
+/// filter there is — was simply not expressible in this query set.
+const DIM_RANGE_LO: f64 = 200.0;
+const DIM_RANGE_HI: f64 = 1.0e5;
+
 // ---------------------------------------------------------------------------------------------
 // Corpus location
 // ---------------------------------------------------------------------------------------------
@@ -1037,38 +1048,46 @@ fn main() {
         }
     }
 
-    // ---- schema, and the engine limit that shapes it --------------------------------------------
+    // ---- schema: the SEVEN columns an image document actually has -------------------------------
     //
-    // `index_text::MAX_FIELD` is **4**. The columns this corpus yields are path, format, shape,
-    // colour, width, height and byte length — **seven**, and an image document is therefore
-    // column-hungrier than the text engine's budget. See "WHAT THIS RUN SURFACED" at the end: that
-    // mismatch is a finding of this benchmark, not a detail of it.
+    // This corpus yields seven columns per image — path, format, shape, colour, width, height and
+    // byte length — and for most of this benchmark's life only four of them could be declared,
+    // because a facet or a numeric column had to be a SCORED field and `index_text::MAX_FIELD` is
+    // 4. That collision is what produced `p56`: unscored columns. `Schema::with_column` declares a
+    // value that can be faceted, ranged or keyed on without spending a scored-field slot, and
+    // `format::tests::unscored_columns_cost_no_posting_byte` proves byte-for-byte that it costs
+    // nothing per posting, because it is never tokenized.
     //
-    // Raising `MAX_FIELD` is not the fix, and this bench will not ask for it: it is the width of
-    // `[u16; MAX_FIELD]` on every posting in `term_post`, so widening it taxes every existing text
-    // consumer to serve one image bench.
+    // So all seven are declared, and `MAX_FIELD` did not move. That was the point: widening
+    // `[u16; MAX_FIELD]` would have taxed every posting of every existing text consumer to serve
+    // one image tier, whereas an unscored column simply stops spending a SCORING slot on a value
+    // that nothing scores.
     //
-    // The packing inside the budget: `path` scored, `format` and `colour` as the two facets
-    // (colour because nothing else can stand in for it), and byte length as the single numeric
-    // column (width and height are derivable and the census above already reports both
-    // distributions). Orientation folds into the path text, where it is still queryable but is no
-    // longer a hard predicate.
+    // Only `path` is scored — the URL path IS the caption on a scrape, and there is no other text.
+    // Nothing else enters the dictionary: `jpeg`, `landscape` and `204800` are stored values, not
+    // searchable terms.
     let schema = || {
-        Schema::new(vec![
-            // The URL path IS the caption on a scrape; there is no other text.
-            Field::new("path", 3.0, 0.5),
-            // boost 0.0: these exist to be faceted/ranged on, not scored on.
-            Field::new("format", 0.0, 0.75),
-            Field::new("color", 0.0, 0.75),
-            Field::new("byte", 0.0, 0.75),
-        ])
+        Schema::new(vec![Field::new("path", 3.0, 0.5)])
+            // Unscored columns, in declaration order. A `Doc` supplies their values in this order,
+            // immediately after the scored fields.
+            .with_column("format")
+            .with_column("shape")
+            .with_column("color")
+            .with_column("width")
+            .with_column("height")
+            .with_column("byte")
     };
 
+    /// One indexed document's column values, in schema declaration order.
     struct Row {
-        /// Path text, with the orientation appended — the column that lost its facet slot.
+        /// The scored field: path text only. Orientation used to be appended here because it had
+        /// no slot of its own; it now has a real facet column, so the caption stays a caption.
         text: String,
         format: &'static str,
+        shape: &'static str,
         color: String,
+        width: String,
+        height: String,
         byte: String,
     }
     let row: Vec<Row> = indexed
@@ -1076,24 +1095,32 @@ fn main() {
         .map(|r| {
             let (w, h) = r.decoded_dim.unwrap();
             Row {
-                text: format!("{} {}", path_text(&r.path), shape_of(w, h)),
+                text: path_text(&r.path),
                 format: r.format.name(),
+                shape: shape_of(w, h),
                 // The dominant OKLab bucket, as a facet term. Real extracted signal, not a label.
                 color: r
                     .palette
                     .as_ref()
                     .and_then(|p| p.term().first().map(|t| t.0.clone()))
                     .unwrap_or_else(|| "col:none".to_string()),
+                width: w.to_string(),
+                height: h.to_string(),
                 byte: r.byte_len.to_string(),
             }
         })
         .collect();
 
     let build = |n: usize| -> ImageIndex {
+        // Facet slot 0/1/2 = format/shape/colour; numeric slot 0/1/2 = width/height/byte. The
+        // predicates below address those slots, so the declaration order here IS the query API.
         let mut b = ImageIndexBuilder::new(schema(), embedding.dim(), Metric::Cosine)
-            .with_facet(1)
-            .with_facet(2)
-            .with_numeric(3);
+            .with_facet_of("format")
+            .with_facet_of("shape")
+            .with_facet_of("color")
+            .with_numeric_of("width")
+            .with_numeric_of("height")
+            .with_numeric_of("byte");
         for (i, r) in indexed.iter().take(n).enumerate() {
             let (w, h) = r.decoded_dim.unwrap();
             let doc = ImageDoc {
@@ -1112,7 +1139,10 @@ fn main() {
             let d = Doc::new(vec![
                 text.text.as_str(),
                 text.format,
+                text.shape,
                 text.color.as_str(),
+                text.width.as_str(),
+                text.height.as_str(),
                 text.byte.as_str(),
             ]);
             if let Err(e) = b.add(&doc, &d, v.as_deref()) {
@@ -1170,15 +1200,25 @@ fn main() {
         // Hard predicates drawn from real documents, so they select rather than empty the corpus.
         let anchor = &row[(qi * 37) % row.len()];
         let format_value = [anchor.format];
+        let shape_value = [anchor.shape];
         let color_value = [anchor.color.as_str()];
-        let mut clause = vec![FacetClause::any(0, &format_value)];
-        // Half the queries also pin the colour bucket, so slot 1 is exercised rather than declared.
+        // Facet slot 0 format, slot 1 shape, slot 2 colour. SHAPE IS A HARD PREDICATE HERE, which
+        // it could not be while it was folded into the path text for want of a slot.
+        let mut clause =
+            vec![FacetClause::any(0, &format_value), FacetClause::any(1, &shape_value)];
+        // Half the queries also pin the colour bucket, so slot 2 is exercised rather than declared.
         if qi % 2 == 1 {
-            clause.push(FacetClause::any(1, &color_value));
+            clause.push(FacetClause::any(2, &color_value));
         }
-        // A byte-length range wide enough to keep a page fillable, narrow enough to be a real
-        // filter: it drops the sub-2-KiB tracking pixels and spacer GIFs a scrape is full of.
-        let range = [(0usize, BYTE_RANGE_LO, BYTE_RANGE_HI)];
+        // Three numeric ranges — width, height, byte length — each wide enough to keep a page
+        // fillable and narrow enough to be a real filter: together they drop the sub-200 px,
+        // sub-2-KiB tracking pixels and spacer GIFs a scrape is full of. Width and height are
+        // ranged on AT ALL only because `p56` gave them numeric columns.
+        let range = [
+            (0usize, DIM_RANGE_LO, DIM_RANGE_HI),
+            (1usize, DIM_RANGE_LO, DIM_RANGE_HI),
+            (2usize, BYTE_RANGE_LO, BYTE_RANGE_HI),
+        ];
 
         let vec_doc = (qi * 7) % row.len();
         let qv = embedding.vector(vec_doc, &indexed[vec_doc].digest);
@@ -1213,22 +1253,28 @@ fn main() {
         // --- 2. no leak ---
         for h in &hit {
             let format_ok = ix.text().facet_of_at(h.doc, 0) == Some(anchor.format);
-            let color_ok = clause.len() < 2
-                || ix.text().facet_of_at(h.doc, 1) == Some(anchor.color.as_str());
-            let range_ok = ix
-                .text()
-                .numeric_of(h.doc, 0)
-                .is_some_and(|v| v >= range[0].1 && v < range[0].2);
-            if !format_ok || !color_ok || !range_ok {
+            let shape_ok = ix.text().facet_of_at(h.doc, 1) == Some(anchor.shape);
+            let color_ok = clause.len() < 3
+                || ix.text().facet_of_at(h.doc, 2) == Some(anchor.color.as_str());
+            // Every declared range, not just the first: a hard predicate that is not verified is
+            // not a hard predicate.
+            let range_ok = range.iter().all(|&(slot, lo, hi)| {
+                ix.text().numeric_of(h.doc, slot).is_some_and(|v| v >= lo && v < hi)
+            });
+            if !format_ok || !shape_ok || !color_ok || !range_ok {
                 leak += 1;
                 if example.len() < EXAMPLE_MAX {
                     example.push(format!(
-                        "LEAK {q:?} doc {}: format {:?} wanted {:?}, colour {:?}, byte {:?}",
+                        "LEAK {q:?} doc {}: format {:?} wanted {:?}, shape {:?} wanted {:?}, colour {:?}, width {:?}, height {:?}, byte {:?}",
                         h.doc,
                         ix.text().facet_of_at(h.doc, 0),
                         anchor.format,
                         ix.text().facet_of_at(h.doc, 1),
-                        ix.text().numeric_of(h.doc, 0)
+                        anchor.shape,
+                        ix.text().facet_of_at(h.doc, 2),
+                        ix.text().numeric_of(h.doc, 0),
+                        ix.text().numeric_of(h.doc, 1),
+                        ix.text().numeric_of(h.doc, 2)
                     ));
                 }
             }
@@ -1238,8 +1284,12 @@ fn main() {
             }
         }
     }
-    println!("  {tried} fused queries at k={K}: text + facet(format) + facet(colour, every 2nd)");
+    println!("  {tried} fused queries at k={K}: text + facet(format) + facet(shape)");
+    println!("  + facet(colour, every 2nd) + range(width >= {DIM_RANGE_LO:.0}) + range(height >= {DIM_RANGE_LO:.0})");
     println!("  + range(byte >= {BYTE_RANGE_LO:.0}) + vector + dHash radius {}", hash::HASH64_NEAR_MAX);
+    println!("  All SEVEN columns are now query surface: three facets and three numeric ranges over");
+    println!("  p56 unscored columns, on one scored text field. Width and height carry hard range");
+    println!("  predicates here — the capability the old four-scored-field packing could not express.");
     println!("  short pages: {short}   filter leaks: {leak}   hits with agreement 0: {mute}");
     for e in example.iter().take(EXAMPLE_MAX) {
         println!("    {e}");
@@ -1463,7 +1513,7 @@ fn main() {
                     println!("      {} group(s) skipped: no vector for the query document.", a.skipped);
                 }
                 print_arm(&a);
-                println!("\n      -> THIS SET CANNOT ADJUDICATE p50 ACCEPTANCE 3, whatever it prints.");
+                println!("\n      -> THIS SET CANNOT ADJUDICATE p59 ACCEPTANCE 3, whatever it prints.");
                 println!("         Byte-identical files decode to identical pixels, so a real encoder");
                 println!("         gives them identical embeddings and the vector arm returns the whole");
                 println!("         group first: nDCG@10 = 1.0 BY CONSTRUCTION. `fused > vector` is then");
@@ -1564,7 +1614,7 @@ fn main() {
                 } else {
                     "the VECTOR half"
                 };
-                println!("\n      -> FUSION LOSES TO {lose} on the non-degenerate set. Per p50");
+                println!("\n      -> FUSION LOSES TO {lose} on the non-degenerate set. Per p59");
                 println!("         acceptance 3 this is a FAILING result and the row is wrong, not");
                 println!("         under-tuned. It is printed as measured; nothing here is adjusted");
                 println!("         until it passes.");

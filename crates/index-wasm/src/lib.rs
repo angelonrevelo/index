@@ -1614,7 +1614,7 @@ pub unsafe extern "C" fn idx_image_doc_count(h: *const ImageHandle) -> u32 {
     h.as_ref().and_then(|x| x.index.as_ref()).map_or(0, |i| i.doc_count() as u32)
 }
 
-/// **Vector search alone**: the `p49` tiered pipeline — binary popcount shortlist, int8 rerank,
+/// **Vector search alone**: the `p58` tiered pipeline — binary popcount shortlist, int8 rerank,
 /// exact final pass — with no text, facet or range predicate.
 ///
 /// `ptr`/`len` is the query embedding as `len` **`f32`**. `oversample` is the shortlist multiplier;
@@ -1629,7 +1629,7 @@ pub unsafe extern "C" fn idx_image_doc_count(h: *const ImageHandle) -> u32 {
 /// **This applies no filter**, and that is exactly why it is separate from
 /// [`idx_image_search_fused`]: a host wanting a filtered vector search must ask for one, so the
 /// filter cannot be lost by accident. A vector arm returning documents the filter bar excluded is
-/// the defect `p50` guards, and it is not a defect this entry point can silently commit.
+/// the defect `p59` guards, and it is not a defect this entry point can silently commit.
 ///
 /// # Safety
 /// `h` must be a live handle; `ptr` readable for `len` `f32`.
@@ -1669,7 +1669,7 @@ pub unsafe extern "C" fn idx_image_search_vector(
 /// **The fused query**: text, facets, numeric ranges, vector proximity and hash proximity, scored
 /// together with top-k selected **once**.
 ///
-/// This is `p50` made callable from JavaScript, and the property it asserts is not speed:
+/// This is `p59` made callable from JavaScript, and the property it asserts is not speed:
 ///
 /// - **Hard predicates are hard everywhere.** Facet and range clauses are applied inside the text
 ///   pass *and* re-applied to the vector and hash arms. A soft arm knows nothing about facets, so
@@ -1840,7 +1840,7 @@ pub unsafe extern "C" fn idx_image_hash_near(h: *mut ImageHandle, hi: u32, lo: u
     near.len() as u32
 }
 
-/// Which signal found hit `hit` of the last search — the explicability `p50` requires, preserved
+/// Which signal found hit `hit` of the last search — the explicability `p59` requires, preserved
 /// across the boundary.
 ///
 /// A bitmask of `IDX_WHY_TEXT` | `IDX_WHY_VECTOR` | `IDX_WHY_HASH` | `IDX_WHY_COLOR`. Returns
@@ -2243,7 +2243,7 @@ mod tests {
 
     /// **The whole point of keys, through the ABI: express an update without knowing an ordinal.**
     ///
-    /// A host receiving "row sku-1 changed" has the key and nothing else. Before `p53` it could
+    /// A host receiving "row sku-1 changed" has the key and nothing else. Before `p62` it could
     /// search but never say which row it meant, because `idx_searcher_delete` takes a dense ordinal
     /// assigned at insertion that no database row carries.
     #[test]

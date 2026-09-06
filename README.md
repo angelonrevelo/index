@@ -357,17 +357,17 @@ python host/python/index_ffi.py                             # ...and through the
 
 The image tier ships **no model**, so the two measurements that need one are driven by host-side
 scripts — which is the architecture, not a workaround: an embedding is an *input*, and a transcode
-is the host's decision (`docs/research/image.md` §8, `bench/roadmap/p52-content-address.md`).
+is the host's decision (`docs/research/image.md` §8, `bench/roadmap/p61-content-address.md`).
 
 ```sh
 # 1. ask the benchmark which documents it indexes, and in what order
 cargo run -p index-bench --release --bin image-corpus -- --emit-manifest manifest.tsv
 # 2. embed exactly those, in exactly that order  (needs torch + transformers)
 python scripts/embed-corpus.py manifest.tsv embedding.bin
-# 3. now p49's recall verdict is real instead of withheld
+# 3. now p58's recall verdict is real instead of withheld
 cargo run -p index-bench --release --bin image-corpus -- --embedding embedding.bin
 
-# p52 acceptance 4: does a lossless transcode round-trip BYTE-EXACT?  (needs `scoop install libjxl`)
+# p61 acceptance 4: does a lossless transcode round-trip BYTE-EXACT?  (needs `scoop install libjxl`)
 python scripts/jxl-roundtrip.py
 ```
 

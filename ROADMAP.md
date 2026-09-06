@@ -341,15 +341,15 @@ app, and the only ground in this space not already occupied.
 
 | Item | What it closes | Effort | Benchmark | Status |
 |---|---|---|---|---|
-| **`p48` cheap tier** — perceptual hash, OKLab colour buckets, hostile-input EXIF | A first result before any model has run. <10 ms and <200 B per image, no GPU, no decoder dependency | M | [`p48`](bench/roadmap/p48-cheap-tier.md) → cost, threshold correctness, and the hash's LIMITS proven by test | **built** |
-| **`p49` vector column** — binary popcount prefilter → int8 rerank → exact | Semantic search without an ANN graph, which below ~1 M vectors costs build time, memory, recall and mutability and buys nothing | M | [`p49`](bench/roadmap/p49-vector-column.md) → recall vs the exact oracle, bytes/vector per tier | **built, recall WITHHELD** |
-| **`p50` fusion** — one query plan, one top-k | **The headline claim.** No short pages, no filter leaks, explicable results | L | [`p50`](bench/roadmap/p50-image-fusion.md) → zero short pages, zero leaks, agreement tie-break | **built** |
-| **`p51` real corpus** — 17,311 scraped web images | Every number above, on data nobody curated for it | M | [`p51`](bench/roadmap/p51-image-corpus.md) → census first, then cost, dedup, recall, latency | **built and run** |
-| **`p52` content address** — SHA-256 dedup key and 1:1 transcode proof | "Compress to fewest bytes, still byte-exact" — reduced to one comparison | S | [`p52`](bench/roadmap/p52-content-address.md) → duplicate rate, byte accounting, round-trip proof | **partial** — round-trip proof unexercised |
-| **`p53` image ABI** — the tier through the C ABI, v11 → v12 | An image tier only Rust can call forfeits the whole portability thesis | M | [`p53`](bench/roadmap/p53-image-abi.md) → Node + headless Chromium match Rust exactly; linear-memory high-water mark | **shipped** |
-| **`p54` video as shots** | "Frame-by-frame video search" — rejected as framing, kept as goal | L | [`p54`](bench/roadmap/p54-video-keyframe.md) → shot-sampled recall >= uniform 1 fps at far fewer frames | spec, T3 |
-| **`p55` face clustering primitive** | The vector arithmetic, and deliberately nothing else | S | [`p55`](bench/roadmap/p55-face-cluster.md) → false-MERGE rate reported separately from accuracy | spec, T3 |
-| **`p56` field budget** | **Surfaced by `p51`, not planned.** An image document wants 7 columns; `MAX_FIELD` is 4, and an unscored facet column should not occupy a scoring slot at all | M | [`p56`](bench/roadmap/p56-field-budget.md) → zero bytes/document regression on presyo's 241,677 products | spec |
+| **`p57` cheap tier** — perceptual hash, OKLab colour buckets, hostile-input EXIF | A first result before any model has run. <10 ms and <200 B per image, no GPU, no decoder dependency | M | [`p57`](bench/roadmap/p57-cheap-tier.md) → cost, threshold correctness, and the hash's LIMITS proven by test | **built** |
+| **`p58` vector column** — binary popcount prefilter → int8 rerank → exact | Semantic search without an ANN graph, which below ~1 M vectors costs build time, memory, recall and mutability and buys nothing | M | [`p58`](bench/roadmap/p58-vector-column.md) → recall vs the exact oracle, bytes/vector per tier | **built, recall WITHHELD** |
+| **`p59` fusion** — one query plan, one top-k | **The headline claim.** No short pages, no filter leaks, explicable results | L | [`p59`](bench/roadmap/p59-image-fusion.md) → zero short pages, zero leaks, agreement tie-break | **built** |
+| **`p60` real corpus** — 17,311 scraped web images | Every number above, on data nobody curated for it | M | [`p60`](bench/roadmap/p60-image-corpus.md) → census first, then cost, dedup, recall, latency | **built and run** |
+| **`p61` content address** — SHA-256 dedup key and 1:1 transcode proof | "Compress to fewest bytes, still byte-exact" — reduced to one comparison | S | [`p61`](bench/roadmap/p61-content-address.md) → duplicate rate, byte accounting, round-trip proof | **partial** — round-trip proof unexercised |
+| **`p62` image ABI** — the tier through the C ABI, v11 → v12 | An image tier only Rust can call forfeits the whole portability thesis | M | [`p62`](bench/roadmap/p62-image-abi.md) → Node + headless Chromium match Rust exactly; linear-memory high-water mark | **shipped** |
+| **`p63` video as shots** | "Frame-by-frame video search" — rejected as framing, kept as goal | L | [`p63`](bench/roadmap/p63-video-keyframe.md) → shot-sampled recall >= uniform 1 fps at far fewer frames | spec, T3 |
+| **`p64` face clustering primitive** | The vector arithmetic, and deliberately nothing else | S | [`p64`](bench/roadmap/p64-face-cluster.md) → false-MERGE rate reported separately from accuracy | spec, T3 |
+| **`p65` field budget** | **Surfaced by `p60`, not planned.** An image document wants 7 columns; `MAX_FIELD` is 4, and an unscored facet column should not occupy a scoring slot at all | M | [`p65`](bench/roadmap/p65-field-budget.md) → zero bytes/document regression on presyo's 241,677 products | spec |
 
 ### Measured, 2026-09-06 — the full 17,311-file corpus
 
@@ -358,7 +358,7 @@ app, and the only ground in this space not already occupied.
 
 | Check | Result |
 |---|---|
-| Ingest robustness (`p48` check 5) | **0 panics, 0 unreadable, 0 decode failures** over 17,311 hostile scraped files (2,838 MB) |
+| Ingest robustness (`p57` check 5) | **0 panics, 0 unreadable, 0 decode failures** over 17,311 hostile scraped files (2,838 MB) |
 | Cheap tier p50 / p99 | **2.049 ms** / 10.434 ms — budget <10 ms p50: **HOLDS** |
 | Cheap tier bytes | **112.0 B/image** (mean = p50 = p99) — budget <200 B: **HOLDS** |
 | EXIF presence | **6 of 17,311 files (0.05%)** carry a block; stripping rate **100%** |
@@ -366,16 +366,16 @@ app, and the only ground in this space not already occupied.
 | Exact duplicates, images only | **42.69%** — 5,126 of 12,007 |
 | Near-duplicates, dHash | 76.51% at <=0 · **97.07% at <=4** · 99.95% at <=12 |
 | Near-duplicates, PDQ-shaped | 65.86% at <=0 · **98.72% at <=31** · 99.83% at <=48 |
-| Fused correctness (`p50`) | **0 short pages, 0 filter leaks, 0 hits with zero agreement** over **100** fused queries at k=20 |
+| Fused correctness (`p59`) | **0 short pages, 0 filter leaks, 0 hits with zero agreement** over **100** fused queries at k=20 |
 | Latency, 12,007 docs | text **2 µs** p50 / 39 µs p99 · vector **192 µs** / 208 µs · **fused 623 µs** / 843 µs |
 | Index size | **2,938.8 B/image**, **14.96%** of the images' own bytes |
-| `p49` recall | **WITHHELD** — synthetic embeddings |
+| `p58` recall | **WITHHELD** — synthetic embeddings |
 
 **Correcting an earlier figure in this file.** A 1,500-file sample (every 11th file) measured the
 exact-duplicate rate at **9.00%**. The full corpus measures **29.82%**. Systematic sampling strides
 *across* duplicate clusters and destroys the structure it is trying to count, so the sampled figure
 was not merely imprecise — it was wrong by a factor of three about the property that matters most
-for `p52`. **The dedup rate cannot be sampled.** Every other sampled number held (cheap tier 2.14
+for `p61`. **The dedup rate cannot be sampled.** Every other sampled number held (cheap tier 2.14
 vs 2.049 ms, 112.0 B exactly).
 
 **The duplicate rate lands on the published one.** §5 records ~30% of LAION-2B as duplicated; this
@@ -391,15 +391,15 @@ regardless — but no general near-duplicate rate should be read out of this cor
 
 **Latency scales the way brute force is supposed to.** Text p50 is **flat at 2 µs** from 1,000 to
 12,007 documents; the vector arm goes 67 -> 102 -> 192 µs, essentially linear in the corpus, which
-is exactly what an exact scan predicts and what `p49` chose deliberately over a graph.
+is exactly what an exact scan predicts and what `p58` chose deliberately over a graph.
 
-**`p49`'s verdict is withheld, not passed.** The vectors are seeded noise with no visual semantics.
-The run prints `[HELD]` and `1 verdict(s) WITHHELD. This run does not pass p49 — it declines to
+**`p58`'s verdict is withheld, not passed.** The vectors are seeded noise with no visual semantics.
+The run prints `[HELD]` and `1 verdict(s) WITHHELD. This run does not pass p58 — it declines to
 answer it`, and §4's `UNVERIFIED` for image-embedding recall stays `UNVERIFIED` until a real encoder
 runs here.
 
 **Two things this run surfaced that were not planned.** The field-budget collision became
-[`p56`](bench/roadmap/p56-field-budget.md). And the expectation that scraped assets carry lying
+[`p65`](bench/roadmap/p65-field-budget.md). And the expectation that scraped assets carry lying
 extensions was **contradicted** — `meta::sniff` disagreed with the extension on **0** files, because
 this host serves what it stored and the scraper wrote the extension from the URL, so the two agree
 by construction. One Supabase-backed scrape is not the web; the sniff remains the right default, but
@@ -407,7 +407,7 @@ this run produces no evidence for it and says so.
 
 ### The tier through the C ABI, measured
 
-`p53` is closed on all four acceptance items. The same fused query returns **identical documents in
+`p62` is closed on all four acceptance items. The same fused query returns **identical documents in
 identical order** in Rust, in Node, in **headless Chromium 147** on the browser main thread, and
 through **`ctypes` in Python's standard library alone**. ABI 11 -> 12, 49 -> **61 symbols**, still
 no `wasm-bindgen` and still zero imports in the module.
@@ -444,7 +444,7 @@ round-trip, and leaves the transcode to the host.
 facial-recognition databases by untargeted scraping; every European Clearview decision rejects the
 "publicly available photos" defence, and the UK Upper Tribunal named **clustering facial vectors** as
 the triggering step. Google paid **$100 M** under BIPA for face-grouping inside users' *own*
-libraries. `p55` is therefore scoped to clustering caller-supplied vectors with no notion of
+libraries. `p64` is therefore scoped to clustering caller-supplied vectors with no notion of
 identity, and the model, the consent flow and the jurisdiction stay with the host.
 
 ## What we are NOT going to do

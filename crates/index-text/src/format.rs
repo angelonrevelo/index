@@ -34,7 +34,7 @@ use crate::index::{Field, Index, Schema};
 /// reader would run off the end of `meta` and an `8` reader would read a `7` file's `schema`
 /// section short. That is exactly the "plausible garbage" this format bumps to avoid, so the
 /// magic moved even though the table did not.
-pub const MAGIC: [u8; 8] = *b"IDXTEXT8";
+pub const MAGIC: [u8; 8] = *b"IDXTEXT9";
 
 /// The magic of every format version this crate has ever written, oldest first, so a reader can
 /// say *"that is an `IDXTEXT5` file, this build reads `IDXTEXT8`"* instead of *"bad magic"*.
@@ -175,6 +175,19 @@ impl Writer {
     fn u64(&mut self, v: u64) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
+    /// LEB128. Seven bits per byte, high bit continues.
+    ///
+    /// Used only where the values are known to be small and numerous — the position sections,
+    /// where `p45` measured the fixed-width form costing **2.2x the data it addressed**, because
+    /// most (term, document) pairs carry exactly one position and each was paying an eight-byte
+    /// offset to say so.
+    fn varint(&mut self, mut v: u64) {
+        while v >= 0x80 {
+            self.buf.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        self.buf.push(v as u8);
+    }
     fn f64(&mut self, v: f64) {
         self.buf.extend_from_slice(&v.to_bits().to_le_bytes());
     }
@@ -232,6 +245,36 @@ impl<'a> Reader<'a> {
         let v = u64::from_le_bytes(self.b[self.p..self.p + 8].try_into().unwrap());
         self.p += 8;
         Ok(v)
+    }
+    /// The explicit element count that prefixes each varint-encoded section.
+    fn varint_u64_count(&mut self) -> Result<usize, String> {
+        let n = self.u64()? as usize;
+        // A count larger than the section could possibly hold is corrupt; bound it before
+        // allocating, the same guard the expansion and facet sections use.
+        if n > self.b.len().saturating_sub(self.p).saturating_add(1) * 8 {
+            return Err(format!("section claims {n} entries, span cannot hold them"));
+        }
+        Ok(n)
+    }
+
+    /// LEB128, refusing an over-long encoding rather than silently wrapping.
+    fn varint(&mut self) -> Result<u64, String> {
+        let mut v = 0u64;
+        let mut shift = 0u32;
+        loop {
+            self.need(1)?;
+            let b = self.b[self.p];
+            self.p += 1;
+            // 10 groups of 7 bits is the most a u64 can hold; an 11th means corrupt input.
+            if shift >= 64 {
+                return Err("varint is longer than 64 bits".into());
+            }
+            v |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                return Ok(v);
+            }
+            shift += 7;
+        }
     }
     fn f64(&mut self) -> Result<f64, String> {
         Ok(f64::from_bits(self.u64()?))
@@ -486,15 +529,37 @@ impl Index {
         // Both spans are empty unless the index carries positions, and they are written together:
         // offsets without data, or data without offsets, is not a state a reader should have to
         // have an opinion about.
+        // Delta-varint, and `p45` is why: the offsets are monotone and almost always advance by
+        // ONE, because most (term, document) pairs carry a single position. Fixed-width `u64` spent
+        // eight bytes to say "+1" and made the offset array 2.2x the positions it addressed.
+        // Nothing at all when positions are off, so the default still costs ZERO bytes -- pinned
+        // by `an_index_without_positions_costs_no_position_bytes`.
         let start = w.here();
-        for v in s.position_at.iter() {
-            w.u64(*v);
+        if !s.position_at.is_empty() {
+            w.u64(s.position_at.len() as u64);
+            let mut prev = 0u64;
+            for v in s.position_at.iter() {
+                w.varint(v - prev);
+                prev = *v;
+            }
         }
         let position_at = w.span_from(start);
 
+        // Positions delta-varint WITHIN each posting run. They ascend inside a run and reset at the
+        // next one, so a global delta would go negative -- the run boundaries come from
+        // `position_at`, which is why that section is written first and read first.
         let start = w.here();
-        for v in s.position.iter() {
-            w.u32(*v);
+        if !s.position_at.is_empty() {
+            w.u64(s.position.len() as u64);
+        }
+        for run in s.position_at.windows(2) {
+            let (lo, hi) = (run[0] as usize, run[1] as usize);
+            let mut prev = 0u32;
+            for &v in &s.position[lo..hi] {
+                // First of a run is written whole; the rest as gaps from the previous.
+                w.varint((v - prev) as u64);
+                prev = v;
+            }
         }
         let position = w.span_from(start);
 
@@ -734,37 +799,49 @@ impl Index {
                 return Err("position data with no offset array".into());
             }
             let want = posting_count + 1;
-            if table.position_at.len as usize != want * 8 {
+            // Delta-varint since IDXTEXT9, so the section is no longer a fixed multiple of 8 and
+            // the count is written explicitly. Everything else is validated exactly as before:
+            // this is the section whose every failure is SILENT, because a short offset array hands
+            // the phrase verifier another posting's positions and it agrees with them.
+            let mut r = Reader::new(&buf[table.position_at.range()]);
+            let n_at = r.varint_u64_count()?;
+            if n_at != want {
                 return Err(format!(
-                    "position_at is {} bytes, expected {} for {posting_count} postings",
-                    table.position_at.len,
-                    want * 8
+                    "position_at holds {n_at} offsets, expected {want} for {posting_count} postings"
                 ));
             }
-            if table.position.len % 4 != 0 {
-                return Err(format!("position section {} is not a whole number of u32", table.position.len));
-            }
-            let entry = table.position.len / 4;
-            let mut r = Reader::new(&buf[table.position_at.range()]);
             let mut at = Vec::with_capacity(want);
-            let mut last = 0u64;
+            let mut acc = 0u64;
             for i in 0..want {
-                let v = r.u64()?;
-                // Non-decreasing and in bounds. Either violated makes `lo..hi` a panic or a slice
-                // of somebody else's positions.
-                if v < last || v > entry {
-                    return Err(format!("position_at[{i}] = {v} is out of order or past {entry}"));
+                acc = acc.checked_add(r.varint()?).ok_or("position_at overflowed")?;
+                // Non-decreasing by construction now (deltas are unsigned), so the remaining
+                // check is the upper bound, which a corrupt delta can still violate.
+                if i == 0 && acc != 0 {
+                    return Err(format!("position_at must start at 0, got {acc}"));
                 }
-                last = v;
-                at.push(v);
+                at.push(acc);
             }
-            if last != entry {
-                return Err(format!("position_at ends at {last} but {entry} positions were written"));
-            }
+
             let mut r = Reader::new(&buf[table.position.range()]);
-            let mut pos = Vec::with_capacity(entry as usize);
-            for _ in 0..entry {
-                pos.push(r.u32()?);
+            let entry = r.varint_u64_count()?;
+            if at[want - 1] != entry as u64 {
+                return Err(format!(
+                    "position_at ends at {} but {entry} positions were written",
+                    at[want - 1]
+                ));
+            }
+            let mut pos = Vec::with_capacity(entry);
+            for run in at.windows(2) {
+                let (lo, hi) = (run[0], run[1]);
+                if hi < lo || hi > entry as u64 {
+                    return Err(format!("position run {lo}..{hi} is out of order or past {entry}"));
+                }
+                let mut prev = 0u32;
+                for _ in lo..hi {
+                    let d = u32::try_from(r.varint()?).map_err(|_| "position delta exceeds u32")?;
+                    prev = prev.checked_add(d).ok_or("position overflowed u32")?;
+                    pos.push(prev);
+                }
             }
             ix.set_position(pos, at);
         }
@@ -1888,7 +1965,10 @@ mod tests {
         old[..MAGIC.len()].copy_from_slice(b"IDXTEXT7");
         let err = Index::from_bytes(&old).expect_err("an IDXTEXT7 file must be refused");
         assert!(err.contains("IDXTEXT7"), "must name the version found: {err}");
-        assert!(err.contains("IDXTEXT8"), "must name the version read: {err}");
+        // Compared against the CURRENT magic rather than a hard-coded one, so the next format
+        // bump does not have to remember to edit this line.
+        let now = std::str::from_utf8(&MAGIC).unwrap();
+        assert!(err.contains(now), "must name the version read ({now}): {err}");
 
         // Long enough to get past the head-length check, so it is the magic that rejects it.
         let mut foreign = built().to_bytes();
