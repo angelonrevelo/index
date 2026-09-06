@@ -116,6 +116,17 @@ fn run(clock: &Clock, kind: &str, stochastic: bool, base: &[u64], span: u64, sca
         col.piece_count(),
         if pass { "PASS" } else { "FAIL" }
     );
+    // Where the time actually goes: a cracked query is dominated by element movement, so the
+    // per-query move count is the number to watch, not the wall clock alone.
+    let stat = col.stat();
+    println!(
+        "                          moved/query={:>8.0}  sorted/query={:>6.0}  \
+         sorted-piece cracks={:>5}  index inserts={}",
+        stat.partition_element as f64 / QUERIES as f64,
+        stat.sort_element as f64 / QUERIES as f64,
+        stat.sorted_hit,
+        stat.index_insert
+    );
     pass
 }
 

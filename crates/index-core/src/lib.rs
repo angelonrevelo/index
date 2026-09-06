@@ -14,7 +14,7 @@ pub mod crack;
 pub mod data;
 pub mod fm;
 mod optimal;
-mod wavelet;
+pub mod wavelet;
 
 pub use crack::CrackerColumn;
 pub use fm::FmIndex;
@@ -36,6 +36,24 @@ pub struct SearchResult {
     pub pos: Option<usize>,
     /// Number of slots the bounded last-mile search was allowed to scan.
     pub window: usize,
+}
+
+/// Exact position of `key` inside the ε-window `key_arr[lo..hi)`, or `None`.
+///
+/// A branchless count of the keys below `key` beats `binary_search` here, and the gap widens with
+/// ε: at ε=16 the window is 33 keys spread over five cache lines, so a binary search pays four
+/// unpredictable branches to save four sequential loads the prefetcher was going to issue anyway.
+/// Measured across sequential/uniform/lognormal/hard at n=1M, the count wins at ε≥16 and wins by
+/// ~2x at ε=64 — which is what makes the larger, cheaper models usable at all. Table:
+/// `bench/roadmap/p74-core-primitive.md`.
+#[inline]
+fn last_mile(key_arr: &[u64], lo: usize, hi: usize, key: u64) -> Option<usize> {
+    let pos = lo + key_arr[lo..hi].iter().filter(|&&k| k < key).count();
+    if pos < key_arr.len() && key_arr[pos] == key {
+        Some(pos)
+    } else {
+        None
+    }
 }
 
 /// A learned index over a sorted, unique `&[u64]`. Maps a key to its position (rank).
@@ -122,18 +140,13 @@ impl PlaIndex {
         }
     }
 
-    /// Locate `key` via prediction + bounded last-mile binary search.
+    /// Locate `key` via prediction + a bounded last-mile scan.
     #[inline]
     pub fn search(&self, key: u64) -> SearchResult {
         let pred = self.predict(key);
         let lo = pred.saturating_sub(self.epsilon);
         let hi = (pred + self.epsilon + 1).min(self.n); // exclusive
-        let window = hi - lo;
-        let found = match self.keys[lo..hi].binary_search(&key) {
-            Ok(off) => Some(lo + off),
-            Err(_) => None,
-        };
-        SearchResult { pos: found, window }
+        SearchResult { pos: last_mile(&self.keys, lo, hi, key), window: hi - lo }
     }
 
     /// Number of segments (PLA model size in segments).
@@ -265,12 +278,7 @@ impl PgmIndex {
         let pred = predict_seg(seg, key, self.n);
         let lo = pred.saturating_sub(self.epsilon);
         let hi = (pred + self.epsilon + 1).min(self.n);
-        let window = hi - lo;
-        let found = match self.keys[lo..hi].binary_search(&key) {
-            Ok(off) => Some(lo + off),
-            Err(_) => None,
-        };
-        SearchResult { pos: found, window }
+        SearchResult { pos: last_mile(&self.keys, lo, hi, key), window: hi - lo }
     }
 
     pub fn height(&self) -> usize {
