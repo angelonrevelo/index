@@ -14,7 +14,11 @@
 // The worker speaks a tiny message protocol rather than exposing handles, because a sync access
 // handle is exclusive: two holders on one file is an error, so ownership stays here.
 
-/** Bytes of magic + section table. Mirrors `MAGIC.len() + TABLE_BYTE` in `format.rs`. */
+/** Bytes of magic + section table. Mirrors `MAGIC.len() + TABLE_BYTE` in `format.rs`.
+ *
+ * This is why `format.rs` holds the magic at eight bytes forever rather than letting it grow to
+ * `IDXTEXT10`: a range reader must know the head's SIZE before it can read the version out of it.
+ */
 const HEAD_BYTE = 8 + 18 * 16;
 
 let handle = null;
@@ -44,7 +48,7 @@ function readAt(h, at, len) {
 
 /** Decode the section table the same way `read_section_table` does: 18 spans of two little-endian u64. */
 function sections(head) {
-  if (String.fromCharCode(...head.subarray(0, 8)) !== 'IDXTEXT9') {
+  if (String.fromCharCode(...head.subarray(0, 8)) !== 'IDXTXT10') {
     throw new Error(`bad magic: ${String.fromCharCode(...head.subarray(0, 8))}`);
   }
   const dv = new DataView(head.buffer, head.byteOffset + 8);

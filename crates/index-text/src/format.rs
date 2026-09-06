@@ -22,29 +22,44 @@
 use crate::analyze::AliasTable;
 use crate::index::{Field, Index, Schema};
 
-/// `"IDXTEXT8"` — magic plus format version in eight bytes.
+/// `"IDXTEXT10"` — magic plus format version.
 ///
-/// The trailing digit has moved 1 -> 8 as sections were added: priors (`2`), facets (`3`),
+/// The trailing number has moved 1 -> 10 as sections were added: priors (`2`), facets (`3`),
 /// multi-slot facets (`4`, same span count but a different encoding), numeric columns (`5`),
-/// token positions (`6`), document keys (`7`), unscored columns (`8`).
+/// token positions (`6`), document keys (`7`), unscored columns (`8`), delta-varint position
+/// sections (`9`), delta-varint posting lists (`10`).
 /// Every bump is forced by the `TABLE_BYTE` assertion in the tests rather than remembered.
 ///
-/// `8` did **not** widen the section table. It appended an unscored-column count to `meta` and
-/// unscored-column names to `schema` (`p56`), and both sections are read positionally — a `7`
-/// reader would run off the end of `meta` and an `8` reader would read a `7` file's `schema`
-/// section short. That is exactly the "plausible garbage" this format bumps to avoid, so the
-/// magic moved even though the table did not.
-pub const MAGIC: [u8; 8] = *b"IDXTEXT9";
+/// **`10` is nine bytes, not eight.** The version outgrew the digit the magic reserved for it,
+/// which widens the head by one and moves the section table with it -- unavoidable without
+/// abandoning the version number, and every offset in the file is absolute from the start of it,
+/// so nothing else shifts.
+///
+/// The last two bumps did **not** widen the section table — they changed the ENCODING of a
+/// section that was already there, which is the same incompatibility in fewer bytes. A `9`
+/// reader decoding a `10` posting section would read a varint list count as a `u32` document id
+/// and the bytes after it as term frequencies, and every answer it returned would be a confident
+/// wrong one. That is exactly the "plausible garbage" this format bumps to avoid, so the magic
+/// moved even though the table did not.
+/// **Eight bytes, always.** The `E` is dropped at version 10 rather than letting the magic grow to
+/// nine, because a RANGE reader has to know how many bytes the head is BEFORE it can know the
+/// version — read 297 and you mis-parse a v9 file, read 296 and you mis-parse a v10 one. A
+/// fixed-width magic keeps `MAGIC.len() + TABLE_BYTE` a constant a browser can fetch blind, which
+/// is what `js/opfs-worker.mjs` does and what `p68` publishes as "296 bytes to open any file".
+pub const MAGIC: [u8; 8] = *b"IDXTXT10";
 
 /// The magic of every format version this crate has ever written, oldest first, so a reader can
-/// say *"that is an `IDXTEXT5` file, this build reads `IDXTEXT8`"* instead of *"bad magic"*.
+/// say *"that is an `IDXTEXT9` file, this build reads `IDXTEXT10`"* instead of *"bad magic"*.
 ///
 /// An index is a file a consumer keeps. Telling them their file is a stale version they must
 /// rebuild is a different instruction from telling them it is not an index at all, and only one of
 /// those is true when the digit moves.
-const KNOWN_MAGIC: [&[u8; 8]; 8] = [
+///
+/// All of these are eight bytes, so the match is exact rather than a prefix — see `MAGIC` for why
+/// the width is held constant instead of growing at version 10.
+const KNOWN_MAGIC: [&[u8]; 9] = [
     b"IDXTEXT1", b"IDXTEXT2", b"IDXTEXT3", b"IDXTEXT4", b"IDXTEXT5", b"IDXTEXT6", b"IDXTEXT7",
-    b"IDXTEXT8",
+    b"IDXTEXT8", b"IDXTEXT9",
 ];
 
 /// Explain a magic mismatch: an older (or newer) `IDXTEXT` version, or not an index at all.
@@ -53,15 +68,20 @@ fn magic_error(head: &[u8]) -> String {
     if head.len() < MAGIC.len() {
         return format!("need {} bytes of magic, got {}", MAGIC.len(), head.len());
     }
-    let got: [u8; 8] = head[..MAGIC.len()].try_into().unwrap();
-    if KNOWN_MAGIC.contains(&&got) {
-        let seen = String::from_utf8_lossy(&got).into_owned();
+    let got = &head[..MAGIC.len()];
+    // Newest first, so that once a nine-byte version is known it is named rather than the
+    // eight-byte prefix it starts with.
+    for known in KNOWN_MAGIC.iter().rev() {
+        if !got.starts_with(known) {
+            continue;
+        }
+        let seen = String::from_utf8_lossy(known).into_owned();
         return format!(
             "{seen} file, but this build reads {this} — an older index-text format version,              rebuild the index"
         );
     }
     if got.starts_with(b"IDXTEXT") {
-        let seen = String::from_utf8_lossy(&got).into_owned();
+        let seen = String::from_utf8_lossy(got).into_owned();
         return format!("{seen} file, but this build reads {this} — unknown format version");
     }
     format!("bad magic — not an index-text file (this build reads {this})")
@@ -90,7 +110,26 @@ pub struct SectionTable {
     /// The serialized FST.
     pub dict: Span,
     /// `term_count + 1` `u64` offsets into `posting`, cumulative. Entry `i..i+1` bounds term `i`.
+    ///
+    /// Still fixed width, deliberately: this is the array a range reader fetches to turn a term
+    /// into a byte range, so it has to be indexable without decoding anything before it.
     pub posting_offset: Span,
+    /// Delta-varint posting lists, one per term, in the order [`SectionTable::posting_offset`]
+    /// bounds. Each list is self-describing: a varint **posting count**, then that many postings
+    /// of a varint **document-id delta** followed by `MAX_FIELD` varint term frequencies. The
+    /// first document of a list is written whole; the rest are gaps from the previous, because
+    /// document ids ascend within a list.
+    ///
+    /// Fixed width through `IDXTEXT9` (`u32` doc + `MAX_FIELD` × `u16`), and `p54` is the
+    /// precedent: it measured the position sections paying eight bytes to say *"+1"*. The same
+    /// was true here -- postings are the largest section in the file, and most of the bytes in
+    /// one were a four-byte document id whose delta from the previous posting is usually 1, plus
+    /// an array of term frequencies that are usually 0 and 1.
+    ///
+    /// The count is written because a variable-width section has no stride to check a length
+    /// against, and a posting list is a place where a wrong length is a wrong ANSWER: reading
+    /// one posting too few silently drops a document from a term, and one too many steals the
+    /// next term's first posting.
     pub posting: Span,
     pub doc_len: Span,
     /// `doc_count` × `f32` static priors, or a **zero-length span** when the index has none.
@@ -153,8 +192,6 @@ pub struct SectionTable {
     pub doc_key: Span,
 }
 
-/// Bytes on the wire for one posting: `u32` doc id + `MAX_FIELD` × `u16` term frequency.
-const POSTING_BYTE: usize = 4 + 2 * crate::index::MAX_FIELD;
 /// Section table is 18 spans × 2 × u64.
 const TABLE_BYTE: usize = 18 * 16;
 
@@ -227,12 +264,6 @@ impl<'a> Reader<'a> {
             Some(end) if end <= self.b.len() => Ok(()),
             _ => Err(format!("truncated: want {n} bytes at {} of {}", self.p, self.b.len())),
         }
-    }
-    fn u16(&mut self) -> Result<u16, String> {
-        self.need(2)?;
-        let v = u16::from_le_bytes(self.b[self.p..self.p + 2].try_into().unwrap());
-        self.p += 2;
-        Ok(v)
     }
     fn u32(&mut self) -> Result<u32, String> {
         self.need(4)?;
@@ -356,6 +387,53 @@ pub fn posting_span(
     Ok(Span { offset: table.posting.offset + a, len: b - a })
 }
 
+/// Decode one term's posting list from its own byte range.
+///
+/// This is the range-read unit -- the decode a browser performs on the bytes [`posting_span`]
+/// hands back -- and it is also the decode [`Index::from_bytes`] performs on every span of the
+/// posting section, so the two cannot drift apart.
+///
+/// Strict by the standard `p54` set for the position sections, because the failure here is a
+/// wrong ANSWER rather than a failed load: a count is written explicitly and bounded by the span
+/// before it is trusted, every accumulation is `checked_add`, document ids must strictly ascend
+/// (which the delta encoding depends on), and the span must be consumed EXACTLY -- the check
+/// fixed width used to give for free, since `len % POSTING_BYTE == 0` no longer exists.
+fn read_posting_list(b: &[u8]) -> Result<Vec<(u32, [u16; crate::index::MAX_FIELD])>, String> {
+    let mut r = Reader::new(b);
+    let n = r.varint()?;
+    let n = usize::try_from(n).map_err(|_| "posting count exceeds usize".to_string())?;
+    // A posting costs at least one byte for its document delta and one per field, so a count
+    // the rest of the span is too small to hold is corrupt. Bounded before allocating.
+    let room = r.b.len().saturating_sub(r.p);
+    if n > room {
+        return Err(format!("posting list claims {n} postings, {room} bytes left in its span"));
+    }
+    let mut list = Vec::with_capacity(n);
+    let mut prev = 0u32;
+    for i in 0..n {
+        let delta = u32::try_from(r.varint()?).map_err(|_| "document delta exceeds u32")?;
+        // Strictly ascending, so a zero delta is one document posted twice. Refused rather than
+        // tolerated: two entries for one document double-count it, and BM25 would score it twice.
+        if i > 0 && delta == 0 {
+            return Err(format!("posting {i} repeats document {prev}"));
+        }
+        let doc = prev.checked_add(delta).ok_or("document id overflowed u32")?;
+        prev = doc;
+        let mut tf = [0u16; crate::index::MAX_FIELD];
+        for t in tf.iter_mut() {
+            *t = u16::try_from(r.varint()?).map_err(|_| "term frequency exceeds u16")?;
+        }
+        list.push((doc, tf));
+    }
+    if r.p != r.b.len() {
+        return Err(format!(
+            "posting list has {} bytes left after its {n} postings",
+            r.b.len() - r.p
+        ));
+    }
+    Ok(list)
+}
+
 impl Index {
     /// Serialize to the portable format.
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -406,26 +484,42 @@ impl Index {
         w.buf.extend_from_slice(&s.dict_bytes);
         let dict = w.span_from(start);
 
+        // The postings are encoded FIRST, into their own buffer: the offset array that addresses
+        // them is written before them in the file, and a variable-width encoding has no stride
+        // to compute those offsets from -- they can only be measured.
+        let mut post = Writer::new();
+        let mut list_byte: Vec<u64> = Vec::with_capacity(s.posting.len());
+        for list in s.posting.iter() {
+            let at = post.here();
+            // The count is per LIST rather than once for the section, so one list still decodes
+            // on its own: that is the range-read property this format exists to provide.
+            post.varint(list.len() as u64);
+            let mut prev = 0u32;
+            for p in list.iter() {
+                // Document ids ascend within a list, so the first is written whole and every
+                // later one is the gap from its predecessor -- usually 1, and one byte to say so.
+                post.varint((p.0 - prev) as u64);
+                prev = p.0;
+                for v in p.1.iter() {
+                    post.varint(*v as u64);
+                }
+            }
+            list_byte.push(post.here() - at);
+        }
+
         // Offsets are relative to the start of the posting section, so the section can be
         // relocated or fetched independently.
         let start = w.here();
         let mut acc: u64 = 0;
         w.u64(0);
-        for list in s.posting.iter() {
-            acc += (list.len() * POSTING_BYTE) as u64;
+        for byte in list_byte.iter() {
+            acc += byte;
             w.u64(acc);
         }
         let posting_offset = w.span_from(start);
 
         let start = w.here();
-        for list in s.posting.iter() {
-            for p in list.iter() {
-                w.u32(p.0);
-                for v in p.1.iter() {
-                    w.u16(*v);
-                }
-            }
-        }
+        w.buf.extend_from_slice(&post.buf);
         let posting = w.span_from(start);
 
         let start = w.here();
@@ -682,25 +776,20 @@ impl Index {
         let term_count = off.len() / 8 - 1;
         let get = |k: usize| -> u64 { u64::from_le_bytes(off[k * 8..k * 8 + 8].try_into().unwrap()) };
         let post_bytes = &buf[table.posting.range()];
-        // Total postings across every term -- the count `position_at` must have one entry for,
-        // plus a terminator. Taken from the offset array so it cannot drift from what was read.
-        let posting_count = post_bytes.len() / POSTING_BYTE;
         let mut posting = Vec::with_capacity(term_count);
+        // Total postings across every term -- the count `position_at` must have one entry for,
+        // plus a terminator. Summed from what was actually decoded, so it cannot drift from it.
+        let mut posting_count = 0usize;
         for i in 0..term_count {
-            let (a, b) = (get(i) as usize, get(i + 1) as usize);
-            if b < a || b > post_bytes.len() || (b - a) % POSTING_BYTE != 0 {
+            let (a, b) = (get(i), get(i + 1));
+            // Checked as `u64` before narrowing: on a 32-bit target a cast would silently
+            // truncate an offset back into range and read the wrong bytes as a posting list.
+            if b < a || b > post_bytes.len() as u64 {
                 return Err(format!("posting list {i} has a malformed span {a}..{b}"));
             }
-            let mut list = Vec::with_capacity((b - a) / POSTING_BYTE);
-            let mut pr = Reader::new(&post_bytes[a..b]);
-            while pr.p < pr.b.len() {
-                let doc = pr.u32()?;
-                let mut tf = [0u16; crate::index::MAX_FIELD];
-                for t in tf.iter_mut() {
-                    *t = pr.u16()?;
-                }
-                list.push((doc, tf));
-            }
+            let list = read_posting_list(&post_bytes[a as usize..b as usize])
+                .map_err(|e| format!("posting list {i}: {e}"))?;
+            posting_count = posting_count.checked_add(list.len()).ok_or("posting count overflowed")?;
             posting.push(list);
         }
 
@@ -798,7 +887,7 @@ impl Index {
             if table.position_at.len == 0 {
                 return Err("position data with no offset array".into());
             }
-            let want = posting_count + 1;
+            let want = posting_count.checked_add(1).ok_or("posting count overflowed")?;
             // Delta-varint since IDXTEXT9, so the section is no longer a fixed multiple of 8 and
             // the count is written explicitly. Everything else is validated exactly as before:
             // this is the section whose every failure is SILENT, because a short offset array hands
@@ -1025,13 +1114,14 @@ mod tests {
         let term_id = ix.term_id_of("colgate").expect("term present");
         let span = posting_span(&table, offsets, term_id).unwrap();
 
-        // ...then only that one list.
+        // ...then only that one list. It carries its own count, so it decodes standalone --
+        // which is the property a fixed-width posting list used to get from its stride.
         assert!(span.len > 0, "colgate must have a non-empty posting list");
         let slice = &bytes[span.range()];
-        assert_eq!(slice.len() % POSTING_BYTE, 0);
+        let list = read_posting_list(slice).expect("a fetched list decodes on its own");
 
-        let doc = u32::from_le_bytes(slice[0..4].try_into().unwrap());
-        assert_eq!(doc, 3, "colgate appears in document 3");
+        assert_eq!(list.len(), 1, "colgate appears in one document");
+        assert_eq!(list[0].0, 3, "colgate appears in document 3");
         assert_eq!(ix.search("colgate", 1)[0].doc, 3, "and the engine agrees");
 
         // And the bytes actually touched are a small fraction of the file.
@@ -1961,10 +2051,13 @@ mod tests {
     /// of them is true.
     #[test]
     fn an_older_format_version_is_named_rather_than_called_garbage() {
+        // Versions `9` and earlier are eight bytes, one shorter than `IDXTEXT10`, so the byte
+        // after the magic belongs to the section table and is left alone -- that is exactly what
+        // a real older file looks like.
         let mut old = built().to_bytes();
-        old[..MAGIC.len()].copy_from_slice(b"IDXTEXT7");
-        let err = Index::from_bytes(&old).expect_err("an IDXTEXT7 file must be refused");
-        assert!(err.contains("IDXTEXT7"), "must name the version found: {err}");
+        old[..8].copy_from_slice(b"IDXTEXT9");
+        let err = Index::from_bytes(&old).expect_err("an IDXTEXT9 file must be refused");
+        assert!(err.contains("IDXTEXT9"), "must name the version found: {err}");
         // Compared against the CURRENT magic rather than a hard-coded one, so the next format
         // bump does not have to remember to edit this line.
         let now = std::str::from_utf8(&MAGIC).unwrap();
@@ -1972,7 +2065,7 @@ mod tests {
 
         // Long enough to get past the head-length check, so it is the magic that rejects it.
         let mut foreign = built().to_bytes();
-        foreign[..MAGIC.len()].copy_from_slice(b"PARQUET1");
+        foreign[..8].copy_from_slice(b"PARQUET1");
         let err = Index::from_bytes(&foreign).expect_err("not an index");
         assert!(err.contains("not an index-text file"), "{err}");
         assert!(!err.contains("rebuild"), "a foreign file is not a stale index: {err}");
@@ -2025,7 +2118,13 @@ mod tests {
         assert_eq!(wide_post, lean_post, "posting section grew by {} B", wide_post - lean_post);
         assert_eq!(wide_len, lean_len, "doc_len section grew");
         assert_eq!(wide_bytes, lean_bytes, "a posting byte moved");
-        assert_eq!(POSTING_BYTE, 4 + 2 * crate::index::MAX_FIELD, "the per-posting array widened");
+        // ...and still exactly `MAX_FIELD` term frequencies per posting over the SCORED fields,
+        // which is why no byte moved: five columns add no slot to that array.
+        assert_eq!(
+            wide.schema().field.len(),
+            lean.schema().field.len(),
+            "a column must not widen the per-posting array"
+        );
 
         // ...and the columns are genuinely there, so this is not measuring two identical indexes.
         assert_eq!(wide.facet_slot_count(), 2);
