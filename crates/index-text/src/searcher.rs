@@ -55,6 +55,38 @@ use crate::index::{Hit, Index};
 /// allowing a full day of ingest between rebuilds on a typical corpus.
 pub const DEFAULT_COMPACTION_RATIO: f32 = 0.2;
 
+/// Least estimated serial work, as `segment_count * doc_count`, worth fanning across OS threads.
+/// See [`Searcher::wants_thread`] for where this number comes from and what it costs to be wrong.
+pub const PARALLEL_WORK_MIN: usize = 4_500_000;
+
+/// Logical CPUs, resolved once. `available_parallelism` is a syscall on every platform this runs
+/// on, and a query path must not pay for it per call.
+fn cpu_count() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
+/// A process-wide kill switch for the threaded fan-out: `INDEX_PARALLEL=0` forces every collection
+/// onto the serial path, `INDEX_PARALLEL=1` forces every multi-segment one onto threads.
+///
+/// It exists because **the win could not otherwise be measured on this machine.** `p38`'s own
+/// header says why -- its one-segment p50 swung 15 -> 30 us between runs while the quality columns
+/// stayed bit-identical -- so a serial number from one process and a threaded number from the next
+/// are not a comparison. With this, both arms run interleaved in one process, which is the method
+/// `p27`, `p46` and `p52` already use here. It is also the switch an embedder wants when the host
+/// owns its own thread budget: a WASM build, or a server that has already given every core to a
+/// request pool, should not have a library spawning underneath it.
+///
+/// Read once. An env lookup on a query path would cost more than the threads save.
+fn env_override() -> Option<bool> {
+    static V: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("INDEX_PARALLEL").ok()?.as_str() {
+        "0" | "off" | "false" => Some(false),
+        "1" | "on" | "true" => Some(true),
+        _ => None,
+    })
+}
+
 /// An ordered set of immutable segments, searched as one collection.
 pub struct Searcher {
     segment: Vec<Index>,
@@ -64,6 +96,10 @@ pub struct Searcher {
     compaction_ratio: f32,
     /// Whether to score against collection-wide statistics. See [`Searcher::set_collection_stat`].
     collection_stat: bool,
+    /// Overrides the size gate in [`Searcher::wants_thread`]. Exists so a test can force the
+    /// threaded path onto a collection small enough to hold an expected answer by hand -- proving
+    /// the two paths agree at all is only possible if both can be made to run on the same rows.
+    force_thread: Option<bool>,
 }
 
 impl std::fmt::Debug for Searcher {
@@ -87,6 +123,7 @@ impl Searcher {
             doc_count: n,
             compaction_ratio: DEFAULT_COMPACTION_RATIO,
             collection_stat: true,
+            force_thread: None,
         };
         // A one-segment collection already scores correctly, but setting it here means every path
         // that reads `collection_size` sees the same thing whether there is one segment or ten.
@@ -149,6 +186,12 @@ impl Searcher {
         self.collection_stat
     }
 
+    /// Force or forbid the threaded per-segment fan-out, ignoring the size gate.
+    #[cfg(test)]
+    fn set_force_thread(&mut self, forced: Option<bool>) {
+        self.force_thread = forced;
+    }
+
     /// Collection-wide statistics for `query`: the first half of a `dfs_query_then_fetch`.
     ///
     /// Every segment reports the `(term text, df)` pairs it would plan; they are summed by TEXT,
@@ -161,9 +204,13 @@ impl Searcher {
         if !self.collection_stat || self.segment.len() < 2 {
             return None;
         }
+        // Fanned out, but still a COMPLETE pass: every segment's `term_stat` is joined and summed
+        // before a single scoring call is made. The two passes cannot interleave -- a segment that
+        // began scoring against a partial `df` would rank against a corpus that does not exist.
+        let per = self.fan(|_, s| s.term_stat(query, prefix_last));
         let mut df: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for s in &self.segment {
-            for (text, d) in s.term_stat(query, prefix_last) {
+        for stat in per {
+            for (text, d) in stat {
                 *df.entry(text).or_insert(0) += d;
             }
         }
@@ -483,9 +530,10 @@ impl Searcher {
     ///
     /// Deleted documents are excluded by each segment, so the counts are live counts.
     pub fn facet_tally_at(&self, query: &str, slot: usize) -> Vec<(String, usize)> {
+        let per = self.fan(|_, ix| ix.facet_tally_at(query, slot));
         let mut total: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-        for ix in &self.segment {
-            for (label, n) in ix.facet_tally_at(query, slot) {
+        for tally in per {
+            for (label, n) in tally {
                 *total.entry(label).or_default() += n;
             }
         }
@@ -504,8 +552,8 @@ impl Searcher {
     /// segments, so unlike a facet tally these counts add elementwise with no key to reconcile.
     pub fn range_tally(&self, query: &str, slot: usize, edge: &[f64]) -> Vec<usize> {
         let mut total = vec![0usize; edge.len().saturating_sub(1)];
-        for ix in &self.segment {
-            for (i, n) in ix.range_tally(query, slot, edge).into_iter().enumerate() {
+        for bucket in self.fan(|_, ix| ix.range_tally(query, slot, edge)) {
+            for (i, n) in bucket.into_iter().enumerate() {
                 if let Some(t) = total.get_mut(i) {
                     *t += n;
                 }
@@ -538,15 +586,21 @@ impl Searcher {
         }
         // Cannot reuse `merge`: that orders by rank, and this orders by value. Collect with the
         // originating segment so the value can be read back after globalisation.
-        let mut all: Vec<(f64, Hit)> = Vec::new();
-        for (i, ix) in self.segment.iter().enumerate() {
+        // The value is read back inside the fan-out, while the producing segment is still in hand.
+        let part = self.fan(|i, ix| {
             let base = self.base[i];
+            let mut out: Vec<(f64, Hit)> = Vec::new();
             for h in ix.search_sorted_filtered(query, k, slot, ascending, want, range) {
                 let Some(v) = ix.numeric_of(h.doc, slot) else { continue };
                 let mut g = h;
                 g.doc += base;
-                all.push((v, g));
+                out.push((v, g));
             }
+            out
+        });
+        let mut all: Vec<(f64, Hit)> = Vec::new();
+        for chunk in part {
+            all.extend(chunk);
         }
         all.sort_by(|a, b| {
             let primary = if ascending { a.0.total_cmp(&b.0) } else { b.0.total_cmp(&a.0) };
@@ -614,17 +668,122 @@ impl Searcher {
         }
     }
 
-    fn merge(&self, k: usize, mut per_segment: impl FnMut(&Index) -> Vec<Hit>) -> Vec<Hit> {
+    /// Whether this collection is large enough that fanning a per-segment pass across OS threads
+    /// pays for the threads.
+    ///
+    /// **The threshold is a work estimate, not a segment count, and the difference is the whole
+    /// point.** Segment count alone would thread a 50-segment collection of 200 documents, which
+    /// does fifty times nothing and pays fifty spawns for it. Document count alone would thread a
+    /// single huge segment, which cannot be split at all. What predicts the serial cost is their
+    /// PRODUCT -- every segment is scanned for every query -- so that is what is gated on.
+    ///
+    /// **Why the number is this large.** `std::thread::scope` spawns fresh OS threads on every
+    /// call. There is no pool, and building one would need either a dependency this repo does not
+    /// take or `unsafe` to launder a non-`'static` closure. Measured on this Windows workstation, a
+    /// scope that spawns and joins does nothing else costs **~550 us for one thread and ~1.4 ms for
+    /// fifteen** -- sublinear, because the spawns overlap, but a floor of over a millisecond per
+    /// query either way. And a `search` pays it TWICE: `p52`'s statistics pass and the scoring pass
+    /// are two separate fan-outs, because they must not interleave.
+    ///
+    /// So the fan-out has to displace roughly **3 ms of serial work** before it is worth starting.
+    /// `p38`'s ladder on presyo's 241,789 real products prices that directly -- serial p50 is 883 us
+    /// at 10 segments and 8,014 us at 50 -- which puts the cost at about 6.6e-4 us per
+    /// segment-document and the 3 ms break-even at `segment_count * doc_count >= 4.5e6`. Against
+    /// that ladder the gate picks exactly the rungs that win: 10 segments scores 2.4e6 and stays
+    /// serial (forcing threads there measured 883 us -> 1,473 us, a LOSS); 25 scores 6.0e6 and 50
+    /// scores 1.2e7, and both win (3,832 -> 2,603 us and 8,014 -> 3,823 us).
+    ///
+    /// The constant is calibrated to one machine and says so. It is deliberately conservative: a
+    /// collection that fails the gate runs exactly the code it ran before, so being wrong low costs
+    /// nothing and being wrong high costs every query a millisecond.
+    ///
+    /// `INDEX_PARALLEL` overrides it in either direction; see [`env_override`].
+    fn wants_thread(&self) -> bool {
+        if self.segment.len() < 2 || cpu_count() < 2 {
+            return false;
+        }
+        if let Some(forced) = self.force_thread.or_else(env_override) {
+            return forced;
+        }
+        self.segment.len().saturating_mul(self.doc_count) >= PARALLEL_WORK_MIN
+    }
+
+    /// Run `f` once per segment and return the results **in segment order**, on threads when the
+    /// collection is big enough to want them.
+    ///
+    /// Order is the whole contract. `base[i]` turns a segment-local ordinal into a global one and
+    /// the merge comparators break ties on that global ordinal, so a result assembled in COMPLETION
+    /// order would rank non-deterministically -- on a corpus this repo already measures as 69 %
+    /// near-ties, that reshuffle is invisible until it reaches a user. Each unit of work therefore
+    /// carries its segment index and the collected pairs are sorted by it before anything is
+    /// returned: the output is identical to the serial loop whichever path ran.
+    ///
+    /// Work is claimed from a shared counter rather than sliced up front, because segments are
+    /// deliberately uneven: the shape an appending application produces is one large base plus many
+    /// small deltas, and a static split would hand one thread the base and leave the rest idle.
+    ///
+    /// The lifetime is explicit so a per-segment result may BORROW from its segment -- a facet
+    /// tally hands back `&str` labels interned in the segment, and copying them to satisfy a
+    /// higher-ranked bound would be an allocation the serial path never made.
+    fn fan<'a, T: Send>(&'a self, f: impl Fn(usize, &'a Index) -> T + Sync) -> Vec<T> {
+        if !self.wants_thread() {
+            return self.segment.iter().enumerate().map(|(i, ix)| f(i, ix)).collect();
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let segment = &self.segment;
+        let next = AtomicUsize::new(0);
+        let f = &f;
+        // One claimant per CPU, never more than there are segments. The calling thread is one of
+        // them, so only `worker - 1` are spawned: a spawn saved is a spawn not paid for.
+        let worker = cpu_count().min(segment.len());
+        let claim = || {
+            let mut out: Vec<(usize, T)> = Vec::new();
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                match segment.get(i) {
+                    Some(ix) => out.push((i, f(i, ix))),
+                    None => return out,
+                }
+            }
+        };
+
+        let mut part: Vec<Vec<(usize, T)>> = std::thread::scope(|scope| {
+            let handle: Vec<_> = (1..worker).map(|_| scope.spawn(claim)).collect();
+            let mut part = vec![claim()];
+            for h in handle {
+                // A panic inside a segment scan is a bug, not a condition to swallow: re-raise it
+                // here so it surfaces where the serial path would have raised it.
+                match h.join() {
+                    Ok(v) => part.push(v),
+                    Err(e) => std::panic::resume_unwind(e),
+                }
+            }
+            part
+        });
+
+        let mut all: Vec<(usize, T)> = part.drain(..).flatten().collect();
+        all.sort_unstable_by_key(|(i, _)| *i);
+        all.into_iter().map(|(_, t)| t).collect()
+    }
+
+    fn merge(&self, k: usize, per_segment: impl Fn(&Index) -> Vec<Hit> + Sync) -> Vec<Hit> {
         if k == 0 {
             return Vec::new();
         }
-        let mut all: Vec<Hit> = Vec::with_capacity(k * self.segment.len());
-        for (i, ix) in self.segment.iter().enumerate() {
+        // Globalising inside the fan-out keeps the merge a plain concatenation, and means a
+        // segment-local ordinal never escapes the thread that produced it.
+        let part = self.fan(|i, ix| {
             let base = self.base[i];
-            all.extend(per_segment(ix).into_iter().map(|mut h| {
+            let mut hit = per_segment(ix);
+            for h in &mut hit {
                 h.doc += base;
-                h
-            }));
+            }
+            hit
+        });
+        let mut all: Vec<Hit> = Vec::with_capacity(k * self.segment.len());
+        for hit in part {
+            all.extend(hit);
         }
         all.sort_by(crate::index::rank_cmp);
         all.truncate(k);
@@ -1224,6 +1383,143 @@ mod tests {
         assert!(!sr.delete(99));
         assert!(!sr.is_deleted(99));
         assert_eq!(sr.live_count(), 1);
+    }
+
+    /// **The threaded fan-out must return the SAME answer, not a comparable one.**
+    ///
+    /// The failure this exists to catch is the one parallelism actually causes here: results
+    /// assembled in COMPLETION order rather than SEGMENT order. `base[i]` turns a local ordinal
+    /// into a global one and the rank comparator breaks ties on that global ordinal, so a
+    /// collection whose segments finish out of order ranks differently from run to run -- and on
+    /// this corpus, 69 % of whose queries have a top-10 spanning under 5 %, that reshuffle is
+    /// invisible right up until a user sees it.
+    ///
+    /// Every parallelised entry point is compared: both `stat_for` call sites (`search`,
+    /// `search_prefix`), the merge-based ones, the value-ordered `search_sorted_filtered`, and the
+    /// two tallies whose merge is keyed on a string interned per segment. The arms run on identical
+    /// rows and an identical segment set, differing only in `force_thread` -- so any difference
+    /// between them is scheduling and nothing else.
+    #[test]
+    fn the_threaded_path_returns_a_bit_identical_answer_to_the_serial_one() {
+        use crate::index::FacetClause;
+
+        // Eight segments, deliberately uneven and interning the same labels at different ids, so
+        // the work-claiming loop has real skew to reorder and the tally has real ids to confuse.
+        let seg: [&[(&str, &str, &str)]; 8] = [
+            &[
+                ("Colgate Toothpaste Large", "Colgate", "150"),
+                ("Aquafresh Toothpaste Mini", "Aquafresh", "50"),
+                ("Colgate Toothpaste Whitening", "Colgate", "120"),
+                ("Oral B Toothpaste Pro", "Oral B", "90"),
+            ],
+            &[("Aquafresh Toothpaste Twin", "Aquafresh", "100")],
+            &[
+                ("Colgate Toothpaste Travel", "Colgate", "25"),
+                ("Oral B Toothpaste Twin", "Oral B", "110"),
+            ],
+            &[("Aquafresh Toothpaste Family", "Aquafresh", "300")],
+            &[
+                ("Oral B Toothpaste Mini", "Oral B", "40"),
+                ("Colgate Toothpaste Family", "Colgate", "250"),
+            ],
+            &[("Colgate Toothpaste Herbal", "Colgate", "75")],
+            &[("Aquafresh Toothpaste Kids", "Aquafresh", "60")],
+            &[
+                ("Oral B Toothpaste Family", "Oral B", "260"),
+                ("Colgate Toothpaste Charcoal", "Colgate", "80"),
+            ],
+        ];
+        let assemble = || {
+            let mut s = Searcher::new(shop(seg[0]));
+            for row in &seg[1..] {
+                s.push(shop(row));
+            }
+            s
+        };
+
+        let mut serial = assemble();
+        serial.set_force_thread(Some(false));
+        let mut threaded = assemble();
+        threaded.set_force_thread(Some(true));
+        assert_eq!(serial.segment_count(), 8);
+        assert!(serial.collection_stat(), "p52's two-pass path is the one under test");
+
+        let q = "Toothpaste";
+        let value: [&str; 2] = ["Colgate", "Oral B"];
+        let clause = [FacetClause::any(0, &value)];
+
+        // Compared as whole `Hit`s, not just ordinals: score is what a reordered merge would move.
+        let cmp = |a: Vec<Hit>, b: Vec<Hit>, what: &str| {
+            assert_eq!(a.len(), b.len(), "{what}: length");
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert_eq!(x.doc, y.doc, "{what}: ordinal");
+                assert_eq!(x.score.to_bits(), y.score.to_bits(), "{what}: score bits");
+            }
+            assert!(!a.is_empty(), "{what}: an empty result would prove nothing");
+        };
+
+        cmp(serial.search(q, 10), threaded.search(q, 10), "search");
+        cmp(serial.search_prefix("Toothp", 10), threaded.search_prefix("Toothp", 10), "prefix");
+        cmp(serial.search_page(q, 3, 5), threaded.search_page(q, 3, 5), "page");
+        cmp(serial.search_facet(q, 10, "Colgate"), threaded.search_facet(q, 10, "Colgate"), "facet");
+        cmp(
+            serial.search_range(q, 10, 0, 50.0, 200.0),
+            threaded.search_range(q, 10, 0, 50.0, 200.0),
+            "range",
+        );
+        cmp(
+            serial.search_clause(q, 5, 1, &clause, &[(0, 30.0, 300.0)]),
+            threaded.search_clause(q, 5, 1, &clause, &[(0, 30.0, 300.0)]),
+            "clause",
+        );
+        cmp(serial.search_sorted(q, 10, 0, true), threaded.search_sorted(q, 10, 0, true), "sort up");
+        cmp(serial.search_sorted(q, 4, 0, false), threaded.search_sorted(q, 4, 0, false), "sort dn");
+
+        assert_eq!(serial.facet_tally(q), threaded.facet_tally(q), "facet tally");
+        let edge = [0.0, 100.0, 200.0, 400.0];
+        assert_eq!(serial.range_tally(q, 0, &edge), threaded.range_tally(q, 0, &edge), "histogram");
+
+        // Phrase needs positions, which `shop` does not record, so it gets its own segment set.
+        let phrase_seg: [&[&str]; 6] = [
+            &["Vanilla Ice Cream Tub", "Ice Crushed Cream Soda"],
+            &["Mango Ice Cream Bar"],
+            &["Cream Ice Bar"],
+            &["Durian Ice Cream Tub", "Ube Ice Cream Pint"],
+            &["Ice Cream Sandwich"],
+            &["Buko Ice Cream Gallon"],
+        ];
+        let phrase_assemble = || {
+            let one = |row: &[&str]| {
+                let mut b = IndexBuilder::new(Schema::new(vec![Field::new("name", 3.0, 0.4)]))
+                    .with_position();
+                for d in row {
+                    b.add(&Doc::new([*d]));
+                }
+                b.build().unwrap()
+            };
+            let mut s = Searcher::new(one(phrase_seg[0]));
+            for row in &phrase_seg[1..] {
+                s.push(one(row));
+            }
+            s
+        };
+        let mut p_serial = phrase_assemble();
+        p_serial.set_force_thread(Some(false));
+        let mut p_threaded = phrase_assemble();
+        p_threaded.set_force_thread(Some(true));
+        let ph = "Ice Cream";
+        cmp(p_serial.search_phrase(ph, 10), p_threaded.search_phrase(ph, 10), "phrase");
+        cmp(
+            p_serial.search_phrase_page(ph, 1, 3),
+            p_threaded.search_phrase_page(ph, 1, 3),
+            "phrase page",
+        );
+
+        // Repeatable, not merely equal once: thread scheduling differs from call to call.
+        for _ in 0..25 {
+            cmp(serial.search(q, 10), threaded.search(q, 10), "search, repeated");
+            cmp(serial.search_sorted(q, 6, 0, true), threaded.search_sorted(q, 6, 0, true), "sort");
+        }
     }
 
 }
