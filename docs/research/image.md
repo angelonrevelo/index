@@ -106,8 +106,21 @@ Building an HNSW graph over it costs build time, memory, recall and mutability, 
 below it — the same limit [`ROADMAP.md`](../../ROADMAP.md) already records for text.
 
 **Caveat recorded rather than buried:** every published binary-quantisation recall number above is
-for **text** embeddings. `UNVERIFIED` — no equivalent published figure for image embeddings was
-found. That is why `p49` measures recall on this repo's own corpus instead of citing Qdrant's.
+for **text** embeddings. No equivalent published figure for image embeddings was found. That is why
+`p49` measures recall on this repo's own corpus instead of citing Qdrant's.
+
+> **RESOLVED 2026-09-06 — this repo measured it.** 12,007 real CLIP ViT-B/32 embeddings over the
+> `p51` corpus, binary-prefilter pipeline against the exact oracle at oversample 4:
+> **recall@10 = 0.9870.** That lands inside the 0.98–0.9966 band Qdrant reports for *text*
+> embeddings, so the published figure does transfer — but it is now a measurement rather than an
+> assumption, and it is the first image-embedding number in this file that is ours.
+>
+> **A second finding came free, and it is an argument for the SYNTHETIC discipline.** The same
+> benchmark on *seeded* vectors reported a fused p50 of 623 µs; on **real** embeddings it is
+> **1,467 µs — 2.4x higher**. Real image embeddings on a corpus that is 42.69 % duplicates are
+> densely clustered, so the Hamming shortlist survives with far more ties to rerank. A benchmark
+> that had quietly used synthetic vectors would have understated its own latency by more than
+> double.
 
 ## 5. Finding 3 — "1:1 lossless" has a hard, measured ceiling
 
@@ -237,6 +250,17 @@ timeout is common enough that Chrome shipped auto-recovery for it.
 The one MEASURED end-to-end ingest number in the whole field is `rclip`'s: **1.28 M images in
 3 hours** on an M1 Max, and **84,725 in 15 hours** on a Celeron J3455. Budget from that, not from
 vendor fps claims.
+
+> **PARTLY RESOLVED 2026-09-06 — this repo measured a native GPU figure.** `scripts/embed-corpus.py`
+> embedded **12,007 images in 133 s — 90 img/s** with CLIP ViT-B/32, fp16, batch 64, on an
+> **RTX 2060 SUPER (8.6 GB)**, end to end including PIL decode from disk. Extrapolated, 30,000
+> images is **~5.5 minutes** and `rclip`'s 1.28 M corpus would be **~4 hours** — the same order as
+> its 3 hours on an M1 Max, which is a reassuring cross-check on both.
+>
+> This is a *native CUDA* number and says nothing about WebGPU, which remains `UNVERIFIED`. Note
+> also that throughput rose from 67 to 90 img/s across the run as the OS file cache warmed, so the
+> bottleneck here is **disk and JPEG decode, not the GPU** — consistent with the ingest budget in
+> §6 treating decode as the host's dominant cost.
 
 ## 9. Video — sample shots, not frames
 

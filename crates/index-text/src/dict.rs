@@ -205,6 +205,59 @@ impl TermDict {
         out
     }
 
+    /// [`TermDict::expand_lazy`], but also returning each matched term's TEXT.
+    ///
+    /// The FST stream already yields the key bytes during traversal and the plain expansion throws
+    /// them away, so recovering the text costs one allocation per match and no extra traversal.
+    ///
+    /// **Only the multi-segment path calls this**, because it is the only one that needs to match
+    /// terms ACROSS dictionaries — a term id means different things in different segments, so
+    /// summing document frequency to a collection-wide figure can only be keyed on the text. A
+    /// single-index search never allocates any of these.
+    pub fn expand_lazy_text(
+        &self,
+        token: &str,
+        is_numeric: bool,
+        prefix: bool,
+    ) -> Vec<(TermMatch, String)> {
+        if !prefix {
+            if let Some(id) = self.exact(token) {
+                // The text is the token itself; no stream, no search.
+                return vec![(TermMatch { term_id: id, distance: 0 }, token.to_string())];
+            }
+        }
+        if is_numeric {
+            return self
+                .exact(token)
+                .map(|id| vec![(TermMatch { term_id: id, distance: 0 }, token.to_string())])
+                .unwrap_or_default();
+        }
+        let budget = max_edit_for(token);
+        if budget == 0 && !prefix {
+            return self
+                .exact(token)
+                .map(|id| vec![(TermMatch { term_id: id, distance: 0 }, token.to_string())])
+                .unwrap_or_default();
+        }
+        let builder = match budget {
+            0 => &self.lev0,
+            1 => &self.lev1,
+            _ => &self.lev2,
+        };
+        let dfa = if prefix { builder.build_prefix_dfa(token) } else { builder.build_dfa(token) };
+        let automaton = Dfa(dfa);
+        let mut out = Vec::new();
+        let mut stream = self.map.search(&automaton).into_stream();
+        while let Some((key, id)) = stream.next() {
+            let d = replay_distance(&automaton, key);
+            // Terms are UTF-8 by construction (`build` takes `&[String]`), so this cannot fail;
+            // the lossy form avoids an unwrap on the hot path regardless.
+            let text = String::from_utf8_lossy(key).into_owned();
+            out.push((TermMatch { term_id: id as u32, distance: d }, text));
+        }
+        out
+    }
+
     /// The **lazy** expansion the production engines all use: try exact first, and only pay for
     /// fuzzy when the exact result set underdelivers.
     ///

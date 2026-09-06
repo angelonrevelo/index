@@ -62,6 +62,8 @@ pub struct Searcher {
     base: Vec<u32>,
     doc_count: usize,
     compaction_ratio: f32,
+    /// Whether to score against collection-wide statistics. See [`Searcher::set_collection_stat`].
+    collection_stat: bool,
 }
 
 impl std::fmt::Debug for Searcher {
@@ -79,12 +81,17 @@ impl Searcher {
     /// Start from one segment — typically a full build from the source database.
     pub fn new(base: Index) -> Self {
         let n = base.doc_count();
-        Searcher {
+        let mut s = Searcher {
             segment: vec![base],
             base: vec![0],
             doc_count: n,
             compaction_ratio: DEFAULT_COMPACTION_RATIO,
-        }
+            collection_stat: true,
+        };
+        // A one-segment collection already scores correctly, but setting it here means every path
+        // that reads `collection_size` sees the same thing whether there is one segment or ten.
+        s.sync_collection_size();
+        s
     }
 
     /// Append a segment. Its documents take the next global ordinals, so ordinals already handed
@@ -120,7 +127,65 @@ impl Searcher {
         self.base.push(self.doc_count as u32);
         self.doc_count += segment.doc_count();
         self.segment.push(segment);
+        self.sync_collection_size();
         shadowed
+    }
+
+    /// Turn collection-wide scoring off, trading ranking parity back for latency.
+    ///
+    /// **On by default, because correct-by-default is the right choice for a ranking property**:
+    /// with it off, how a document scores depends on which segment holds it, and nothing in the
+    /// result signals that. It costs a second dictionary expansion per segment, which is the price
+    /// of knowing a term's corpus-wide document frequency at all — `p52` measures it.
+    ///
+    /// Turn it off only if you have measured that you need the latency and do not care that a
+    /// segmented collection ranks differently from a rebuild of the same rows.
+    pub fn set_collection_stat(&mut self, on: bool) {
+        self.collection_stat = on;
+    }
+
+    /// Whether collection-wide scoring is on.
+    pub fn collection_stat(&self) -> bool {
+        self.collection_stat
+    }
+
+    /// Collection-wide statistics for `query`: the first half of a `dfs_query_then_fetch`.
+    ///
+    /// Every segment reports the `(term text, df)` pairs it would plan; they are summed by TEXT,
+    /// because a term id means something different in each dictionary. The result is handed back to
+    /// every segment so all of them score a term by how rare it is in the CORPUS.
+    ///
+    /// Skipped entirely for a single-segment collection, where the segment already is the corpus —
+    /// so the common case pays nothing.
+    fn stat_for(&self, query: &str, prefix_last: bool) -> Option<crate::index::CollectionStat> {
+        if !self.collection_stat || self.segment.len() < 2 {
+            return None;
+        }
+        let mut df: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for s in &self.segment {
+            for (text, d) in s.term_stat(query, prefix_last) {
+                *df.entry(text).or_insert(0) += d;
+            }
+        }
+        Some(crate::index::CollectionStat { doc_count: self.doc_count, df })
+    }
+
+    /// Point every segment at the collection's document count, so IDF means the same thing in all
+    /// of them.
+    ///
+    /// Called on every change to the segment set. Without it a term is "rare" or "common" according
+    /// to the shard it landed in rather than the corpus -- see [`Index::set_collection_size`],
+    /// which carries the measurement.
+    ///
+    /// Deleted documents still count, exactly as they do for a single index: a tombstone removes a
+    /// row from results without rewriting the postings, and collection statistics keep counting it
+    /// until a rebuild. Excluding them here would make the segmented path disagree with the
+    /// standalone path for a reason that has nothing to do with segmentation.
+    fn sync_collection_size(&mut self) {
+        let n = self.doc_count;
+        for s in &mut self.segment {
+            s.set_collection_size(Some(n));
+        }
     }
 
     /// Borrow segment `i`, in insertion order.
@@ -293,7 +358,12 @@ impl Searcher {
     /// path uses, so typo bucket still dominates score and ties still break on the document
     /// ordinal — which, being global and ascending with insertion, keeps results deterministic.
     pub fn search(&self, query: &str, k: usize) -> Vec<Hit> {
-        self.merge(k, |ix| ix.search(query, k))
+        // Collection-wide IDF, so a term is rare or common according to the corpus rather than to
+        // whichever segment holds the row. See `CollectionStat` for the measurement that forced it.
+        match self.stat_for(query, false) {
+            Some(stat) => self.merge(k, |ix| ix.search_with_stat(query, k, &stat)),
+            None => self.merge(k, |ix| ix.search(query, k)),
+        }
     }
 
     /// [`Searcher::search`] with typeahead semantics on the last token.
@@ -538,7 +608,10 @@ impl Searcher {
     }
 
     pub fn search_prefix(&self, query: &str, k: usize) -> Vec<Hit> {
-        self.merge(k, |ix| ix.search_prefix(query, k))
+        match self.stat_for(query, true) {
+            Some(stat) => self.merge(k, |ix| ix.search_prefix_with_stat(query, k, &stat)),
+            None => self.merge(k, |ix| ix.search_prefix(query, k)),
+        }
     }
 
     fn merge(&self, k: usize, mut per_segment: impl FnMut(&Index) -> Vec<Hit>) -> Vec<Hit> {
@@ -865,6 +938,61 @@ mod tests {
         keyed.add(&Doc::new(["Oral B Toothpaste Pro"]));
         s.push(keyed.build().unwrap());
         assert!(!s.has_key(), "a partially keyed collection reports unkeyed");
+    }
+
+    /// **A term must be as rare as the CORPUS says, not as the segment that holds it says.**
+    ///
+    /// This is the defect `p52` fixed. The same document, the same query: put the document in a
+    /// tiny delta and its terms are scored against three documents instead of four thousand, so it
+    /// ranks somewhere completely different from where a full rebuild puts it.
+    ///
+    /// The corpus below is built so the effect is unmissable — one distinctive word, one row
+    /// carrying it, and that row alone in a one-document delta.
+    #[test]
+    fn a_terms_rarity_is_a_property_of_the_corpus_not_of_its_segment() {
+        let field = vec![Field::new("name", 3.0, 0.4)];
+        let mk = |row: &[String]| {
+            let mut b = IndexBuilder::new(Schema::new(field.clone()));
+            for r in row {
+                b.add(&Doc::new([r.as_str()]));
+            }
+            b.build().unwrap()
+        };
+
+        // 400 filler rows sharing a common word, plus one row with a distinctive one.
+        let mut row: Vec<String> = (0..400).map(|i| format!("common listing number {i}")).collect();
+        row.push("common listing zamboanga special".to_string());
+
+        let whole = mk(&row);
+        // Same documents, same order, but the distinctive row is alone in a delta.
+        let mut split = Searcher::new(mk(&row[..400]));
+        split.push(mk(&row[400..]));
+        assert_eq!(whole.doc_count(), split.doc_count());
+
+        // The distinctive term must identify the same document either way.
+        let a = whole.search("zamboanga", 5);
+        let b = split.search("zamboanga", 5);
+        assert_eq!(a[0].doc, b[0].doc, "a unique term must find the same row after segmentation");
+
+        // And the SCORE must be close. Without collection statistics the delta scores `zamboanga`
+        // against one document instead of 401, so `idf` collapses and the score is a fraction of
+        // what a rebuild gives. Field-length normalisation still differs slightly per segment, so
+        // this allows 20 % rather than demanding equality -- an order of magnitude is the failure
+        // being guarded against, not a few percent.
+        let ratio = b[0].score / a[0].score;
+        assert!(
+            (0.8..1.25).contains(&ratio),
+            "segmented score {} vs monolithic {} (ratio {ratio:.3}) -- collection IDF is not being \
+             applied",
+            b[0].score,
+            a[0].score
+        );
+
+        // The common term is the mirror image: common in the corpus, and the delta must not treat
+        // it as rare just because it holds one of the 401 rows carrying it.
+        let ca = whole.search("common", 10);
+        let cb = split.search("common", 10);
+        assert_eq!(ca[0].doc, cb[0].doc, "a common term must not be inflated inside a small delta");
     }
 
     /// Mismatched facet layout is detectable rather than silently wrong.

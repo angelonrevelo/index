@@ -8,8 +8,26 @@ images alone) — landing on the ~30% the literature reports for LAION-2B, from 
 scrape. Near-duplicate counts are printed at every threshold rather than as one headline rate.
 **The dedup rate cannot be sampled**: a 1,500-file systematic sample said 9.00%, because striding
 across a corpus strides across duplicate clusters.
-**Acceptance 4 — the round-trip proof — is NOT exercised**, because nothing in this repo runs a
-transcode. The comparison exists; no real restored file has been put through it.
+**Acceptance 4 — the round-trip proof — is now EXERCISED and PASSES.** `scripts/jxl-roundtrip.py`
+drives real `cjxl`/`djxl` 0.12.0 over the corpus: **2,000 / 2,000 JPEG transcoded and restored
+BYTE-EXACT**, verified by SHA-256 against the original. `OVERALL: PASS`.
+
+**Both of §5's published claims FAILED to reproduce on this corpus, and that is the finding:**
+
+| §5 claim | Measured here |
+|---|---|
+| JPEG XL lossless saves **13–22%** (~20% typical) | **6.65%** — does NOT reproduce |
+| **~1%** of real JPEG cannot be losslessly reconstructed | **0.00%** over 2,000 files — does NOT reproduce |
+| A generic compressor wins **1–3%** on entropy-coded JPEG | **1.06%** (zlib control) — **reproduces** |
+
+The explanation is the corpus, not the codec. These are small, already-optimised CDN assets from a
+single pipeline (p50 file size 27 KiB); Cloudinary's ~20% is measured on typical photographic
+JPEGs with far more redundancy left in their entropy coding, and the ~1% refusal rate comes from
+files carrying unusual trailing bytes that a clean CDN pipeline does not emit.
+
+**The consequence sharpens this row's own conclusion.** At 6.65%, transcode is worth *less* here
+than it looked, while dedup measured **29.82%** — so on this corpus the content address is not
+merely the cheaper win, it is roughly **4.5x** the bigger one.
 
 The product ask was "compress to the fewest bytes while the download is still 1:1 with the
 original, all attributes preserved". [`docs/research/image.md`](../../docs/research/image.md) §5

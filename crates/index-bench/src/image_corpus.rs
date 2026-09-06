@@ -25,6 +25,26 @@
 //! deterministic stand-in so the *plumbing* is gated today; every number derived from it is printed
 //! with a `SYNTHETIC` marker and the `p49` recall verdict is **withheld**, because a recall figure
 //! over made-up vectors measures nothing.
+//!
+//! ## `--emit-manifest <path>` — the contract an external encoder binds to
+//!
+//! The embedding file is **positional**: entry `i` is the vector for the `i`th document this run
+//! indexes. Nothing about that order is guessable from outside — it is the sorted walk, minus every
+//! file that did not decode, and a `--limit` run strides the corpus on top of that. An external
+//! encoder therefore cannot produce a correctly ordered file without being told the order, and a
+//! file that is merely *plausible* mis-attributes every vector in silence.
+//!
+//! `--emit-manifest` writes that order down: one line per indexed document, in exactly the order
+//! this run indexes them, as `<absolute path>\t<sha256 hex>`. Feed the paths to the encoder in file
+//! order and write the vectors back in the same order.
+//!
+//! The **digest column exists so that a stale manifest can be detected rather than silently
+//! mis-aligning every vector**. If the corpus changes under a manifest — a file added, removed or
+//! re-encoded — the digest on that line stops matching, which is a checkable fact; without it the
+//! only symptom would be a plausible-looking retrieval number computed over vectors attached to the
+//! wrong images. For the same reason `--embedding` refuses to run when the vector count and the
+//! indexed-document count disagree: a truncated or over-long embedding file must never produce a
+//! recall figure.
 
 use index_image::color::Palette;
 use index_image::hash::{self, Hash256, Hash64};
@@ -32,7 +52,7 @@ use index_image::meta::{self, Exif, Format};
 use index_image::vector::Metric;
 use index_image::{sha256, FusedQuery, ImageDoc, ImageIndex, ImageIndexBuilder};
 use index_text::{Doc, FacetClause, Field, Schema};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -55,6 +75,14 @@ const DIM: usize = 512;
 const K: usize = 20;
 /// `p50` acceptance 1: "the 100 hardest fused queries".
 const QUERY_COUNT: usize = 100;
+
+/// `p50` acceptance 3 fixes the cutoff at 10: "fused nDCG@10 must exceed both".
+const NDCG_K: usize = 10;
+/// Fewest queries the NON-DEGENERATE labelled set must yield before acceptance 3 is adjudicated on
+/// it at all. Below this the mean of three nDCG figures is noise wearing a verdict's clothes, and an
+/// underpowered PASS is worth nothing — so the verdict is withheld exactly as `p49`'s recall is
+/// withheld under synthetic embeddings, rather than rendered from too little evidence.
+const NDCG_QUERY_MIN: usize = 20;
 
 /// Refuse to decode beyond this many pixels. A scraped corpus can contain a header claiming a
 /// 60000x60000 image; allocating for it is a denial of service, not a measurement.
@@ -242,6 +270,15 @@ impl Embedding {
         matches!(self, Embedding::Synthetic)
     }
 
+    /// How many vectors the file actually holds. `None` for the synthetic source, which is a
+    /// function of the digest and so has exactly as many vectors as it is asked for.
+    fn count(&self) -> Option<usize> {
+        match self {
+            Embedding::Synthetic => None,
+            Embedding::Real { dim, data } => Some(data.len() / *dim),
+        }
+    }
+
     /// The vector for indexed document `i`.
     fn vector(&self, i: usize, digest: &[u8; 32]) -> Option<Vec<f32>> {
         match self {
@@ -331,6 +368,45 @@ impl UnionFind {
 // Reporting helpers
 // ---------------------------------------------------------------------------------------------
 
+/// Lowercase hex of a content digest — the manifest's second column.
+fn hex(digest: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// The corpus root as an absolute path, with Windows' `\\?\` verbatim prefix stripped: the manifest
+/// is read by an external encoder, not by this process, and that prefix trips several toolchains.
+/// Falls back to the path as given rather than failing — a manifest with a relative root is worse
+/// than useless but it is not this function's job to decide that.
+fn absolute_dir(dir: &Path) -> PathBuf {
+    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let text = canonical.to_string_lossy().to_string();
+    PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(text.as_str()))
+}
+
+/// Binary-gain nDCG at `k`: gain 1 for a relevant document, discount `1 / log2(rank + 1)` with
+/// ranks 1-based, normalised by the ideal DCG for this query's relevant count **capped at k** (a
+/// query with 40 relevant documents cannot be punished for a 10-slot page holding only 10).
+fn ndcg(rank: &[u32], relevant: &HashSet<u32>, k: usize) -> f64 {
+    let discount = |i: usize| 1.0 / ((i + 2) as f64).log2();
+    let dcg: f64 = rank
+        .iter()
+        .take(k)
+        .enumerate()
+        .filter(|(_, doc)| relevant.contains(doc))
+        .map(|(i, _)| discount(i))
+        .sum();
+    let ideal: f64 = (0..relevant.len().min(k)).map(discount).sum();
+    if ideal == 0.0 {
+        0.0
+    } else {
+        dcg / ideal
+    }
+}
+
 fn ms(sorted: &[f64], p: f64) -> f64 {
     timer::percentile(sorted, p) / 1e6
 }
@@ -387,10 +463,12 @@ fn histogram(label: &str, sorted: &[f64], edge: &[f64], unit: &str) {
 struct Arg {
     limit: Option<usize>,
     embedding: Option<PathBuf>,
+    /// Where to write the positional contract an external encoder binds to. See the module comment.
+    manifest: Option<PathBuf>,
 }
 
 fn parse_arg() -> Result<Arg, String> {
-    let mut arg = Arg { limit: None, embedding: None };
+    let mut arg = Arg { limit: None, embedding: None, manifest: None };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -404,6 +482,10 @@ fn parse_arg() -> Result<Arg, String> {
                     arg.embedding = Some(PathBuf::from(v));
                 }
             }
+            "--emit-manifest" => {
+                let v = it.next().ok_or("--emit-manifest needs a path")?;
+                arg.manifest = Some(PathBuf::from(v));
+            }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -415,7 +497,9 @@ fn main() {
         Ok(a) => a,
         Err(e) => {
             println!("p51-image-corpus: {e}");
-            println!("usage: image-corpus [--limit N] [--embedding synthetic|<path>]");
+            println!(
+                "usage: image-corpus [--limit N] [--embedding synthetic|<path>] [--emit-manifest <path>]"
+            );
             std::process::exit(2);
         }
     };
@@ -617,6 +701,10 @@ fn main() {
     let mut fail = 0usize;
     let mut check: Vec<(String, bool)> = Vec::new();
     let mut withheld: Vec<String> = Vec::new();
+    // Measured, reported, and deliberately given NO verdict — a figure whose labelled set cannot
+    // adjudicate the question it looks like it answers. It is neither a PASS nor a FAIL and must
+    // never be counted as either.
+    let mut note: Vec<String> = Vec::new();
 
     // =============================================================================================
     // 1. CENSUS — first, because every number below is meaningless without it
@@ -896,6 +984,59 @@ fn main() {
         std::process::exit(0);
     }
 
+    // ---- the positional manifest (written BEFORE indexing, which is the point) -------------------
+    //
+    // `indexed` is now fixed, and it IS the order every vector file must follow. Emitting here — after
+    // the decode pass that decides membership, before a single document enters the index — is what
+    // makes the order a contract rather than an accident an encoder has to reverse-engineer.
+    if let Some(out_path) = arg.manifest.as_ref() {
+        let root = absolute_dir(&dir);
+        let mut text = String::with_capacity(indexed.len() * 96);
+        for r in &indexed {
+            // `Record::path` is stored forward-slashed for the text field; put the platform's
+            // separator back so the line names a path the host's encoder can actually open.
+            let native = r.path.replace('/', std::path::MAIN_SEPARATOR_STR);
+            text.push_str(&format!("{}\t{}\n", root.join(native).display(), hex(&r.digest)));
+        }
+        match std::fs::write(out_path, &text) {
+            Ok(()) => {
+                println!("\n  manifest: {} lines -> {}", indexed.len(), out_path.display());
+                println!("    One line per indexed document, in indexing order, as");
+                println!("    `<absolute path>\\t<sha256 hex>`. This is the order a vector file must");
+                println!("    follow: entry i is the vector for line i+1. The digest column is there so");
+                println!("    a stale manifest is DETECTABLE — without it, a corpus that changed under");
+                println!("    the encoder mis-attributes every vector and still prints a number.");
+            }
+            Err(e) => {
+                println!("\nFAIL: --emit-manifest {}: {e}", out_path.display());
+                println!("\nOVERALL: FAIL");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // ---- embedding alignment: refuse rather than mis-attribute -----------------------------------
+    //
+    // The embedding file is positional, so a count mismatch is not a rounding error — it means every
+    // vector past the first discrepancy belongs to a different image. A silently truncated or
+    // over-long file must never produce a recall figure, so this is fatal and prints both numbers.
+    if let Some(vector_count) = embedding.count() {
+        if vector_count != indexed.len() {
+            println!("\nFAIL: --embedding holds {vector_count} vectors but this run indexes {} documents.",
+                indexed.len());
+            println!("      The file is POSITIONAL: entry i is the vector for indexed document i, so a");
+            println!("      count mismatch mis-attributes vectors rather than merely losing some. Any");
+            println!("      recall or nDCG computed over it would be a number about nothing.");
+            println!("      Regenerate with --emit-manifest <path> and encode the paths in file order.");
+            if arg.limit.is_some() {
+                println!("      NOTE: --limit strides the corpus, so a manifest emitted at one --limit");
+                println!("      does not describe a run at another. Emit and encode at the same limit.");
+            }
+            println!("\nOVERALL: FAIL");
+            std::process::exit(1);
+        }
+    }
+
     // ---- schema, and the engine limit that shapes it --------------------------------------------
     //
     // `index_text::MAX_FIELD` is **4**. The columns this corpus yields are path, format, shape,
@@ -1146,6 +1287,308 @@ fn main() {
         }
     }
 
+    // --- p50 acceptance 3: fused nDCG@10 against each half alone ----------------------------------
+    //
+    // Acceptance 3 says fused nDCG@10 must EXCEED both text-only and vector-only, and that a row
+    // which fails "is wrong and must be rejected, not tuned until it passes". This block is written
+    // to honour that literally: it reports the loss and fails the check. Nothing here is tuned to
+    // make fusion win — the arms share one query set, one k and one scoring function.
+    //
+    // TWO labelled sets are reported and only ONE of them votes; the block below says at length
+    // which and why. The short version: exact-duplicate labels make the vector arm perfect BY
+    // CONSTRUCTION, so they cannot adjudicate "fused > vector" at all, and the near-duplicate set
+    // with the exact duplicates removed is the one that can.
+    println!("\n  --- p50 acceptance 3: nDCG@10, fused vs each half alone ---");
+    if embedding.is_synthetic() {
+        println!("    WITHHELD, for the same reason p49's recall is. The vectors are SYNTHETIC —");
+        println!("    seeded noise keyed on the content digest, carrying no visual semantics. An");
+        println!("    nDCG over them would measure that identical bytes hash identically, which is");
+        println!("    arithmetic, not retrieval. Run with --embedding <path> for a verdict.");
+        withheld.push("p50 acceptance 3 nDCG@10 verdict (synthetic embedding mode)".to_string());
+    } else if ix.doc_count() != indexed.len() {
+        // Document ordinals are assigned in insertion order, so the labels below are only valid if
+        // every indexed record actually became a document. If one failed to add, say so and decline.
+        println!("    WITHHELD: {} documents indexed but {} records offered, so a document ordinal",
+            ix.doc_count(), indexed.len());
+        println!("    no longer names the record it came from and the labels cannot be trusted.");
+        withheld.push("p50 acceptance 3 nDCG@10 verdict (document ordinals not aligned)".to_string());
+    } else {
+        // ---- TWO labelled sets, and which one is allowed to vote ---------------------------------
+        //
+        // There are two, and only the second one votes. The reason is a property of the corpus, not
+        // a preference, and it has to be written down because the first set is the obvious one:
+        //
+        //  [A] EXACT-DUPLICATE GROUPS, by sha256. Objective and abundant — membership falls out of
+        //      the bytes, so nobody tuned the labels — but **DEGENERATE FOR ACCEPTANCE 3**.
+        //      Byte-identical files decode to byte-identical pixels, so a real encoder assigns them
+        //      byte-identical embeddings, so the vector arm retrieves the whole group at rank 1..n
+        //      and scores nDCG@10 = 1.0 BY CONSTRUCTION. "Fused must exceed vector-only" is then
+        //      unreachable no matter how good fusion is: nothing exceeds a perfect oracle. A FAIL
+        //      printed off this set would be a verdict produced by the instrument, so this set is
+        //      reported as INFORMATIONAL and is given a `[note]`, never a PASS or a FAIL.
+        //
+        //  [B] NEAR-DUPLICATE GROUPS WITH THE EXACT DUPLICATES REMOVED: dHash Hamming distance
+        //      within `hash::HASH64_NEAR_MAX`, AND a DIFFERENT sha256. These are the same image
+        //      resized or re-encoded, which is what makes the set non-degenerate:
+        //        - the vector arm is strong but NOT perfect, because the pixels genuinely differ;
+        //        - the text arm is independent, because the paths genuinely differ;
+        //        - the label comes from a THIRD function — a perceptual hash — which is neither the
+        //          CLIP embedding nor the path, so it advantages neither arm by construction.
+        //      Acceptance 3 is adjudicated here and nowhere else. If fusion loses on this set that
+        //      is a rejection of the row, not an invitation to tune, and it is printed as measured.
+        //
+        // Both sets exclude the query document from its own result list before scoring, and both
+        // measure the vector arm with `search_exact`, so a fusion win can never be an artefact of
+        // quantisation loss in the arm it is being compared against.
+
+        /// The three arms over one labelled set, plus how much of the set actually scored.
+        struct Score {
+            scored: usize,
+            skipped: usize,
+            relevant_total: usize,
+            text: f64,
+            vector: f64,
+            fused: f64,
+        }
+
+        // One scoring function, shared by both sets: same k, same query construction, same
+        // self-exclusion. Anything that differs between the two blocks below is the LABELS.
+        let evaluate = |label: &[(u32, HashSet<u32>)]| -> Score {
+            let (mut text_sum, mut vector_sum, mut fused_sum) = (0.0f64, 0.0f64, 0.0f64);
+            let (mut scored, mut skipped, mut relevant_total) = (0usize, 0usize, 0usize);
+            for (q_doc, relevant) in label.iter().take(QUERY_COUNT) {
+                let q_doc = *q_doc;
+                let Some(qv) = embedding.vector(q_doc as usize, &indexed[q_doc as usize].digest)
+                else {
+                    skipped += 1;
+                    continue;
+                };
+                let q_text = row[q_doc as usize].text.as_str();
+
+                // k+1 everywhere, then drop the query document: it matches itself perfectly on both
+                // arms, and leaving it in would inflate all three numbers with a trivial self-match.
+                let take = NDCG_K + 1;
+                let drop_self = |doc: u32| doc != q_doc;
+
+                let text_rank: Vec<u32> = ix
+                    .text()
+                    .search(q_text, take)
+                    .into_iter()
+                    .map(|h| h.doc)
+                    .filter(|&d| drop_self(d))
+                    .take(NDCG_K)
+                    .collect();
+                // `search_exact`, not the binary-prefilter pipeline: the vector arm is measured at
+                // its BEST, so "fusion beats vector-only" is not an artefact of quantisation loss.
+                let vector_rank: Vec<u32> = ix
+                    .vector()
+                    .search_exact(&qv, take)
+                    .into_iter()
+                    .map(|(d, _)| d)
+                    .filter(|&d| drop_self(d))
+                    .take(NDCG_K)
+                    .collect();
+                let fq = FusedQuery {
+                    text: Some(q_text),
+                    vector: Some(&qv),
+                    ..FusedQuery::default()
+                };
+                let fused_rank: Vec<u32> = ix
+                    .search_fused(&fq, take)
+                    .into_iter()
+                    .map(|h| h.doc)
+                    .filter(|&d| drop_self(d))
+                    .take(NDCG_K)
+                    .collect();
+
+                text_sum += ndcg(&text_rank, relevant, NDCG_K);
+                vector_sum += ndcg(&vector_rank, relevant, NDCG_K);
+                fused_sum += ndcg(&fused_rank, relevant, NDCG_K);
+                relevant_total += relevant.len();
+                scored += 1;
+            }
+            let n = scored.max(1) as f64;
+            Score {
+                scored,
+                skipped,
+                relevant_total,
+                text: text_sum / n,
+                vector: vector_sum / n,
+                fused: fused_sum / n,
+            }
+        };
+
+        let print_arm = |s: &Score| {
+            println!("\n    {:<24} {:>10}", "arm", "nDCG@10");
+            println!("    {:<24} {:>10.4}", "text-only", s.text);
+            println!("    {:<24} {:>10.4}", "vector-only (exact)", s.vector);
+            println!("    {:<24} {:>10.4}", "FUSED", s.fused);
+            println!("    delta vs text-only:   {:+.4}", s.fused - s.text);
+            println!("    delta vs vector-only: {:+.4}", s.fused - s.vector);
+        };
+
+        // ---- [A] the exact-duplicate labelled set ------------------------------------------------
+        let mut group: HashMap<[u8; 32], Vec<u32>> = HashMap::new();
+        for (i, r) in indexed.iter().enumerate() {
+            group.entry(r.digest).or_default().push(i as u32);
+        }
+        // Sorted by digest: deterministic, and independent of hash-map iteration order.
+        let mut dup_set: Vec<([u8; 32], Vec<u32>)> =
+            group.into_iter().filter(|(_, m)| m.len() >= 2).collect();
+        dup_set.sort_by_key(|entry| entry.0);
+        // Members were pushed in indexing order, so member[0] is the lowest ordinal — a fixed,
+        // clock-free choice of query document.
+        let exact_label: Vec<(u32, HashSet<u32>)> = dup_set
+            .iter()
+            .map(|(_, member)| (member[0], member[1..].iter().copied().collect()))
+            .collect();
+
+        println!("\n    [A] EXACT-DUPLICATE LABELS (sha256) — INFORMATIONAL, CANNOT ADJUDICATE");
+        if exact_label.is_empty() {
+            println!("      no exact-duplicate group in this corpus slice, so nothing to report.");
+        } else {
+            let a = evaluate(&exact_label);
+            if a.scored == 0 {
+                println!(
+                    "      {} group(s) found but none had a vector for the query document.",
+                    exact_label.len()
+                );
+            } else {
+                println!(
+                    "      {} queries over exact-duplicate groups, {} relevant documents in total",
+                    a.scored, a.relevant_total
+                );
+                println!("      ({:.1} per query).", a.relevant_total as f64 / a.scored as f64);
+                if a.skipped > 0 {
+                    println!("      {} group(s) skipped: no vector for the query document.", a.skipped);
+                }
+                print_arm(&a);
+                println!("\n      -> THIS SET CANNOT ADJUDICATE p50 ACCEPTANCE 3, whatever it prints.");
+                println!("         Byte-identical files decode to identical pixels, so a real encoder");
+                println!("         gives them identical embeddings and the vector arm returns the whole");
+                println!("         group first: nDCG@10 = 1.0 BY CONSTRUCTION. `fused > vector` is then");
+                println!("         unreachable for a reason that has nothing to do with whether fusion");
+                println!("         works — nothing exceeds a perfect oracle. Reporting a FAIL from this");
+                println!("         set would be a verdict produced by the instrument, so it gets a");
+                println!("         [note] and set [B] below carries the verdict.");
+                note.push(format!(
+                    "p50 acc.3 on EXACT-duplicate labels: fused {:.4}, text {:.4}, vector {:.4} ({} queries) — cannot adjudicate, the vector arm is perfect by construction",
+                    a.fused, a.text, a.vector, a.scored
+                ));
+            }
+        }
+
+        // ---- [B] the near-duplicate labelled set, exact duplicates REMOVED -----------------------
+        //
+        // A query document per DISTINCT digest, taken in ordinal order, so a file that happens to
+        // have twelve byte-identical copies contributes one query rather than twelve. Its relevant
+        // set is every document within `HASH64_NEAR_MAX` dHash of it whose sha256 DIFFERS — the same
+        // picture at another size or another encoder setting, never another copy of the same bytes.
+        let mut near_label: Vec<(u32, HashSet<u32>)> = Vec::new();
+        let mut query_digest: HashSet<[u8; 32]> = HashSet::new();
+        for (i, r) in indexed.iter().enumerate() {
+            if near_label.len() >= QUERY_COUNT {
+                break;
+            }
+            let Some(qh) = r.dhash else { continue };
+            if !query_digest.insert(r.digest) {
+                continue;
+            }
+            let mut relevant: HashSet<u32> = HashSet::new();
+            for (j, other) in indexed.iter().enumerate() {
+                if j == i || other.digest == r.digest {
+                    continue;
+                }
+                if other.dhash.is_some_and(|oh| qh.distance(&oh) <= hash::HASH64_NEAR_MAX) {
+                    relevant.insert(j as u32);
+                }
+            }
+            if !relevant.is_empty() {
+                near_label.push((i as u32, relevant));
+            }
+        }
+
+        println!(
+            "\n    [B] NEAR-DUPLICATE LABELS (dHash <= {}, sha256 DIFFERS) — THIS SET VOTES",
+            hash::HASH64_NEAR_MAX
+        );
+        let b = evaluate(&near_label);
+        if b.scored < NDCG_QUERY_MIN {
+            println!(
+                "      {} scorable quer(ies) — under the {NDCG_QUERY_MIN} this benchmark requires",
+                b.scored
+            );
+            println!(
+                "      before it renders a verdict. {} candidate group(s) were built and {} skipped",
+                near_label.len(), b.skipped
+            );
+            println!("      for want of a vector. At this corpus size the non-degenerate set is NOT");
+            println!("      TESTABLE, and an underpowered pass is worth nothing, so the verdict is");
+            println!("      WITHHELD the same way p49's recall is under synthetic embeddings.");
+            if b.scored > 0 {
+                print_arm(&b);
+                println!("\n      (printed for information only — too few queries to mean anything.)");
+            }
+            withheld.push(format!(
+                "p50 acceptance 3 nDCG@10 verdict (non-degenerate set has {} quer(ies), under {NDCG_QUERY_MIN})",
+                b.scored
+            ));
+        } else {
+            println!(
+                "      {} queries, one per distinct digest, {} relevant documents in total",
+                b.scored, b.relevant_total
+            );
+            println!(
+                "      ({:.1} per query). The query document is fed its own indexed path text and",
+                b.relevant_total as f64 / b.scored as f64
+            );
+            println!("      its own embedding, and is excluded from its own results before scoring.");
+            if b.skipped > 0 {
+                println!("      {} group(s) skipped: no vector for the query document.", b.skipped);
+            }
+            println!("      NON-DEGENERATE BY CONSTRUCTION: the pixels differ, so the vector arm is");
+            println!("      strong but not perfect; the paths differ, so the text arm is independent;");
+            println!("      and the label comes from a perceptual hash, which is neither arm's own");
+            println!("      function, so it hands neither of them a free win.");
+            print_arm(&b);
+
+            let beat = b.fused > b.text && b.fused > b.vector;
+            if beat {
+                println!("\n      -> fusion strictly exceeds both halves on the NON-DEGENERATE set.");
+                println!("         p50 acceptance 3 HOLDS.");
+            } else {
+                let lose = if b.fused <= b.text && b.fused <= b.vector {
+                    "BOTH halves"
+                } else if b.fused <= b.text {
+                    "the TEXT half"
+                } else {
+                    "the VECTOR half"
+                };
+                println!("\n      -> FUSION LOSES TO {lose} on the non-degenerate set. Per p50");
+                println!("         acceptance 3 this is a FAILING result and the row is wrong, not");
+                println!("         under-tuned. It is printed as measured; nothing here is adjusted");
+                println!("         until it passes.");
+            }
+            println!("\n      LIMIT, stated beside the number rather than in a footnote: this measures");
+            println!("      NEAR-DUPLICATE RETRIEVAL, not semantic relevance. Nothing here shows that a");
+            println!("      fused query finds a semantically SIMILAR image, only that it finds the same");
+            println!("      image at another size or encoding. It is the strongest non-degenerate set");
+            println!("      this corpus can yield without human judgements — a scrape carries no");
+            println!("      relevance labels — and a real semantic evaluation needs a corpus with them.");
+
+            check.push((
+                format!(
+                    "p50 acc.3 fused nDCG@10 {:.4} > text {:.4} and vector {:.4} (NON-DEGENERATE near-duplicate labels, {} queries)",
+                    b.fused, b.text, b.vector, b.scored
+                ),
+                beat,
+            ));
+            if !beat {
+                fail += 1;
+            }
+        }
+    }
+
     // =============================================================================================
     // 5. LATENCY
     // =============================================================================================
@@ -1267,6 +1710,9 @@ fn main() {
     println!("\n=== CHECK LIST =========================================================");
     for (name, ok) in &check {
         println!("  [{}] {name}", if *ok { "PASS" } else { "FAIL" });
+    }
+    for name in &note {
+        println!("  [note] {name}");
     }
     for name in &withheld {
         println!("  [HELD] {name}");

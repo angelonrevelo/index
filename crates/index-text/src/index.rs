@@ -26,9 +26,26 @@ use crate::analyze::{apply_alias, tokenize, AliasTable, Token};
 use crate::dict::TermDict;
 use std::collections::BTreeMap;
 
-/// Maximum number of fields. Four covers `{brand, title, category, description}`, the shape
-/// `docs/research/relevance.md` recommends, and keeps a posting one cache-friendly struct.
+/// Maximum number of **scored** fields. Four covers `{brand, title, category, description}`, the
+/// shape `docs/research/relevance.md` recommends, and keeps a posting one cache-friendly struct.
+///
+/// This is deliberately not the limit on how many columns a document may carry — see
+/// [`MAX_COLUMN`] and [`Schema::with_column`]. Raising *this* constant would widen
+/// `[u16; MAX_FIELD]` on every posting of every existing index, which
+/// `bench/roadmap/p56-field-budget.md` rejects: it taxes four shipping consumers to serve one new
+/// corpus.
 pub const MAX_FIELD: usize = 4;
+
+/// Maximum number of **columns** a schema may address: scored fields plus unscored columns.
+///
+/// A column index below [`Schema::field_count`] names a scored field; one at or above it names an
+/// unscored column, which is stored, faceted, ranged or keyed on but never tokenized and never
+/// scored. An unscored column costs **zero bytes per posting** — it is read straight out of
+/// [`Doc::field_text`] at build time and never enters `term_post` or `doc_len`.
+///
+/// Sixteen, not four, because the thing being bounded here is a `Vec<String>` per schema and a
+/// `usize` per declared column, not a per-posting array. `p51`'s image document wants seven.
+pub const MAX_COLUMN: usize = 16;
 
 /// Bits a packed position reserves for the token index inside its field.
 ///
@@ -68,6 +85,13 @@ impl Field {
 #[derive(Clone, Debug)]
 pub struct Schema {
     pub field: Vec<Field>,
+    /// **Unscored columns**, in declaration order, addressed at column index
+    /// `field.len() + i`. See [`Schema::with_column`].
+    ///
+    /// A name only: an unscored column has no boost and no `b` because nothing ever scores it.
+    /// That is the whole point — it is a place to put `width`, `format` or `orientation` without
+    /// spending one of the four [`MAX_FIELD`] slots and a `u16` on every posting.
+    pub unscored: Vec<String>,
     /// BM25 term-frequency saturation. Anserini's default is 0.9; Lucene's is 1.2.
     pub k1: f32,
     /// Penalty multiplier applied per edit of distance, so a typo'd match scores below a clean one
@@ -79,10 +103,67 @@ pub struct Schema {
 impl Schema {
     pub fn new(field: Vec<Field>) -> Self {
         assert!(!field.is_empty() && field.len() <= MAX_FIELD, "1..={MAX_FIELD} fields");
-        Schema { field, k1: 0.9, typo_penalty: 0.6 }
+        Schema { field, unscored: Vec::new(), k1: 0.9, typo_penalty: 0.6 }
     }
+
+    /// Declare an **unscored column**: a stored value that can be faceted, ranged or keyed on
+    /// without occupying one of the four scored-field slots.
+    ///
+    /// # Why this exists
+    ///
+    /// Before this, a facet or a numeric column was declared *by scored-field index*
+    /// (`with_facet(field)`), so `Field::new("width", 0.0, 0.75)` — boost 0.0, meaning "never
+    /// scored" — still consumed a [`MAX_FIELD`] slot **and** a `u16` field length on every posting
+    /// that nobody would ever read. `bench/roadmap/p56-field-budget.md` measured the alternative
+    /// and rejected it: widening the per-posting array to eight taxes presyo's 241,677 products,
+    /// sisia and profstopick to serve one image corpus.
+    ///
+    /// An unscored column costs a `String` per schema and whatever the facet/numeric/key store
+    /// already costs per document. It costs **nothing per posting**, because it is never tokenized:
+    /// [`IndexBuilder::add`] analyzes only the first [`Schema::field_count`] entries of
+    /// [`Doc::field_text`], and reads a column straight out of the remainder.
+    ///
+    /// Positionally, the column is the next entry of [`Doc::field_text`] after the scored fields
+    /// and any column declared before it. Returns `self` so declarations chain.
+    pub fn with_column(mut self, name: &str) -> Self {
+        assert!(self.add_column(name), "at most {MAX_COLUMN} columns");
+        self
+    }
+
+    /// Non-consuming [`Schema::with_column`], for the C ABI. Returns `false` rather than panicking
+    /// when the column budget is spent — a trap kills the whole WASM instance.
+    pub fn add_column(&mut self, name: &str) -> bool {
+        if self.column_count() >= MAX_COLUMN {
+            return false;
+        }
+        self.unscored.push(name.to_string());
+        true
+    }
+
+    /// How many **scored** fields. Only these are tokenized, scored and length-normalized.
     pub fn field_count(&self) -> usize {
         self.field.len()
+    }
+
+    /// How many columns in total: scored fields plus unscored columns. This is the addressing
+    /// space [`IndexBuilder::with_facet`], [`IndexBuilder::with_numeric`] and
+    /// [`IndexBuilder::with_key`] take an index into.
+    pub fn column_count(&self) -> usize {
+        self.field.len() + self.unscored.len()
+    }
+
+    /// The name of a column by index: a scored field's name below [`Schema::field_count`], an
+    /// unscored column's name above it.
+    pub fn column_name(&self, column: usize) -> Option<&str> {
+        match self.field.get(column) {
+            Some(f) => Some(f.name.as_str()),
+            None => self.unscored.get(column - self.field.len()).map(String::as_str),
+        }
+    }
+
+    /// Resolve a column by name, scored fields first. `None` when no column carries that name.
+    pub fn column_of(&self, name: &str) -> Option<usize> {
+        (0..self.column_count()).find(|&i| self.column_name(i) == Some(name))
     }
 }
 
@@ -330,6 +411,36 @@ impl IndexBuilder {
         true
     }
 
+    /// One past the highest column index a facet, numeric or key declaration may name.
+    ///
+    /// [`MAX_FIELD`] is the floor rather than the bound, so a schema that declares fewer than four
+    /// scored fields and no unscored column keeps accepting exactly the indices it accepted before
+    /// `p56` — a two-field schema could always `with_facet(3)` and store the empty string, and
+    /// tightening that would be a silent behaviour change dressed as a refactor.
+    fn column_limit(&self) -> usize {
+        self.schema.column_count().max(MAX_FIELD)
+    }
+
+    /// Declare a facet on a column resolved **by name** — the ergonomic form of
+    /// [`IndexBuilder::with_facet`] once a schema carries [`Schema::with_column`] declarations,
+    /// since an unscored column's index is otherwise a number the caller has to count out.
+    pub fn with_facet_of(self, name: &str) -> Self {
+        let column = self.schema.column_of(name).expect("no such column");
+        self.with_facet(column)
+    }
+
+    /// Declare a numeric column resolved **by name**. See [`IndexBuilder::with_facet_of`].
+    pub fn with_numeric_of(self, name: &str) -> Self {
+        let column = self.schema.column_of(name).expect("no such column");
+        self.with_numeric(column)
+    }
+
+    /// Declare the primary key column resolved **by name**. See [`IndexBuilder::with_facet_of`].
+    pub fn with_key_of(self, name: &str) -> Self {
+        let column = self.schema.column_of(name).expect("no such column");
+        self.with_key(column)
+    }
+
     /// Store field `field` as a **facet**: a value kept verbatim per document, for filtering and
     /// counting rather than for scoring.
     ///
@@ -342,6 +453,10 @@ impl IndexBuilder {
     ///
     /// Independent of [`IndexBuilder::learn_expansion`], which also takes a "facet field" but uses
     /// it to derive query expansions and keeps a *tokenized* copy. They may name the same field.
+    ///
+    /// `field` is a **column** index, so it may name an unscored [`Schema::with_column`] as well as
+    /// a scored field. Faceting on an unscored column is the cheaper of the two and the reason that
+    /// declaration exists: it stores the same interned labels and costs no per-posting `u16`.
     pub fn with_facet(mut self, field: usize) -> Self {
         assert!(self.set_facet_field(field), "facet field out of range");
         self
@@ -400,7 +515,7 @@ impl IndexBuilder {
     /// Non-consuming [`IndexBuilder::with_key`], for the C ABI. Returns `false` for an
     /// out-of-range field or once a document has been added, rather than panicking.
     pub fn set_key_field(&mut self, field: usize) -> bool {
-        if field >= MAX_FIELD || !self.key_store.is_empty() || !self.doc_len.is_empty() {
+        if field >= self.column_limit() || !self.key_store.is_empty() || !self.doc_len.is_empty() {
             return false;
         }
         self.key_field = Some(field);
@@ -415,7 +530,7 @@ impl IndexBuilder {
     /// Non-consuming [`IndexBuilder::with_numeric`], for the C ABI. See
     /// [`IndexBuilder::set_facet_field`] for why the ABI cannot use the consuming form.
     pub fn set_numeric_field(&mut self, field: usize) -> bool {
-        if field >= MAX_FIELD || !self.numeric_store.is_empty() {
+        if field >= self.column_limit() || !self.numeric_store.is_empty() {
             return false;
         }
         if !self.numeric_field.contains(&field) {
@@ -436,7 +551,7 @@ impl IndexBuilder {
     /// repeated field is ignored rather than duplicated -- two slots over one field would double
     /// the storage to answer identical questions.
     pub fn set_facet_field(&mut self, field: usize) -> bool {
-        if field >= MAX_FIELD || !self.facet_store.is_empty() {
+        if field >= self.column_limit() || !self.facet_store.is_empty() {
             return false;
         }
         if !self.facet_field.contains(&field) {
@@ -787,6 +902,7 @@ impl IndexBuilder {
             doc_key: self.key_store,
             key_field: self.key_field.unwrap_or(usize::MAX),
             key_order: Vec::new(),
+            collection_size: None,
         };
         ix.rebuild_meta();
         Ok(ix)
@@ -930,6 +1046,28 @@ pub struct Index {
     /// **Derived, never serialized**, like `numeric_order` and `posting_base`: it is a sort of data
     /// the index already holds, and a stored copy could disagree with it.
     key_order: Vec<u32>,
+    /// Documents in the whole COLLECTION this segment belongs to, when it belongs to one.
+    ///
+    /// # Why a segment must not score against its own size
+    ///
+    /// IDF answers "how rare is this term", and rarity is a property of the corpus, not of the
+    /// shard that happens to hold the row. A three-row delta computing IDF over three documents
+    /// scores a term at `ln(1 + 2.5/1.5) = 0.98`; the same term in a 4,001-row base scores `7.89`.
+    /// Same word, same corpus, an eight-fold difference decided purely by which segment the row
+    /// landed in -- which is why a row updated through `apply` can outrank or underrank its own
+    /// former self.
+    ///
+    /// `p50` measured that as the ceiling on incremental updating: rank-1 agreement with a full
+    /// rebuild stuck near 93 % however compaction was tuned, because the FIRST delta already cost
+    /// that much. This field is what removes it.
+    ///
+    /// **Derived, never serialized**, and set by [`Searcher`] whenever the collection changes.
+    /// `None` for a standalone index, where the segment IS the collection.
+    ///
+    /// Only IDF's numerator is corrected here. Document frequency stays per segment, because
+    /// summing it across segments needs each term's TEXT and the dictionary stores an FST rather
+    /// than the strings. That is the remaining gap, and `p52` measures what it leaves behind.
+    collection_size: Option<usize>,
     /// Per numeric slot, every document that HAS a finite value there, ascending by value.
     ///
     /// **Derived, never serialized**, exactly like `block_max`: it is a sort of a column the index
@@ -1145,6 +1283,53 @@ pub(crate) fn canon_score(x: f32) -> f32 {
     f32::from_bits(x.to_bits().wrapping_add(half) & mask)
 }
 
+/// Collection-wide statistics, so every segment of a [`Searcher`] scores against the same corpus.
+///
+/// # The problem it removes
+///
+/// IDF answers "how rare is this term", and rarity is a property of the CORPUS, not of the shard
+/// that happens to hold the row. Left per segment, a three-row delta scores a term at
+/// `ln(1 + 2.5/1.5) = 0.98` while the same term in a 4,001-row base scores `7.89` — an eight-fold
+/// difference decided by which segment a row landed in. `p38` measured the consequence as a ranking
+/// ceiling and `p50` measured it again on a change stream: rank-1 agreement with a full rebuild
+/// stuck near 93 %, because the FIRST delta already cost that much.
+///
+/// # Why BOTH numbers, and never only one
+///
+/// The first attempt corrected only `doc_count`, and it made ranking **worse** — caught immediately
+/// by `ranking_skew_is_bounded_for_a_small_delta`. A small segment has a small `df` as well as a
+/// small `n`, and the two partially cancel; raising `n` alone leaves `df = 1` against a corpus of
+/// 200 and inflates that segment's terms instead of correcting them. **A partial correction of a
+/// ratio is not a partial improvement.** So `df` is summed across segments too, and the two travel
+/// together.
+///
+/// # Why it is keyed on text
+///
+/// A term id is an index into one segment's dictionary and means something different in the next,
+/// so document frequency can only be summed by the term's TEXT. The dictionary stores an FST rather
+/// than the strings, but the stream yields the key bytes during traversal, so
+/// [`TermDict::expand_lazy_text`] recovers them for the handful of planned terms at no extra
+/// traversal. This is the same design Elasticsearch calls `dfs_query_then_fetch`.
+#[derive(Debug, Default, Clone)]
+pub struct CollectionStat {
+    /// Documents across every segment, deleted ones included — matching the single-index rule that
+    /// a tombstone does not rewrite statistics until a rebuild.
+    pub doc_count: usize,
+    /// Term text -> summed document frequency across every segment.
+    pub df: std::collections::HashMap<String, usize>,
+}
+
+impl CollectionStat {
+    /// IDF for `text`, against the whole collection. Falls back to `local_df` for a term the stats
+    /// pass never saw, which cannot normally happen and must not be a panic if it does.
+    #[inline]
+    fn idf(&self, text: &str, local_df: usize) -> f32 {
+        let df = self.df.get(text).copied().unwrap_or(local_df) as f32;
+        let n = self.doc_count as f32;
+        (1.0 + (n - df + 0.5).max(0.5) / (df + 0.5)).ln()
+    }
+}
+
 /// One clause of a filter bar: a slot, the values that satisfy it, and whether to invert.
 ///
 /// Values inside a clause are **OR**-ed ("Colgate or Oral-B"); clauses are **AND**-ed. That is how
@@ -1205,6 +1390,8 @@ struct Scan<'a> {
     range: &'a [(usize, f64, f64)],
     /// Term ids that must appear as consecutive tokens of one field. Empty means no constraint.
     phrase: &'a [u32],
+    /// Collection-wide statistics, when this segment is one of several. See [`CollectionStat`].
+    stat: Option<&'a CollectionStat>,
 }
 
 impl<'a> Scan<'a> {
@@ -1218,6 +1405,7 @@ impl<'a> Scan<'a> {
             facet: &[],
             range: &[],
             phrase: &[],
+            stat: None,
         }
     }
 }
@@ -1371,6 +1559,8 @@ impl PartialOrd for RankCandidate {
 pub(crate) struct Snapshot<'a> {
     pub doc_count: usize,
     pub field: &'a [Field],
+    /// Unscored column names, in declaration order. See [`Schema::with_column`].
+    pub unscored: &'a [String],
     pub k1: f32,
     pub typo_penalty: f32,
     pub avg_len: [f32; MAX_FIELD],
@@ -1445,6 +1635,7 @@ impl Index {
         Snapshot {
             doc_count: self.doc_count,
             field: &self.schema.field,
+            unscored: &self.schema.unscored,
             k1: self.schema.k1,
             typo_penalty: self.schema.typo_penalty,
             avg_len: self.avg_len,
@@ -1567,6 +1758,7 @@ impl Index {
             doc_key: Vec::new(),
             key_field: usize::MAX,
             key_order: Vec::new(),
+            collection_size: None,
             // Set by the caller after construction via `set_facet`; the facet sections are
             // optional, exactly like the prior and expansion sections above.
             facet_field: Vec::new(),
@@ -1744,11 +1936,16 @@ impl Index {
     }
 
     /// Robertson-Sparck-Jones IDF with the standard +0.5 smoothing, as Lucene uses.
+    ///
+    /// `n` is the **collection** size when this index is part of one, not this segment's own
+    /// document count. See [`Index::set_collection_size`] for why that difference is not small.
     #[inline]
     fn idf(&self, df: usize) -> f32 {
-        let n = self.doc_count as f32;
+        let n = self.collection_size.unwrap_or(self.doc_count) as f32;
         let df = df as f32;
-        (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
+        // `df` cannot exceed a correctly set collection size, but clamping keeps the logarithm's
+        // argument positive rather than producing NaN if one is ever set inconsistently.
+        (1.0 + (n - df + 0.5).max(0.5) / (df + 0.5)).ln()
     }
 
     /// BM25F pseudo term frequency: field contributions summed **before** saturation, each
@@ -1781,6 +1978,39 @@ impl Index {
     /// `prefix_last` applies typeahead semantics to the final token only — Meilisearch's rule, and
     /// the right default for a search-as-you-type box.
     fn plan(&self, query: &str, prefix_last: bool, cap: usize) -> (Vec<QueryTerm>, Vec<bool>, bool) {
+        self.plan_stat(query, prefix_last, cap, None)
+    }
+
+    /// Expand a dictionary token, carrying the matched TEXT only when a collection stat needs it.
+    ///
+    /// An empty `String` does not allocate, so the single-index path pays nothing for the pair.
+    #[inline]
+    fn expand_pair(
+        &self,
+        token: &str,
+        numeric: bool,
+        prefix: bool,
+        stat: Option<&CollectionStat>,
+    ) -> Vec<(crate::dict::TermMatch, String)> {
+        match stat {
+            Some(_) => self.dict.expand_lazy_text(token, numeric, prefix),
+            None => self
+                .dict
+                .expand_lazy(token, numeric, prefix)
+                .into_iter()
+                .map(|m| (m, String::new()))
+                .collect(),
+        }
+    }
+
+    /// [`Index::plan`], scoring IDF against `stat` when this segment belongs to a collection.
+    fn plan_stat(
+        &self,
+        query: &str,
+        prefix_last: bool,
+        cap: usize,
+        stat: Option<&CollectionStat>,
+    ) -> (Vec<QueryTerm>, Vec<bool>, bool) {
         let mut tok = tokenize(query);
         apply_alias(&mut tok, &self.alias);
         // A group is a "quantity" group when its token parses as a real physical size. A bare
@@ -1806,7 +2036,7 @@ impl Index {
 
         for (ti, t) in tok.iter().enumerate() {
             let is_last = ti + 1 == n;
-            let matches = self.dict.expand_lazy(&t.text, t.is_numeric, prefix_last && is_last);
+            let matches = self.expand_pair(&t.text, t.is_numeric, prefix_last && is_last, stat);
 
             if matches.is_empty() && t.text.chars().count() >= 4 {
                 if let Some((a, b)) = self.split_compound(&t.text) {
@@ -1815,8 +2045,8 @@ impl Index {
                         let gi = group_is_quantity.len() as u16;
                         group_is_quantity
                             .push(numeric && crate::analyze::parse_quantity(&part).is_some());
-                        let m = self.dict.expand_lazy(&part, numeric, false);
-                        self.emit(&mut out, m, gi, cap);
+                        let m = self.expand_pair(&part, numeric, false, stat);
+                        self.emit(&mut out, m, gi, cap, stat);
                     }
                     continue;
                 }
@@ -1825,7 +2055,7 @@ impl Index {
             let gi = group_is_quantity.len() as u16;
             group_is_quantity
                 .push(t.is_numeric && crate::analyze::parse_quantity(&t.text).is_some());
-            self.emit(&mut out, matches, gi, cap);
+            self.emit(&mut out, matches, gi, cap, stat);
         }
 
         // --- learned expansion, fired STRICTLY.
@@ -1847,13 +2077,18 @@ impl Index {
                 // merely shares one word with the category's name. As alternatives, one expansion
                 // hit satisfies the group it sits in, which is the intended meaning: *this document
                 // belongs to the thing you asked for.*
-                let extra: Vec<crate::dict::TermMatch> = self.expansion[at]
+                // The expansion table stores term IDS, not text, so these carry an empty string
+                // and fall back to this segment's own `df`. Documented rather than hidden: a
+                // learned-expansion query is the one case still scored per segment.
+                let extra: Vec<(crate::dict::TermMatch, String)> = self.expansion[at]
                     .1
                     .iter()
-                    .map(|&term_id| crate::dict::TermMatch { term_id, distance: EXPANSION_DISTANCE })
+                    .map(|&term_id| {
+                        (crate::dict::TermMatch { term_id, distance: EXPANSION_DISTANCE }, String::new())
+                    })
                     .collect();
                 for gi in 0..group_is_quantity.len() as u16 {
-                    self.emit(&mut out, extra.clone(), gi, cap);
+                    self.emit(&mut out, extra.clone(), gi, cap, stat);
                 }
                 expanded = true;
             }
@@ -1900,24 +2135,36 @@ impl Index {
 
     /// Turn a token's dictionary matches into weighted query terms for group `gi`, applying the
     /// expansion cap.
+    ///
+    /// `matches` pairs each dictionary match with its TEXT, which is empty on the single-index path
+    /// -- an empty `String` does not allocate, so that path pays nothing for carrying it. Pairing
+    /// rather than keeping two parallel vectors matters because the expansion cap SORTS this list,
+    /// and a parallel vector would silently desynchronise.
     fn emit(
         &self,
         out: &mut Vec<QueryTerm>,
-        mut matches: Vec<crate::dict::TermMatch>,
+        mut matches: Vec<(crate::dict::TermMatch, String)>,
         gi: u16,
         cap: usize,
+        stat: Option<&CollectionStat>,
     ) {
         if matches.len() > cap {
             // Closest first; among equals, the rarer term is the more discriminative one.
-            matches.sort_by_key(|m| (m.distance, self.posting[m.term_id as usize].len()));
+            matches.sort_by_key(|(m, _)| (m.distance, self.posting[m.term_id as usize].len()));
             matches.truncate(cap);
         }
-        for m in matches {
+        for (m, text) in matches {
             let df = self.posting[m.term_id as usize].len();
             if df == 0 {
                 continue;
             }
-            let w = self.idf(df) * self.schema.typo_penalty.powi(m.distance as i32);
+            // Collection-wide IDF when this segment is part of one, so a term is rare or common
+            // according to the corpus rather than to the shard it landed in. See `CollectionStat`.
+            let idf = match stat {
+                Some(s) => s.idf(&text, df),
+                None => self.idf(df),
+            };
+            let w = idf * self.schema.typo_penalty.powi(m.distance as i32);
             out.push(QueryTerm {
                 term_id: m.term_id,
                 group: gi,
@@ -2449,6 +2696,23 @@ impl Index {
         })
     }
 
+    /// Score IDF against a collection of `n` documents rather than against this segment alone.
+    ///
+    /// Set by [`Searcher`] on every segment whenever the collection changes; `None` restores the
+    /// standalone behaviour.
+    ///
+    /// **Nothing has to be recomputed.** The saturated posting contributions (`sat`, `block_max`,
+    /// `max_sat`) depend on term frequency and field length, never on IDF, and IDF enters at query
+    /// time as part of the term weight. So this is one write per segment, not a rebuild.
+    pub fn set_collection_size(&mut self, n: Option<usize>) {
+        self.collection_size = n;
+    }
+
+    /// The collection this segment scores against; its own document count when standalone.
+    pub fn collection_size(&self) -> usize {
+        self.collection_size.unwrap_or(self.doc_count)
+    }
+
     /// Whether this index carries application keys.
     pub fn has_key(&self) -> bool {
         !self.doc_key.is_empty()
@@ -2743,13 +3007,60 @@ impl Index {
         }
     }
 
+    /// The `(term text, document frequency)` pairs this segment would plan for `query`.
+    ///
+    /// The first half of a `dfs_query_then_fetch`: [`Searcher`] sums these across segments to build
+    /// a [`CollectionStat`], then searches with it, so every segment scores a term by how rare it
+    /// is in the CORPUS rather than in the shard. Costs one dictionary expansion — the same one the
+    /// search would do anyway, which is why the second pass is not twice the work it looks.
+    ///
+    /// **The expansion cap is deliberately NOT applied here.** A term this segment would cap away
+    /// may survive the cap in another one, and it still needs a collection-wide `df` there. Over-
+    /// collecting costs a few map entries; under-collecting would silently fall back to local `df`
+    /// for exactly the terms the cap disagrees about.
+    pub fn term_stat(&self, query: &str, prefix_last: bool) -> Vec<(String, usize)> {
+        let mut tok = tokenize(query);
+        crate::analyze::apply_alias(&mut tok, &self.alias);
+        let n = tok.len();
+        let mut out = Vec::new();
+        for (ti, t) in tok.iter().enumerate() {
+            let is_last = ti + 1 == n;
+            let m = self.dict.expand_lazy_text(&t.text, t.is_numeric, prefix_last && is_last);
+            if m.is_empty() && t.text.chars().count() >= 4 {
+                if let Some((a, b)) = self.split_compound(&t.text) {
+                    for part in [a, b] {
+                        let numeric = part.chars().any(|c| c.is_ascii_digit());
+                        for (tm, text) in self.dict.expand_lazy_text(&part, numeric, false) {
+                            out.push((text, self.posting[tm.term_id as usize].len()));
+                        }
+                    }
+                    continue;
+                }
+            }
+            for (tm, text) in m {
+                out.push((text, self.posting[tm.term_id as usize].len()));
+            }
+        }
+        out
+    }
+
+    /// [`Index::search`], scored against collection-wide statistics.
+    pub fn search_with_stat(&self, query: &str, k: usize, stat: &CollectionStat) -> Vec<Hit> {
+        self.search_opt(Scan { stat: Some(stat), ..Scan::new(query, k) })
+    }
+
+    /// [`Index::search_prefix`], scored against collection-wide statistics.
+    pub fn search_prefix_with_stat(&self, query: &str, k: usize, stat: &CollectionStat) -> Vec<Hit> {
+        self.search_opt(Scan { prefix_last: true, stat: Some(stat), ..Scan::new(query, k) })
+    }
+
     /// [`Index::search`] with typeahead semantics on the last token.
     pub fn search_prefix(&self, query: &str, k: usize) -> Vec<Hit> {
         self.search_opt(Scan { prefix_last: true, ..Scan::new(query, k) })
     }
 
     fn search_opt(&self, scan: Scan) -> Vec<Hit> {
-        let Scan { query, k, offset, prefix_last, cap, facet, range, phrase } = scan;
+        let Scan { query, k, offset, prefix_last, cap, facet, range, phrase, stat } = scan;
         // Deep paging is served by over-fetching and dropping: rank order is only known once
         // everything above the page has been scored, so the pool must hold `offset + k`. Cost
         // therefore grows with `offset`, which is true of every engine without a stored cursor and
@@ -2758,7 +3069,7 @@ impl Index {
         if k == 0 {
             return Vec::new();
         }
-        let (mut term, group_is_quantity, expanded) = self.plan(query, prefix_last, cap);
+        let (mut term, group_is_quantity, expanded) = self.plan_stat(query, prefix_last, cap, stat);
         if term.is_empty() {
             return Vec::new();
         }
@@ -3927,4 +4238,91 @@ mod tests {
         }
     }
 
+    /// `p56`: the seven-column image document that surfaced this row -- one scored text field and
+    /// six unscored columns -- builds, facets and ranges, on a `MAX_FIELD` that did not move.
+    #[test]
+    fn a_seven_column_schema_fits_in_four_scored_fields() {
+        assert_eq!(MAX_FIELD, 4, "p56 must not be paid for by widening the per-posting array");
+
+        let schema = Schema::new(vec![Field::new("path", 1.0, 0.75)])
+            .with_column("format")
+            .with_column("orientation")
+            .with_column("colour")
+            .with_column("width")
+            .with_column("height")
+            .with_column("byte");
+        assert_eq!(schema.column_count(), 7);
+        assert_eq!(schema.field_count(), 1, "only the path is scored");
+
+        let mut b = IndexBuilder::new(schema)
+            .with_facet_of("format")
+            .with_facet_of("orientation")
+            .with_facet_of("colour")
+            .with_numeric_of("width")
+            .with_numeric_of("height")
+            .with_numeric_of("byte");
+        b.add(&Doc::new([
+            "cdn/hero banner.jpg",
+            "jpeg",
+            "landscape",
+            "warm",
+            "1920",
+            "1080",
+            "204800",
+        ]));
+        b.add(&Doc::new(["cdn/hero icon.png", "png", "square", "cool", "64", "64", "1024"]));
+        b.add(&Doc::new(["cdn/hero strip.webp", "webp", "landscape", "cool", "1600", "400", "5120"]));
+        let ix = b.build().unwrap();
+
+        // Nothing but the path is tokenized: "jpeg" is a stored value, not a searchable term.
+        assert_eq!(ix.search("hero", 5).len(), 3);
+        for stored in ["landscape", "warm", "204800"] {
+            assert!(
+                ix.search(stored, 5).is_empty(),
+                "{stored:?} is a stored column value, it must not enter the dictionary"
+            );
+        }
+
+        assert_eq!(ix.facet_slot_count(), 3);
+        assert_eq!(ix.facet_label_at(1), ["landscape", "square"]);
+        let landscape: Vec<u32> =
+            ix.search_facet_at("hero", 5, 1, "landscape").iter().map(|h| h.doc).collect();
+        assert_eq!(landscape.len(), 2);
+        assert!(!landscape.contains(&1));
+
+        assert_eq!(ix.numeric_of(0, 0), Some(1920.0), "width");
+        let big: Vec<u32> =
+            ix.search_range("hero", 5, 2, 100_000.0, f64::MAX).iter().map(|h| h.doc).collect();
+        assert_eq!(big, vec![0], "only the banner is over 100 kB");
+    }
+
+    /// The old index-by-scored-field path keeps working unchanged, because shipping benchmarks use
+    /// it. `p56` adds a road, it does not close one.
+    #[test]
+    fn declaring_a_facet_by_scored_field_index_still_works() {
+        let schema =
+            Schema::new(vec![Field::new("name", 2.0, 0.4), Field::new("category", 1.0, 0.4)]);
+        let mut b = IndexBuilder::new(schema).with_facet(1);
+        b.add(&Doc::new(["bear brand milk", "Dairy"]));
+        b.add(&Doc::new(["colgate toothpaste", "Personal Care"]));
+        let ix = b.build().unwrap();
+        assert_eq!(ix.facet_field(), [1]);
+        assert_eq!(ix.facet_label(), ["Dairy", "Personal Care"]);
+        assert_eq!(ix.search_facet("milk", 5, "Dairy").len(), 1);
+        // ...and the category is still scored, which is the difference from an unscored column.
+        assert_eq!(ix.search("dairy", 5).len(), 1);
+    }
+
+    /// A column budget is a budget: `add_column` refuses rather than panicking, for the C ABI.
+    #[test]
+    fn the_column_budget_is_bounded_and_refuses_rather_than_traps() {
+        let mut schema = Schema::new(vec![Field::new("name", 1.0, 0.4)]);
+        while schema.add_column(&format!("c{}", schema.column_count())) {}
+        assert_eq!(schema.column_count(), MAX_COLUMN);
+        assert!(!schema.add_column("one too many"));
+
+        let mut b = IndexBuilder::new(schema);
+        assert!(!b.set_facet_field(MAX_COLUMN), "a column past the end is refused, not stored");
+        assert!(b.set_facet_field(MAX_COLUMN - 1));
+    }
 }

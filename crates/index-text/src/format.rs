@@ -22,13 +22,50 @@
 use crate::analyze::AliasTable;
 use crate::index::{Field, Index, Schema};
 
-/// `"IDXTEXT5"` — magic plus format version in eight bytes.
+/// `"IDXTEXT8"` — magic plus format version in eight bytes.
 ///
-/// The trailing digit has moved 1 -> 5 as sections were added: priors (`2`), facets (`3`),
+/// The trailing digit has moved 1 -> 8 as sections were added: priors (`2`), facets (`3`),
 /// multi-slot facets (`4`, same span count but a different encoding), numeric columns (`5`),
-/// token positions (`6`), document keys (`7`).
+/// token positions (`6`), document keys (`7`), unscored columns (`8`).
 /// Every bump is forced by the `TABLE_BYTE` assertion in the tests rather than remembered.
-pub const MAGIC: [u8; 8] = *b"IDXTEXT7";
+///
+/// `8` did **not** widen the section table. It appended an unscored-column count to `meta` and
+/// unscored-column names to `schema` (`p56`), and both sections are read positionally — a `7`
+/// reader would run off the end of `meta` and an `8` reader would read a `7` file's `schema`
+/// section short. That is exactly the "plausible garbage" this format bumps to avoid, so the
+/// magic moved even though the table did not.
+pub const MAGIC: [u8; 8] = *b"IDXTEXT8";
+
+/// The magic of every format version this crate has ever written, oldest first, so a reader can
+/// say *"that is an `IDXTEXT5` file, this build reads `IDXTEXT8`"* instead of *"bad magic"*.
+///
+/// An index is a file a consumer keeps. Telling them their file is a stale version they must
+/// rebuild is a different instruction from telling them it is not an index at all, and only one of
+/// those is true when the digit moves.
+const KNOWN_MAGIC: [&[u8; 8]; 8] = [
+    b"IDXTEXT1", b"IDXTEXT2", b"IDXTEXT3", b"IDXTEXT4", b"IDXTEXT5", b"IDXTEXT6", b"IDXTEXT7",
+    b"IDXTEXT8",
+];
+
+/// Explain a magic mismatch: an older (or newer) `IDXTEXT` version, or not an index at all.
+fn magic_error(head: &[u8]) -> String {
+    let this = String::from_utf8_lossy(&MAGIC).into_owned();
+    if head.len() < MAGIC.len() {
+        return format!("need {} bytes of magic, got {}", MAGIC.len(), head.len());
+    }
+    let got: [u8; 8] = head[..MAGIC.len()].try_into().unwrap();
+    if KNOWN_MAGIC.contains(&&got) {
+        let seen = String::from_utf8_lossy(&got).into_owned();
+        return format!(
+            "{seen} file, but this build reads {this} — an older index-text format version,              rebuild the index"
+        );
+    }
+    if got.starts_with(b"IDXTEXT") {
+        let seen = String::from_utf8_lossy(&got).into_owned();
+        return format!("{seen} file, but this build reads {this} — unknown format version");
+    }
+    format!("bad magic — not an index-text file (this build reads {this})")
+}
 
 /// Byte offset and length of one section. All `u64`, all absolute from the start of the file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,7 +264,7 @@ pub fn read_section_table(head: &[u8]) -> Result<SectionTable, String> {
         return Err(format!("need {} head bytes, got {}", MAGIC.len() + TABLE_BYTE, head.len()));
     }
     if head[..MAGIC.len()] != MAGIC {
-        return Err("bad magic — not an index-text file, or a different format version".into());
+        return Err(magic_error(head));
     }
     let mut r = Reader::new(&head[MAGIC.len()..]);
     let mut span = || -> Result<Span, String> {
@@ -295,6 +332,10 @@ impl Index {
         for v in s.avg_len.iter() {
             w.f32(*v);
         }
+        // Appended in `IDXTEXT8` rather than placed beside `field.len()`, so the bytes an
+        // `IDXTEXT7` reader would have read are still in the same places -- the version digit is
+        // what rejects the file, not a shifted offset producing a plausible wrong number.
+        w.u32(s.unscored.len() as u32);
         let meta = w.span_from(start);
 
         let start = w.here();
@@ -302,6 +343,11 @@ impl Index {
             w.str(&f.name);
             w.f32(f.boost);
             w.f32(f.b);
+        }
+        // Unscored columns carry a name and nothing else: no boost and no `b`, because nothing
+        // scores them. See `Schema::with_column`.
+        for name in s.unscored.iter() {
+            w.str(name);
         }
         let schema = w.span_from(start);
 
@@ -528,6 +574,13 @@ impl Index {
         for v in avg_len.iter_mut() {
             *v = r.f32()?;
         }
+        let unscored_count = r.u32()? as usize;
+        if field_count + unscored_count > crate::index::MAX_COLUMN {
+            return Err(format!(
+                "{field_count} fields + {unscored_count} unscored columns exceeds                  MAX_COLUMN {}",
+                crate::index::MAX_COLUMN
+            ));
+        }
 
         let mut r = Reader::new(&buf[table.schema.range()]);
         let mut field = Vec::with_capacity(field_count);
@@ -537,7 +590,12 @@ impl Index {
             let b = r.f32()?;
             field.push(Field { name, boost, b });
         }
+        let mut unscored = Vec::with_capacity(unscored_count);
+        for _ in 0..unscored_count {
+            unscored.push(r.str()?);
+        }
         let mut schema = Schema::new(field);
+        schema.unscored = unscored;
         schema.k1 = k1;
         schema.typo_penalty = typo_penalty;
 
@@ -1787,5 +1845,112 @@ mod tests {
         assert_eq!(after, before, "serialization must not change the order");
         // Normalized against the largest, so the top document sits at exactly 1.0.
         assert!((round.prior_of(1) - 1.0).abs() < 1e-6);
+    }
+
+    /// `p56`: a schema's unscored columns survive serialization, and so do the facet and numeric
+    /// slots declared over them. Without the `IDXTEXT8` schema-section entries a loaded index
+    /// would report a facet slot pointing at a column it can no longer name.
+    #[test]
+    fn unscored_columns_survive_a_round_trip() {
+        let schema = Schema::new(vec![Field::new("path", 1.0, 0.75)])
+            .with_column("format")
+            .with_column("orientation")
+            .with_column("width")
+            .with_column("height")
+            .with_column("byte");
+        let mut b = IndexBuilder::new(schema)
+            .with_facet_of("format")
+            .with_facet_of("orientation")
+            .with_numeric_of("width")
+            .with_numeric_of("height")
+            .with_numeric_of("byte");
+        b.add(&Doc::new(["cdn/a/hero.jpg", "jpeg", "landscape", "1920", "1080", "204800"]));
+        b.add(&Doc::new(["cdn/b/icon.png", "png", "square", "64", "64", "1024"]));
+        let ix = b.build().unwrap();
+
+        let back = Index::from_bytes(&ix.to_bytes()).unwrap();
+        assert_eq!(back.schema().unscored, ix.schema().unscored, "column names survive");
+        assert_eq!(back.schema().column_count(), 6, "one scored field plus five columns");
+        assert_eq!(back.schema().column_of("width"), Some(3));
+        assert_eq!(back.facet_field(), ix.facet_field());
+        assert_eq!(back.numeric_field(), ix.numeric_field());
+        assert_eq!(back.facet_label_at(1), ix.facet_label_at(1));
+        assert_eq!(back.search("hero", 5), ix.search("hero", 5));
+    }
+
+    /// `p56` bumped `IDXTEXT7` -> `IDXTEXT8` by appending to two positionally-read sections. A
+    /// reader must say *which* version it found rather than "bad magic", because "your file is a
+    /// version old, rebuild it" and "this is not an index" are different instructions and only one
+    /// of them is true.
+    #[test]
+    fn an_older_format_version_is_named_rather_than_called_garbage() {
+        let mut old = built().to_bytes();
+        old[..MAGIC.len()].copy_from_slice(b"IDXTEXT7");
+        let err = Index::from_bytes(&old).expect_err("an IDXTEXT7 file must be refused");
+        assert!(err.contains("IDXTEXT7"), "must name the version found: {err}");
+        assert!(err.contains("IDXTEXT8"), "must name the version read: {err}");
+
+        // Long enough to get past the head-length check, so it is the magic that rejects it.
+        let mut foreign = built().to_bytes();
+        foreign[..MAGIC.len()].copy_from_slice(b"PARQUET1");
+        let err = Index::from_bytes(&foreign).expect_err("not an index");
+        assert!(err.contains("not an index-text file"), "{err}");
+        assert!(!err.contains("rebuild"), "a foreign file is not a stale index: {err}");
+    }
+
+    /// **The `p56` no-regression assertion.** Adding unscored columns -- and faceting and ranging
+    /// over all of them -- must not move a single posting byte, because the per-posting array is
+    /// `[u16; MAX_FIELD]` over *scored* fields only. Measured on the sections themselves rather
+    /// than asserted in prose.
+    #[test]
+    fn unscored_columns_cost_no_posting_byte() {
+        fn sections(ix: &Index) -> (u64, u64, Vec<u8>) {
+            let bytes = ix.to_bytes();
+            let t = read_section_table(&bytes[..MAGIC.len() + TABLE_BYTE]).unwrap();
+            (t.posting.len, t.doc_len.len, bytes[t.posting.range()].to_vec())
+        }
+        let doc: [[&str; 6]; 3] = [
+            ["cdn/a/hero.jpg", "jpeg", "landscape", "1920", "1080", "204800"],
+            ["cdn/b/icon.png", "png", "square", "64", "64", "1024"],
+            ["cdn/c/hero banner.webp", "webp", "landscape", "1600", "400", "51200"],
+        ];
+
+        // Baseline: one scored field, nothing else.
+        let mut b = IndexBuilder::new(Schema::new(vec![Field::new("path", 1.0, 0.75)]));
+        for d in doc.iter() {
+            b.add(&Doc::new([d[0]]));
+        }
+        let lean = b.build().unwrap();
+
+        // The same corpus with five unscored columns, two faceted and three numeric.
+        let schema = Schema::new(vec![Field::new("path", 1.0, 0.75)])
+            .with_column("format")
+            .with_column("orientation")
+            .with_column("width")
+            .with_column("height")
+            .with_column("byte");
+        let mut b = IndexBuilder::new(schema)
+            .with_facet_of("format")
+            .with_facet_of("orientation")
+            .with_numeric_of("width")
+            .with_numeric_of("height")
+            .with_numeric_of("byte");
+        for d in doc.iter() {
+            b.add(&Doc::new(*d));
+        }
+        let wide = b.build().unwrap();
+
+        let (lean_post, lean_len, lean_bytes) = sections(&lean);
+        let (wide_post, wide_len, wide_bytes) = sections(&wide);
+        assert_eq!(wide_post, lean_post, "posting section grew by {} B", wide_post - lean_post);
+        assert_eq!(wide_len, lean_len, "doc_len section grew");
+        assert_eq!(wide_bytes, lean_bytes, "a posting byte moved");
+        assert_eq!(POSTING_BYTE, 4 + 2 * crate::index::MAX_FIELD, "the per-posting array widened");
+
+        // ...and the columns are genuinely there, so this is not measuring two identical indexes.
+        assert_eq!(wide.facet_slot_count(), 2);
+        assert_eq!(wide.numeric_field(), [3, 4, 5]);
+        assert_eq!(wide.facet_of_at(0, 1), Some("landscape"));
+        assert_eq!(wide.search("hero", 5), lean.search("hero", 5), "and nothing scores differently");
     }
 }

@@ -331,7 +331,7 @@ refuted hypothesis: [`bench/roadmap/p5-fuzzy-term-feasibility.md`](bench/roadmap
 ## Build & test
 
 ```sh
-cargo test --workspace              # 162 tests: engine + learned-index invariants + CLI
+cargo test --workspace              # engine + learned-index invariants + image tier + CLI
 
 cargo run -p index-bench --release --bin real-corpus       # THE ENGINE vs production corpora
 
@@ -346,7 +346,37 @@ cargo run -p index-bench --release --bin fuzzy-decision    # fuzzy-over-FM viabi
 cargo run -p index-bench --release --bin fuzzy-term        # typo-tolerant term dictionary feasibility
 ```
 
+### The image tier
+
+```sh
+cargo run -p index-bench --release --bin image-corpus       # the whole tier on a real web scrape
+cargo run -p index-bench --release --bin video-shot         # video as SHOTS, not frames
+node js/image-smoke.mjs                                     # a fused query, in Node
+python host/python/index_ffi.py                             # ...and through the C ABI from Python
+```
+
+The image tier ships **no model**, so the two measurements that need one are driven by host-side
+scripts — which is the architecture, not a workaround: an embedding is an *input*, and a transcode
+is the host's decision (`docs/research/image.md` §8, `bench/roadmap/p52-content-address.md`).
+
+```sh
+# 1. ask the benchmark which documents it indexes, and in what order
+cargo run -p index-bench --release --bin image-corpus -- --emit-manifest manifest.tsv
+# 2. embed exactly those, in exactly that order  (needs torch + transformers)
+python scripts/embed-corpus.py manifest.tsv embedding.bin
+# 3. now p49's recall verdict is real instead of withheld
+cargo run -p index-bench --release --bin image-corpus -- --embedding embedding.bin
+
+# p52 acceptance 4: does a lossless transcode round-trip BYTE-EXACT?  (needs `scoop install libjxl`)
+python scripts/jxl-roundtrip.py
+```
+
+**Without `--embedding`, `image-corpus` refuses to report a recall verdict** rather than quietly
+scoring seeded noise. That is deliberate: a recall figure over made-up vectors measures the
+arithmetic, not the retrieval. It prints `[HELD]` and says so.
+
 Size overrides: `INDEX_BENCH_N`. Epsilon override: `INDEX_BENCH_EPS`.
+Corpus overrides: `INDEX_IMAGE_CORPUS`, `INDEX_VIDEO_CORPUS`.
 `real-corpus` reads the two corpora from sibling checkouts; set `INDEX_CORPUS_DIR` to relocate them.
 A missing corpus is skipped and announced — the bench never invents data.
 `INDEX_DIAG=1` additionally asserts MaxScore's pruned results are identical to exhaustive scoring.

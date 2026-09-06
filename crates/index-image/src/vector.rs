@@ -467,6 +467,166 @@ impl VectorColumn {
         top.into_sorted()
     }
 
+    /// Group vectors that are dense in each other's neighbourhood — DBSCAN, and deterministically.
+    ///
+    /// # This module has no notion of a face
+    ///
+    /// It clusters `f32` vectors a caller pushed. It cannot detect anything, it bundles no model
+    /// and no weight, and it does not know or care what the numbers mean. That is not modesty: it
+    /// is the line between lawful arithmetic and a biometric feature, and this crate stays on the
+    /// arithmetic side of it deliberately. Supplying an embedding model, a consent flow and a
+    /// jurisdiction is the host's decision and must stay there — see `docs/research/image.md` §10.
+    ///
+    /// # What the API deliberately cannot express
+    ///
+    /// There is **no name, no identity, no label string, and no way to match a group produced here
+    /// against a group produced from any other column.** [`Cluster`] hands back opaque ordinals
+    /// scoped to the single column that produced them; ordinal 3 here means nothing over there.
+    /// **The absence is the feature.** EU AI Act **Art. 5(1)(e)** absolutely prohibits creating or
+    /// expanding a facial-recognition database through untargeted scraping — no proportionality
+    /// test, no exception — and the UK Upper Tribunal, reinstating the ICO's Clearview penalty on
+    /// 2025-10-07, named **"clustering similar facial vectors"** as the triggering processing
+    /// step. An API that could express a cross-corpus identity query would be an API whose misuse
+    /// this crate had designed in, so it is not expressible. A caller who wants that has to build
+    /// it, above this line, under their own name.
+    ///
+    /// # Accuracy limits, stated plainly
+    ///
+    /// If the vectors *are* face embeddings, the ceiling is not this code's arithmetic:
+    ///
+    ///   - **Children are near-unusable** — NIST FRVT measured **47.9 % TAR@0.1 % FAR at ages
+    ///     0–4**, and dlib's own documentation says Chinese Whispers "mixes up children easily".
+    ///   - **Bias lands in false positives.** NIST FRVT (NISTIR 8280) found demographic
+    ///     false-**positive** differentials of up to a factor of **~7,203**, versus ~3x for false
+    ///     negatives. A wrong *merge* is the error that discriminates, which is why the tests
+    ///     report a false-merge rate **separately** from purity; a single "accuracy" number hides
+    ///     exactly the failure that matters.
+    ///   - **Aging and occlusion compound**, and casual photos are materially harder than the
+    ///     curated benchmark sets those figures come from.
+    ///
+    /// # The algorithm, and why this one
+    ///
+    /// DBSCAN, because that is what actually ships. **Immich** runs a modified DBSCAN requiring
+    /// **>= 3 neighbours** for a core point at a recommended max distance of **0.3–0.7**;
+    /// **PhotoPrism** runs DBSCAN over L2-normalised embeddings with per-model calibrated
+    /// thresholds. Both are the defaults this signature is shaped around. `min_neighbour` counts
+    /// **other** points within `max_distance`, excluding the point itself.
+    ///
+    /// A point with at least `min_neighbour` neighbours is a **core** point. A non-core point is
+    /// pulled into a group only if some core point reaches it; a point no core point reaches is
+    /// labelled [`NOISE`] rather than forced into the nearest group. DBSCAN is chosen over dlib's
+    /// **Chinese Whispers** precisely because Chinese Whispers is non-deterministic across runs.
+    ///
+    /// # Determinism is a guarantee, not an accident
+    ///
+    /// The same column clusters to byte-identical labels on every run, every thread and every
+    /// build. Seeds are taken in ascending id, each expansion scans in ascending id, membership is
+    /// returned in ascending id, and no step consults a hash map. Nothing here reads a clock or an
+    /// entropy source.
+    ///
+    /// # Distance
+    ///
+    /// `max_distance` is a **distance**, not one of the higher-is-better scores [`Metric`]
+    /// exposes, and its meaning follows the column's metric:
+    ///
+    ///   - [`Metric::Cosine`] — `1 - cos`, in `[0, 2]`. This is the scale Immich's 0.3–0.7 is on.
+    ///     A zero vector has no direction, so its distance to anything is defined as 1.0.
+    ///   - [`Metric::L2`] and [`Metric::Dot`] — plain Euclidean distance. An inner product is not
+    ///     a distance and has no zero point for identical vectors, so under `Dot` this uses the
+    ///     Euclidean distance and says so rather than inventing a threshold scale.
+    ///
+    /// Distances are computed on the **active prefix** of the **highest tier retained** — exact
+    /// f32 on a normal column, the int8 reconstruction on a compact one.
+    ///
+    /// # Cost
+    ///
+    /// `O(n²·d)` time, `O(n·d)` working memory — every pair is compared twice over, once to count
+    /// degrees and once while expanding. No adjacency list is materialised, so a pathological
+    /// column where every point neighbours every other costs no more memory than a sparse one.
+    /// For the corpus size this module targets that is the right trade; it is not an ANN index and
+    /// does not pretend to be, for the reason the module header gives.
+    ///
+    /// # Degenerate input is answered, not punished
+    ///
+    /// An empty column, a single vector, `min_neighbour` of 0 (every point becomes core), a
+    /// `max_distance` of 0, a huge one, a negative one, and a non-finite one all return without
+    /// panicking. A `max_distance` that no comparison can satisfy yields every point as noise.
+    pub fn cluster(&self, max_distance: f32, min_neighbour: usize) -> Cluster {
+        if self.len == 0 {
+            return Cluster::default();
+        }
+
+        // Dequantise once. Doing it inside the O(n^2) loop would dominate the cost of the loop.
+        let point: Vec<Vec<f32>> = (0..self.len)
+            .map(|id| {
+                let mut v = self.dense(id);
+                v.truncate(self.active);
+                v
+            })
+            .collect();
+        let mag: Vec<f32> = point.iter().map(|v| norm(v)).collect();
+        let metric = self.metric;
+        let near = |a: usize, b: usize| -> bool {
+            separation(metric, &point[a], &point[b], mag[a], mag[b]) <= max_distance
+        };
+
+        // Pass 1 -- the degree of every point, hence which points are core. The relation is
+        // symmetric, so each pair is examined once and credited to both ends.
+        let mut degree = vec![0usize; self.len];
+        for a in 0..self.len {
+            for b in (a + 1)..self.len {
+                if near(a, b) {
+                    degree[a] += 1;
+                    degree[b] += 1;
+                }
+            }
+        }
+        let core: Vec<bool> = degree.iter().map(|d| *d >= min_neighbour).collect();
+
+        // Pass 2 -- seed from every unlabelled core point in ascending id, and expand breadth
+        // first, scanning candidates in ascending id. Those two orderings are the whole of the
+        // determinism guarantee: a border point reachable from two groups joins the one whose seed
+        // has the lower id, on every run.
+        let mut label = vec![NOISE; self.len];
+        let mut member: Vec<Vec<u32>> = Vec::new();
+        let mut queue: Vec<usize> = Vec::new();
+        for seed in 0..self.len {
+            if !core[seed] || label[seed] != NOISE {
+                continue;
+            }
+            let group = member.len() as u32;
+            label[seed] = group;
+            queue.clear();
+            queue.push(seed);
+            let mut of = vec![seed as u32];
+            let mut head = 0;
+            while head < queue.len() {
+                let p = queue[head];
+                head += 1;
+                // A border point is absorbed but never expanded from -- that is the difference
+                // between density-reachable and density-connected, and skipping it is what stops a
+                // chain of non-core points welding two groups together.
+                if !core[p] {
+                    continue;
+                }
+                // `p` itself is already labelled, so the NOISE test also excludes it.
+                for (q, l) in label.iter_mut().enumerate() {
+                    if *l != NOISE || !near(p, q) {
+                        continue;
+                    }
+                    *l = group;
+                    of.push(q as u32);
+                    queue.push(q);
+                }
+            }
+            of.sort_unstable();
+            member.push(of);
+        }
+
+        let noise = label.iter().filter(|l| **l == NOISE).count();
+        Cluster { label, member, noise }
+    }
+
     // ---- internals -------------------------------------------------------------------------
 
     /// Dequantise one stored vector to `dim` floats.
@@ -685,6 +845,118 @@ impl TopK {
         let mut v = self.heap.into_vec();
         v.sort_unstable();
         v.into_iter().map(|(Reverse(Score(s)), id)| (id, s)).collect()
+    }
+}
+
+/// The label of a vector no core point could reach.
+///
+/// A DBSCAN that forces every point into the nearest group is a DBSCAN that has thrown away its
+/// only honest answer. `u32::MAX` is used rather than an `Option` so the label vector stays a flat
+/// `&[u32]` a host can hand straight to a UI, and it can never collide with a real ordinal: a
+/// column holds at most `u32::MAX` vectors, so the highest ordinal reachable is `u32::MAX - 1`.
+pub const NOISE: u32 = u32::MAX;
+
+/// The result of [`VectorColumn::cluster`]: one opaque group ordinal per vector.
+///
+/// # What this type is not, on purpose
+///
+/// It carries **no name, no identity and no string**, and it exposes nothing that could match one
+/// of its groups against a group from another column. The ordinals are positional and scoped to
+/// the one column that produced them — the natural UX is "Person 1", "Person 2", and attaching a
+/// real name to an ordinal is the host's opt-in decision, made above this line. See
+/// [`VectorColumn::cluster`] for why the omission is load-bearing rather than an oversight.
+///
+/// Ordinals are assigned in ascending seed id, so they are stable across runs; they are *not*
+/// stable across edits to the column, and nothing here pretends otherwise.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Cluster {
+    /// One label per vector, indexed by id. [`NOISE`] where no core point reached it.
+    label: Vec<u32>,
+    /// Member ids per group ordinal, each ascending.
+    member: Vec<Vec<u32>>,
+    /// How many labels are [`NOISE`].
+    noise: usize,
+}
+
+impl Cluster {
+    /// Per-vector labels, indexed by id, [`NOISE`] for an unreachable point.
+    ///
+    /// This slice is the byte-identical artefact the determinism guarantee is about.
+    pub fn label(&self) -> &[u32] {
+        &self.label
+    }
+
+    /// The label of one vector, or `None` for an id the column never issued.
+    pub fn label_at(&self, id: u32) -> Option<u32> {
+        self.label.get(id as usize).copied()
+    }
+
+    /// Whether `id` was left unreachable. `false` for an unknown id, which is not noise but
+    /// nothing at all.
+    pub fn is_noise(&self, id: u32) -> bool {
+        self.label_at(id) == Some(NOISE)
+    }
+
+    /// Number of vectors labelled, noise included — i.e. the length of the clustered column.
+    pub fn len(&self) -> usize {
+        self.label.len()
+    }
+
+    /// Whether nothing was clustered.
+    pub fn is_empty(&self) -> bool {
+        self.label.is_empty()
+    }
+
+    /// How many groups were formed. Group ordinals are `0..group_count`.
+    pub fn group_count(&self) -> usize {
+        self.member.len()
+    }
+
+    /// How many vectors are [`NOISE`].
+    ///
+    /// Reported rather than buried because it is the number that says whether `max_distance` and
+    /// `min_neighbour` were chosen sanely: a run where almost everything is noise and a run where
+    /// everything is one group are both failures, and only this figure distinguishes them from a
+    /// good one.
+    pub fn noise_count(&self) -> usize {
+        self.noise
+    }
+
+    /// The member ids of one group, ascending. Empty for an ordinal no group has.
+    pub fn group(&self, group: u32) -> &[u32] {
+        self.member.get(group as usize).map_or(&[], |g| g.as_slice())
+    }
+
+    /// Every group's membership, in ordinal order.
+    pub fn membership(&self) -> &[Vec<u32>] {
+        &self.member
+    }
+}
+
+/// The distance [`VectorColumn::cluster`] thresholds against.
+///
+/// Separate from `score_f32` because that family is deliberately higher-is-better for k-selection,
+/// and DBSCAN needs the opposite sense with a true zero at "identical". `na`/`nb` are the
+/// precomputed norms, so the cosine branch costs one dot product per pair rather than three.
+fn separation(metric: Metric, a: &[f32], b: &[f32], na: f32, nb: f32) -> f32 {
+    match metric {
+        Metric::Cosine => {
+            if na > 0.0 && nb > 0.0 {
+                let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+                (1.0 - dot / (na * nb)).clamp(0.0, 2.0)
+            } else {
+                // A zero vector has no direction. Calling that distance 0 would weld every blank
+                // frame in a corpus into one group; 1.0 is the orthogonal case, which is what "no
+                // information about the angle" actually means.
+                1.0
+            }
+        }
+        // An inner product is not a distance -- it has no zero point for a pair of identical
+        // vectors and grows with magnitude -- so Dot clusters on Euclidean distance and says so
+        // rather than inventing a threshold scale nobody has calibrated.
+        Metric::Dot | Metric::L2 => {
+            a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt()
+        }
     }
 }
 
@@ -1069,5 +1341,369 @@ mod test {
             let q: Vec<f32> = v[probe].iter().map(|x| x + 0.05).collect();
             assert_eq!(col.search(&q, 5, 250), col.search_exact(&q, 5), "probe {probe}");
         }
+    }
+
+    // ---- p55: clustering ------------------------------------------------------------------
+
+    /// A labelled synthetic set: `group` well-separated centroids, `per` points jittered about
+    /// each, plus `stray` lone points that belong to no group and must come back as [`NOISE`].
+    ///
+    /// Returns the vectors and the *true* group of each, so purity, completeness and the
+    /// false-merge rate can be computed against a ground truth rather than eyeballed. A stray's
+    /// truth label is `usize::MAX`.
+    fn labelled_corpus(
+        seed: u64,
+        group: usize,
+        per: usize,
+        stray: usize,
+        dim: usize,
+        jitter: f32,
+    ) -> (Vec<Vec<f32>>, Vec<usize>) {
+        let mut g = Lcg::new(seed);
+        let mut v = Vec::with_capacity(group * per + stray);
+        let mut truth = Vec::with_capacity(group * per + stray);
+        for t in 0..group {
+            let centre: Vec<f32> = (0..dim).map(|_| g.normal()).collect();
+            for _ in 0..per {
+                v.push(centre.iter().map(|x| x + jitter * g.normal()).collect());
+                truth.push(t);
+            }
+        }
+        for _ in 0..stray {
+            v.push((0..dim).map(|_| g.normal()).collect());
+            truth.push(usize::MAX);
+        }
+        (v, truth)
+    }
+
+    /// Purity, completeness and the **false-merge rate**, reported as three separate numbers.
+    ///
+    /// They are separate because `p55` acceptance 1 says so, and it says so because NIST FRVT
+    /// found demographic false-*positive* differentials of up to ~7,203x versus ~3x for false
+    /// negatives. A merge of two people is the error that discriminates; a single "accuracy"
+    /// figure averages it away against the harmless failure.
+    ///
+    ///   - **purity** — over clustered (non-noise) points, the fraction sitting in a cluster whose
+    ///     majority true group is their own. 1.0 means no cluster mixes two people.
+    ///   - **completeness** — over *all* points including noise, the fraction of each true group
+    ///     that landed in that group's single largest cluster. Noise counts against it, which is
+    ///     the pessimistic reading and the right one.
+    ///   - **false merge** — of all unordered pairs of distinct true groups, the fraction that
+    ///     share at least one cluster. This is the number that must be zero.
+    fn score(truth: &[usize], truth_count: usize, c: &Cluster) -> (f64, f64, f64) {
+        let g = c.group_count();
+        // tally[group][true_group]; strays (usize::MAX) are excluded from every count -- they have
+        // no true group to be pure or complete about.
+        let mut tally = vec![vec![0usize; truth_count]; g];
+        for (id, t) in truth.iter().enumerate() {
+            if *t == usize::MAX {
+                continue;
+            }
+            let l = c.label[id];
+            if l != NOISE {
+                tally[l as usize][*t] += 1;
+            }
+        }
+
+        let clustered: usize = tally.iter().flat_map(|r| r.iter()).sum();
+        let purity = if clustered == 0 {
+            0.0
+        } else {
+            tally.iter().map(|r| *r.iter().max().unwrap_or(&0)).sum::<usize>() as f64
+                / clustered as f64
+        };
+
+        let total: usize = truth.iter().filter(|t| **t != usize::MAX).count();
+        let completeness = if total == 0 {
+            0.0
+        } else {
+            (0..truth_count)
+                .map(|t| tally.iter().map(|r| r[t]).max().unwrap_or(0))
+                .sum::<usize>() as f64
+                / total as f64
+        };
+
+        let mut merged = 0usize;
+        let mut pair = 0usize;
+        for a in 0..truth_count {
+            for b in (a + 1)..truth_count {
+                pair += 1;
+                if tally.iter().any(|r| r[a] > 0 && r[b] > 0) {
+                    merged += 1;
+                }
+            }
+        }
+        let false_merge = if pair == 0 { 0.0 } else { merged as f64 / pair as f64 };
+
+        (purity, completeness, false_merge)
+    }
+
+    /// The correctness measurement: eight well-separated true groups of twelve, plus six lone
+    /// strays, clustered at Immich's own settings — max distance 0.3, `min_neighbour` 3.
+    ///
+    /// Measured on this set: **purity 1.0000, completeness 1.0000, false-merge rate 0.0000**, 8
+    /// groups recovered and all 6 strays returned as noise. Every one of those is asserted, and
+    /// the false-merge rate is asserted as its own number rather than folded into an accuracy.
+    #[test]
+    fn cluster_recovers_a_known_group_and_reports_purity_completeness_and_false_merge() {
+        let (v, truth) = labelled_corpus(90_055, 8, 12, 6, 32, 0.05);
+        let col = column(&v, 32, Metric::Cosine, true);
+        let c = col.cluster(0.3, 3);
+
+        let (purity, completeness, false_merge) = score(&truth, 8, &c);
+        println!(
+            "p55 recovery: group {} noise {} purity {purity:.4} completeness {completeness:.4} \
+             false-merge {false_merge:.4}",
+            c.group_count(),
+            c.noise_count()
+        );
+
+        assert_eq!(c.group_count(), 8, "eight true groups, eight clusters");
+        assert_eq!(c.noise_count(), 6, "the six strays are noise, not forced into a group");
+        assert!((purity - 1.0).abs() < 1e-12, "measured purity 1.0, got {purity:.4}");
+        assert!(
+            (completeness - 1.0).abs() < 1e-12,
+            "measured completeness 1.0, got {completeness:.4}"
+        );
+        assert!(
+            false_merge == 0.0,
+            "measured false-merge rate 0.0, got {false_merge:.4} -- this is the number that must \
+             not be averaged into an accuracy"
+        );
+
+        // Membership is the same partition the labels describe, and every group is ascending.
+        assert_eq!(c.len(), v.len());
+        let mut seen = 0;
+        for g in 0..c.group_count() as u32 {
+            let m = c.group(g);
+            assert!(m.windows(2).all(|w| w[0] < w[1]), "group {g} must be ascending ids");
+            for id in m {
+                assert_eq!(c.label_at(*id), Some(g));
+                assert!(!c.is_noise(*id));
+            }
+            seen += m.len();
+        }
+        assert_eq!(seen + c.noise_count(), c.len(), "every vector is in exactly one group or noise");
+        assert!(c.group(99).is_empty(), "an ordinal no group has is empty, not a panic");
+        assert_eq!(c.label_at(v.len() as u32), None, "an unissued id has no label");
+    }
+
+    /// The failure a single "accuracy" number hides.
+    ///
+    /// Two of the three true groups are placed close together on purpose. At a radius wide enough
+    /// to swallow the gap, **completeness stays perfect and every point is still clustered** — an
+    /// accuracy-shaped figure would look fine — while two distinct people have in fact been welded
+    /// into one identity. Measured here at r=0.5: completeness 1.0000, purity 0.6667, **false-merge
+    /// rate 0.3333** (one of the three group pairs merged). Only the third number sees it.
+    #[test]
+    fn cluster_reports_the_false_merge_rate_separately_from_accuracy() {
+        let dim = 32;
+        let mut g = Lcg::new(55_055);
+        let near_a: Vec<f32> = (0..dim).map(|_| g.normal()).collect();
+        // A neighbour centroid a short angular hop away -- two different people who happen to
+        // embed close, which is exactly the demographic false-positive case.
+        let near_b: Vec<f32> = near_a.iter().map(|x| x + 0.62 * g.normal()).collect();
+        let far: Vec<f32> = (0..dim).map(|_| g.normal()).collect();
+
+        let mut v = Vec::new();
+        let mut truth = Vec::new();
+        for (t, centre) in [&near_a, &near_b, &far].into_iter().enumerate() {
+            for _ in 0..12 {
+                v.push(centre.iter().map(|x| x + 0.05 * g.normal()).collect::<Vec<f32>>());
+                truth.push(t);
+            }
+        }
+        let col = column(&v, dim, Metric::Cosine, true);
+
+        let tight = col.cluster(0.05, 3);
+        let (tp, tc, tf) = score(&truth, 3, &tight);
+        println!("p55 false-merge, tight r=0.05: purity {tp:.4} completeness {tc:.4} merge {tf:.4}");
+        assert_eq!(tight.group_count(), 3, "at a tight radius the three groups stay apart");
+        assert!(tf == 0.0, "no merge at r=0.05, got {tf:.4}");
+
+        let wide = col.cluster(0.5, 3);
+        let (wp, wc, wf) = score(&truth, 3, &wide);
+        println!("p55 false-merge, wide  r=0.50: purity {wp:.4} completeness {wc:.4} merge {wf:.4}");
+        assert_eq!(wide.noise_count(), 0, "nothing is noise -- an accuracy number would be happy");
+        assert!(
+            (wc - 1.0).abs() < 1e-12,
+            "completeness stays perfect through the merge, got {wc:.4}"
+        );
+        assert!(
+            (wf - 1.0 / 3.0).abs() < 1e-12,
+            "measured false-merge rate 1/3 -- one of three group pairs welded -- got {wf:.4}"
+        );
+        assert!(wp < wc, "purity {wp:.4} must fall while completeness {wc:.4} does not");
+    }
+
+    /// `p55` acceptance 2. dlib's Chinese Whispers is non-deterministic across runs; this must not
+    /// be. Five clusterings of the same column, byte-identical every time.
+    #[test]
+    fn cluster_is_byte_identical_across_five_run() {
+        let (v, _) = labelled_corpus(4_242, 7, 9, 4, 24, 0.06);
+        let col = column(&v, 24, Metric::Cosine, true);
+
+        let first = col.cluster(0.3, 3);
+        for run in 1..5 {
+            let again = col.cluster(0.3, 3);
+            assert_eq!(first.label(), again.label(), "run {run} produced different labels");
+            assert_eq!(first.membership(), again.membership(), "run {run} differs in membership");
+            assert_eq!(first.noise_count(), again.noise_count(), "run {run} differs in noise");
+            assert_eq!(first, again, "run {run} is not byte-identical");
+        }
+
+        // A second column built from the same vectors in the same order is the same clustering --
+        // determinism is a property of the input, not of one live object's history.
+        let twin = column(&v, 24, Metric::Cosine, true);
+        assert_eq!(first, twin.cluster(0.3, 3), "a rebuilt column must cluster identically");
+    }
+
+    /// Nothing degenerate may panic: an empty column, one vector, `min_neighbour` 0, a radius of
+    /// 0, a huge radius, a negative one, a non-finite one, and a column of identical vectors.
+    #[test]
+    fn cluster_answers_degenerate_input_without_panicking() {
+        // Empty.
+        let empty = VectorColumn::new(8, Metric::Cosine);
+        for (r, m) in [(0.0, 0), (0.5, 3), (f32::INFINITY, usize::MAX)] {
+            let c = empty.cluster(r, m);
+            assert!(c.is_empty());
+            assert_eq!(c.group_count(), 0);
+            assert_eq!(c.noise_count(), 0);
+            assert_eq!(c.label_at(0), None);
+        }
+
+        // A zero-dimension column can never hold a vector, so it clusters to nothing.
+        assert!(VectorColumn::new(0, Metric::Cosine).cluster(0.5, 1).is_empty());
+
+        // One vector. min_neighbour 3 leaves it noise -- it has no neighbours to be core with --
+        // and min_neighbour 0 makes it its own group.
+        let mut one = VectorColumn::new(4, Metric::Cosine);
+        one.push(&[1.0, 0.0, 0.0, 0.0]).expect("push");
+        assert_eq!(one.cluster(0.5, 3).noise_count(), 1);
+        assert_eq!(one.cluster(0.5, 3).group_count(), 0);
+        assert_eq!(one.cluster(0.5, 0).group_count(), 1);
+        assert_eq!(one.cluster(0.5, 0).noise_count(), 0);
+        assert_eq!(one.cluster(0.0, 0).group(0), &[0]);
+
+        // Every vector identical. A radius of 0 under L2 is an exact tie, so they are all one
+        // group; under cosine the same holds at any usable radius.
+        let same: Vec<Vec<f32>> = (0..16).map(|_| vec![0.3f32, -0.7, 0.1, 0.5]).collect();
+        for metric in [Metric::Cosine, Metric::L2, Metric::Dot] {
+            let col = column(&same, 4, metric, true);
+            let c = col.cluster(0.5, 3);
+            assert_eq!(c.group_count(), 1, "{metric:?}: identical vectors are one group");
+            assert_eq!(c.noise_count(), 0, "{metric:?}");
+            assert_eq!(c.group(0).len(), 16, "{metric:?}");
+        }
+        let exact_tie = column(&same, 4, Metric::L2, true).cluster(0.0, 3);
+        assert_eq!(exact_tie.group_count(), 1, "a zero radius still joins exact duplicates");
+
+        // A radius nothing can satisfy: negative, and NaN. Every point is noise, no panic.
+        let (v, _) = labelled_corpus(7, 4, 5, 2, 16, 0.05);
+        let col = column(&v, 16, Metric::Cosine, true);
+        for r in [-1.0f32, f32::NAN, f32::NEG_INFINITY] {
+            let c = col.cluster(r, 3);
+            assert_eq!(c.noise_count(), c.len(), "radius {r} must leave everything noise");
+            assert_eq!(c.group_count(), 0, "radius {r}");
+            assert!(c.label().iter().all(|l| *l == NOISE), "radius {r}");
+        }
+
+        // A radius that swallows the corpus: one group, nothing noise.
+        for r in [10.0f32, 1e30, f32::INFINITY] {
+            let c = col.cluster(r, 3);
+            assert_eq!(c.group_count(), 1, "radius {r} must merge everything into one group");
+            assert_eq!(c.noise_count(), 0, "radius {r}");
+        }
+
+        // min_neighbour 0 makes every point core, so nothing can be noise at any radius.
+        for r in [0.0f32, 0.3, 1e30] {
+            assert_eq!(col.cluster(r, 0).noise_count(), 0, "min_neighbour 0, radius {r}");
+        }
+        // min_neighbour larger than the column makes every point noise.
+        assert_eq!(col.cluster(1e30, usize::MAX).noise_count(), col.len());
+
+        // A compact column has no f32 tier; clustering the int8 reconstruction must still work.
+        let compact = column(&v, 16, Metric::Cosine, false);
+        assert!(compact.cluster(0.3, 3).group_count() > 0);
+
+        // And under truncation, where the active prefix is shorter than the stored dimension.
+        let mut short = column(&v, 16, Metric::Cosine, true);
+        short.truncate(8).expect("truncate");
+        let _ = short.cluster(0.3, 3);
+    }
+
+    /// Widening the radius may only **merge** groups, never split one.
+    ///
+    /// The invariant is stated on pairs, because that is where it is actually true: DBSCAN's raw
+    /// cluster *count* can rise with the radius when former noise becomes dense enough to form a
+    /// group of its own. What can never happen is two points sharing a group at a tight radius and
+    /// not sharing one at a wider radius — a core point stays core as its degree only grows, and
+    /// every edge that existed still exists, so density-connectivity is monotone. Two consequences
+    /// are asserted too: noise never increases, and the number of distinct groups covering the
+    /// points that were already clustered never increases.
+    #[test]
+    fn a_wider_radius_merges_group_and_never_split_them() {
+        let (v, _) = labelled_corpus(1_234_567, 9, 11, 7, 32, 0.06);
+        let col = column(&v, 32, Metric::Cosine, true);
+        let radius = [0.01f32, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9, 1.2, 2.0];
+
+        let mut previous: Option<Cluster> = None;
+        let mut shape = Vec::new();
+        for r in radius {
+            let wide = col.cluster(r, 3);
+            shape.push((r, wide.group_count(), wide.noise_count()));
+
+            if let Some(tight) = previous {
+                assert!(
+                    wide.noise_count() <= tight.noise_count(),
+                    "r={r}: noise rose from {} to {}",
+                    tight.noise_count(),
+                    wide.noise_count()
+                );
+                // Pairwise: co-clustered at the tighter radius implies co-clustered here.
+                for a in 0..tight.len() as u32 {
+                    let la = tight.label_at(a).expect("label");
+                    if la == NOISE {
+                        continue;
+                    }
+                    assert!(
+                        !wide.is_noise(a),
+                        "r={r}: id {a} was clustered at the tighter radius and is now noise"
+                    );
+                    for b in (a + 1)..tight.len() as u32 {
+                        if tight.label_at(b) == Some(la) {
+                            assert_eq!(
+                                wide.label_at(a),
+                                wide.label_at(b),
+                                "r={r}: ids {a} and {b} shared a group at the tighter radius and \
+                                 have been split"
+                            );
+                        }
+                    }
+                }
+                // The image of the tight partition under the wide one can only shrink.
+                let mut image: Vec<u32> = (0..tight.len() as u32)
+                    .filter(|id| !tight.is_noise(*id))
+                    .filter_map(|id| wide.label_at(id))
+                    .collect();
+                image.sort_unstable();
+                image.dedup();
+                let mut before: Vec<u32> =
+                    tight.label().iter().copied().filter(|l| *l != NOISE).collect();
+                before.sort_unstable();
+                before.dedup();
+                assert!(
+                    image.len() <= before.len(),
+                    "r={r}: {} groups became {} -- that is a split, not a merge",
+                    before.len(),
+                    image.len()
+                );
+            }
+            previous = Some(wide);
+        }
+        println!("p55 monotonicity (radius, group, noise): {shape:?}");
+        let last = previous.expect("at least one radius");
+        assert_eq!(last.group_count(), 1, "at r=2.0 cosine distance saturates: one group");
+        assert_eq!(last.noise_count(), 0);
     }
 }

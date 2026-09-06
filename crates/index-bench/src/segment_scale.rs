@@ -203,11 +203,38 @@ fn main() {
     println!("  {}", "-".repeat(70));
 
     let mut fail = 0usize;
+    // p52: what collection-wide statistics cost, measured INTERLEAVED in one process.
+    //
+    // Comparing against a number from a previous run is not a measurement on this machine: the
+    // one-segment p50 alone swung 15 -> 30 us between runs while the quality columns stayed
+    // bit-identical, because another build was running. So both arms are timed back to back on the
+    // same collection, which is the method `p27` and `p46` already use here.
+    let mut ab: Vec<(usize, f64, f64, f64, f64)> = Vec::new();
     for &n in &LADDER {
         let t0 = std::time::Instant::now();
-        let s = segmented(&product, n);
+        let mut s = segmented(&product, n);
         let build_s = t0.elapsed().as_secs_f64();
         assert_eq!(s.doc_count(), product.len(), "segmentation must not lose documents");
+
+        if n > 1 {
+            s.set_collection_stat(false);
+            let mut off = clock.time_each(probe.len(), |i| s.search(&probe[i], 10).len() as u64);
+            off.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mut off_t = clock.time_each(dirty.len(), |i| s.search(&dirty[i], 10).len() as u64);
+            off_t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            s.set_collection_stat(true);
+            let mut on = clock.time_each(probe.len(), |i| s.search(&probe[i], 10).len() as u64);
+            on.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mut on_t = clock.time_each(dirty.len(), |i| s.search(&dirty[i], 10).len() as u64);
+            on_t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            ab.push((
+                n,
+                timer::percentile(&off, 0.50) / 1000.0,
+                timer::percentile(&on, 0.50) / 1000.0,
+                timer::percentile(&off_t, 0.99) / 1000.0,
+                timer::percentile(&on_t, 0.99) / 1000.0,
+            ));
+        }
 
         let mut e = clock.time_each(probe.len(), |i| s.search(&probe[i], 10).len() as u64);
         e.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -301,6 +328,30 @@ fn main() {
             println!("    CONTROL FAILED: one segment must equal the monolithic index exactly");
             fail += 1;
         }
+    }
+
+    // p52: the cost of collection-wide statistics, both arms timed on the same collection.
+    if !ab.is_empty() {
+        println!(
+            "\n  --- p52: what collection-wide statistics cost (interleaved, same process) ---"
+        );
+        println!(
+            "  {:>6}  {:>11}  {:>11}  {:>7}  {:>13}  {:>13}  {:>7}",
+            "segs", "p50 off", "p50 on", "x", "typo p99 off", "typo p99 on", "x"
+        );
+        for (n, o50, n50, o99, n99) in &ab {
+            println!(
+                "  {:>6}  {:>9.0}us  {:>9.0}us  {:>6.2}x  {:>11.0}us  {:>11.0}us  {:>6.2}x",
+                n, o50, n50, n50 / o50.max(0.001), o99, n99, n99 / o99.max(0.001)
+            );
+        }
+        println!(
+            "  A second dictionary expansion per segment is the price of knowing a term's"
+        );
+        println!(
+            "  corpus-wide document frequency at all. `Searcher::set_collection_stat(false)`"
+        );
+        println!("  trades the parity back for the latency.");
     }
 
     println!("\n  Read: all columns compare against a single index over identical rows.");

@@ -137,3 +137,7 @@ path = "src/cdc_equivalence.rs"
 [[bin]]
 name = "image-corpus"
 path = "src/image_corpus.rs"
+
+[[bin]]
+name = "video-shot"
+path = "src/video_shot.rs"

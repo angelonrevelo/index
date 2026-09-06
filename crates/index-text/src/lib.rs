@@ -44,5 +44,7 @@ pub use analyze::{fold, parse_quantity, tokenize, AliasTable, BaseUnit, Quantity
 pub use dict::{max_edit_for, TermDict, TermMatch};
 pub use format::{posting_span, read_section_table, SectionTable, Span, MAGIC};
 pub use fuse::{convex, rrf, RRF_K};
-pub use index::{Doc, FacetClause, Field, Hit, Index, IndexBuilder, Schema, MAX_FIELD};
+pub use index::{
+    Doc, FacetClause, Field, Hit, Index, IndexBuilder, Schema, MAX_COLUMN, MAX_FIELD,
+};
 pub use searcher::{Searcher, DEFAULT_COMPACTION_RATIO};

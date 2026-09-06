@@ -1,16 +1,29 @@
 # P49 — the vector column: brute force, and why that is the right answer
 
 **Tier:** T1 · **Bin:** `image-corpus` · **API:** `VectorColumn`
-**Status: BUILT, 2026-09-06 — but acceptance 1 is NOT MET, it is WITHHELD.**
+**Status: SHIPPED, 2026-09-06. Acceptance 1 is MET — recall@10 = 0.9870 on REAL embeddings.**
 `crates/index-image/vector.rs` implements the three tiers and the pipeline, with 14 tests green.
 On a seeded clustered set the measured top-10 recall vs the exact oracle is **1.0000** at the
 default oversample, and **0.333 / 0.603 / 0.876 at oversample 4 / 16 / 64** for a query sitting in
 no neighbourhood at all — that second number is the honest boundary of the binary prefilter and is
 recorded rather than hidden.
-**But those vectors are synthetic.** The corpus benchmark prints `[HELD]` and refuses a recall
-verdict, because a recall figure over made-up vectors measures the arithmetic, not the retrieval.
-`docs/research/image.md` §4's `UNVERIFIED` for image-embedding recall **stays UNVERIFIED** until a
-real encoder runs against this corpus. **This row is not done.**
+**A real encoder has now run.** `scripts/embed-corpus.py` produced **12,007 real CLIP ViT-B/32
+embeddings** over the `p51` corpus (90 img/s on an RTX 2060 SUPER, 133 s, zero placeholders), and
+the benchmark measured the binary-prefilter pipeline against `search_exact` at the default
+oversample of 4:
+
+> **recall@10 = 0.9870.**
+
+That is the number `docs/research/image.md` §4 recorded as `UNVERIFIED` — every published
+binary-quantisation recall figure is for **text** embeddings. It lands inside Qdrant's 0.98–0.9966
+text band, so the published result does transfer to image embeddings; it is now a measurement here
+rather than an assumption borrowed from a different modality.
+
+**A second result came free, and it justifies the SYNTHETIC discipline in hard numbers.** The same
+benchmark reports fused p50 **623 µs on seeded vectors** and **1,467 µs on real ones — 2.4x
+higher**. Real image embeddings over a corpus that is 42.69 % duplicates are densely clustered, so
+the Hamming shortlist survives with far more ties for the rerank to resolve. A benchmark that had
+quietly accepted synthetic vectors would have understated its own latency by more than double.
 
 The reflex when adding vector search is to reach for HNSW. At this project's scale that is the
 wrong tool, and [`docs/research/image.md`](../../docs/research/image.md) §4 has the numbers:
