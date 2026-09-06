@@ -3,3 +3,6 @@
 Cargo.lock
 artifact/
 node_modules/
+# Built WebAssembly artifacts (scripts/build-wasm.sh). Reproducible from source,
+# and `index.wasm` alone is 374 KB -- not something to carry in git history.
+/dist

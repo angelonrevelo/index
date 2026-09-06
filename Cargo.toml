@@ -5,9 +5,11 @@ members = [
     "crates/index-text",
     "crates/index-geo",
     "crates/index-geo-wasm",
+    "crates/index-image",
     "crates/index-wasm",
     "crates/index-accel",
     "crates/index-bench",
+    "crates/index-cli",
 ]
 # `index-accel` is a `no_std` wasm32-only kernel module: it has a `#[panic_handler]` and uses
 # `core::arch::wasm32`, so it cannot build for the host. Workspace commands skip it by default;
@@ -16,8 +18,10 @@ default-members = [
     "crates/index-core",
     "crates/index-text",
     "crates/index-geo",
+    "crates/index-image",
     "crates/index-wasm",
     "crates/index-bench",
+    "crates/index-cli",
 ]
 
 [workspace.package]

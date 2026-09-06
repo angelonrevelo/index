@@ -82,12 +82,58 @@ path = "src/presyo_categorize.rs"
 name = "profstopick-dept"
 path = "src/profstopick_dept.rs"
 
+[[bin]]
+name = "prune-consistency"
+path = "src/prune_consistency.rs"
+
+[[bin]]
+name = "pool-audit"
+path = "src/pool_audit.rs"
+
 [dependencies]
 index-core = { path = "../index-core" }
 index-text = { path = "../index-text" }
+index-accel = { path = "../index-accel" }
+index-image = { path = "../index-image" }
+# The pixel decoder, bench crate ONLY. `index-image` deliberately has none -- that is its thesis:
+# an image decoder is a host concern, not an index concern, and pulling one into the engine is how
+# every incumbent inherited a C++ toolchain. This benchmark IS a host, so it owns the decode.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 # Spike-only dependencies (bench crate only; `index-core` stays dependency-free).
 # Audited in docs/research/build-or-buy.md.
 tantivy-fst = "0.5"
 levenshtein_automata = "0.2"
 # Bench-only: reads the two production corpora exported by the consumer repos.
 serde_json = "1"
+
+[[bin]]
+name = "facet-shop"
+path = "src/facet_shop.rs"
+
+[[bin]]
+name = "accel-kernel"
+path = "src/accel_kernel.rs"
+
+[[bin]]
+name = "segment-scale"
+path = "src/segment_scale.rs"
+
+[[bin]]
+name = "booted-schema"
+path = "src/booted_schema.rs"
+
+[[bin]]
+name = "alec-surface"
+path = "src/alec_surface.rs"
+
+[[bin]]
+name = "phrase-cost"
+path = "src/phrase_cost.rs"
+
+[[bin]]
+name = "cdc-equivalence"
+path = "src/cdc_equivalence.rs"
+
+[[bin]]
+name = "image-corpus"
+path = "src/image_corpus.rs"

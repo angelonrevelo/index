@@ -3,7 +3,7 @@
 <title>index — in a real browser</title>
 <style>
   body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 2rem; max-width: 60rem; }
-  h1 { font-size: 1.1rem; }
+  h1 { font-size: 1.1rem; } h2 { font-size: 1rem; margin-top: 1.5rem; }
   .pass { color: #0a7f2e; } .fail { color: #b00020; font-weight: 700; }
   table { border-collapse: collapse; margin: 1rem 0; }
   td, th { padding: .2rem .8rem .2rem 0; text-align: left; vertical-align: top; }
@@ -14,18 +14,39 @@
 <p>
   The same <code>.wasm</code> Node runs, the same index file, no wasm-bindgen. If this page shows
   PASS, the engine works on the tier profstopick actually ships to — a browser, offline after first
-  load, with no server in the query path.
+  load, with no server in the query path. That covers the text tier and the IMAGE tier: a fused
+  query over caption, facet, numeric range, embedding and perceptual hash, top-k selected once, on
+  this main thread — which is precisely where every server-bound photo system cannot follow.
 </p>
 <div id="meta"></div>
 <div id="out"></div>
+<h2>linear memory</h2>
+<div id="memory"></div>
+<pre id="json" hidden></pre>
 <div id="verdict"></div>
 
 <script type="module">
   // Deliberately NOT importing js/index.mjs: this page exercises the raw ABI the way a browser
   // host would, so a failure here cannot be hidden by the Node wrapper.
-  const ABI_VERSION = 2;
+  const ABI_VERSION = 12;
   const HIT_BYTE = 12;
+  const IMAGE_HIT_BYTE = 12; // u32 doc, f32 score, u32 why
+  const IMAGE_NEAR_BYTE = 8; // u32 doc, u32 distance
+  const ERR = 0xffffffff;
   const u32 = (n) => n >>> 0;
+
+  // Linear memory only ever grows, so the current byte length IS the high-water mark. A browser
+  // TAB has a different memory posture from Node — a fresh heap, a render loop next door, and a
+  // 4 GiB ceiling shared with everything else on the page — so the number is worth having
+  // separately from the one `js/image-smoke.mjs` prints.
+  let memory = null;
+  let highWater = 0;
+  const phase = [];
+  const mark = (label) => {
+    const at = memory ? memory.buffer.byteLength : 0;
+    if (at > highWater) highWater = at;
+    phase.push([label, at]);
+  };
 
   const out = document.getElementById('out');
   let failed = 0;
@@ -42,6 +63,8 @@
     const { instance } = await WebAssembly.instantiateStreaming(fetch('./index_wasm.wasm'), {});
     const e = instance.exports;
     const compileMs = performance.now() - t0;
+    memory = e.memory;
+    mark('module instantiated');
 
     check(e.idx_abi_version() === ABI_VERSION, `ABI version is ${ABI_VERSION}`);
 
@@ -116,6 +139,193 @@
     check(per < 5000, `${sample.length} real name queries: ${per.toFixed(0)} µs each, on the main thread`);
 
     e.idx_close(handle);
+    mark('text index closed');
+
+    // ---- The image tier, on the browser main thread ------------------------------------------
+    //
+    // This is the arm of p53 that carries the thesis. `docs/research/image.md` §1 finds that every
+    // alive FOSS photo system (Immich, LibrePhotos, PhotoPrism) needs a SERVER to answer a question
+    // about your own files, and §2 finds the browser is exactly where they fail. A fused image
+    // query — text, facet, numeric range, embedding and perceptual hash, top-k selected ONCE —
+    // running here, next to a render loop, with no server in the query path, is the claim.
+    //
+    // The corpus, the probe and the expected orders are `js/image-smoke.mjs` verbatim. Two
+    // independent assertions per query: the order this page DERIVES from cosine in JavaScript, and
+    // the order Node and Rust actually returned, frozen below. The second is what makes "the
+    // browser matches" a cross-tier claim rather than a self-consistent one.
+    const NODE = {
+      vector: '1,0,4,2,5,3', // js/image-smoke.mjs: "vector search matches the ordering JS computed"
+      fused: '0,2,5',        // ... "the surviving order is the JS cosine order restricted to the facet"
+      near: '0,1',           // ... "hash_near finds the re-encode within radius 4"
+      distance: '0,2',
+    };
+
+    const DIM = 8;
+    const SEP = '\0';
+    const SPEC = ['caption:3:0.4', 'camera:1:0.6:f', 'year:0:0.6:n'].join(SEP);
+    const image = [
+      { caption: 'beach sunset waves',   camera: 'Canon EOS R5', year: '2019',
+        vec: [0.90, 0.20, 0.10, 0.00, 0.00, 0.10, 0.00, 0.00], dhash: 0x0123456789abcdefn },
+      { caption: 'beach umbrella sand',  camera: 'iPhone 15',    year: '2020',
+        vec: [0.95, 0.25, 0.05, 0.00, 0.00, 0.00, 0.00, 0.00], dhash: 0x0123456789abcdecn },
+      { caption: 'mountain snow peak',   camera: 'Canon EOS R5', year: '2021',
+        vec: [0.10, 0.90, 0.20, 0.00, 0.00, 0.00, 0.00, 0.00], dhash: 0xffffffffffffffffn },
+      { caption: 'city street night',    camera: 'iPhone 15',    year: '2018',
+        vec: [0.00, 0.10, 0.95, 0.20, 0.00, 0.00, 0.00, 0.00], dhash: 0x0000000000000000n },
+      { caption: 'beach dog running',    camera: 'Pixel 8',      year: '2022',
+        vec: [0.80, 0.30, 0.20, 0.10, 0.00, 0.00, 0.00, 0.00], dhash: 0xaaaaaaaaaaaaaaaan },
+      { caption: 'forest trail mist',    camera: 'Canon EOS R5', year: '2017',
+        vec: [0.20, 0.20, 0.90, 0.10, 0.00, 0.00, 0.00, 0.00], dhash: 0x5555555555555555n },
+    ];
+    const probe = [1.0, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+    // Every helper re-derives its view from `e.memory.buffer`: `idx_alloc` can call `memory.grow()`,
+    // which DETACHES every existing view — even `grow(0)` — and a cached view then reads zeroes
+    // with no error at all.
+    const put = (s) => {
+      const b = enc.encode(s);
+      const p = u32(e.idx_alloc(b.length || 1));
+      if (b.length) new Uint8Array(e.memory.buffer, p, b.length).set(b);
+      return [p, b.length];
+    };
+    // THE EMBEDDING NEVER CROSSES AS JSON: one copy of f32 into linear memory, no parse on arrival.
+    const putF32 = (v) => {
+      const p = u32(e.idx_alloc(v.length * 4));
+      new Float32Array(e.memory.buffer, p, v.length).set(v);
+      return p;
+    };
+    const readImageHit = (h, n) => {
+      if (n === 0 || n === ERR) return [];
+      const dv = new DataView(e.memory.buffer, u32(e.idx_image_result_ptr(h)), n * IMAGE_HIT_BYTE);
+      return Array.from({ length: n }, (_, i) => ({
+        doc: dv.getUint32(i * IMAGE_HIT_BYTE, true),
+        score: dv.getFloat32(i * IMAGE_HIT_BYTE + 4, true),
+        why: dv.getUint32(i * IMAGE_HIT_BYTE + 8, true),
+      }));
+    };
+    const readNear = (h, n) => {
+      if (n === 0 || n === ERR) return [];
+      const dv = new DataView(e.memory.buffer, u32(e.idx_image_result_ptr(h)), n * IMAGE_NEAR_BYTE);
+      return Array.from({ length: n }, (_, i) => ({
+        doc: dv.getUint32(i * IMAGE_NEAR_BYTE, true),
+        distance: dv.getUint32(i * IMAGE_NEAR_BYTE + 4, true),
+      }));
+    };
+
+    const [sp, sl] = put(SPEC);
+    const ix = u32(e.idx_image_new(sp, sl, DIM, 0 /* cosine */));
+    e.idx_free(sp, sl);
+    check(ix !== 0, 'an image index with a facet and a numeric column is created in the browser');
+
+    for (const d of image) {
+      const vp = putF32(d.vec);
+      check(u32(e.idx_image_push_vector(ix, vp, DIM)) === 1, `embedding staged for <code>${d.caption}</code>`);
+      e.idx_free(vp, DIM * 4);
+      const [dp, dl] = put([d.caption, d.camera, d.year].join(SEP));
+      const hi = Number(d.dhash >> 32n) >>> 0;
+      const lo = Number(d.dhash & 0xffffffffn) >>> 0;
+      const ord = u32(e.idx_image_add(ix, dp, dl, 1 /* dhash present */, hi, lo, 0, 0, 0, 0));
+      e.idx_free(dp, dl);
+      if (ord === ERR) check(false, `idx_image_add accepted ${d.caption}`);
+    }
+    check(u32(e.idx_image_build(ix)) === 1, 'the image index builds in the browser');
+    check(u32(e.idx_image_doc_count(ix)) === image.length, `${image.length} images ingested`);
+    mark('image index built');
+
+    const cos = (a, b) => {
+      let dot = 0, na = 0, nb = 0;
+      for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+      return dot / Math.sqrt(na * nb);
+    };
+    const byCosine = image
+      .map((d, i) => ({ doc: i, sim: cos(d.vec, probe) }))
+      .sort((x, y) => y.sim - x.sim || x.doc - y.doc)
+      .map((x) => x.doc);
+
+    const pp = putF32(probe);
+    {
+      const t = performance.now();
+      const got = readImageHit(ix, u32(e.idx_image_search_vector(ix, pp, DIM, image.length, 4)));
+      const ms = performance.now() - t;
+      check(got.map((h) => h.doc).join() === byCosine.join(),
+        `vector search matches the cosine order this page computed: <b>${got.map((h) => h.doc).join()}</b> (${ms.toFixed(2)} ms)`);
+      check(got.map((h) => h.doc).join() === NODE.vector,
+        `and it is the SAME order Node and Rust return: <b>${NODE.vector}</b>`);
+      check(got.every((h) => h.why === 2), 'every vector-only hit is attributed to the vector arm alone');
+    }
+
+    // The p50 leak test, in a browser. The probe's nearest neighbour is an iPhone shot; the filter
+    // says Canon. A soft arm knows nothing about facets, so it must be FILTERED, not trusted.
+    const canon = image.map((d, i) => [d, i]).filter(([d]) => d.camera === 'Canon EOS R5').map(([, i]) => i);
+    const canonExpect = byCosine.filter((d) => canon.includes(d));
+    check(!canon.includes(byCosine[0]),
+      `the nearest neighbour overall (doc ${byCosine[0]}) is EXCLUDED by the filter — the leak test can fail`);
+    let fusedOrder = '';
+    {
+      const [fp, fl] = put('0=Canon EOS R5');
+      const t = performance.now();
+      const n = u32(e.idx_image_search_fused(ix, 0, 0, fp, fl, 0, 0, pp, DIM, 0, 0, 0, 0, -1, image.length));
+      const ms = performance.now() - t;
+      e.idx_free(fp, fl);
+      const got = readImageHit(ix, n);
+      fusedOrder = got.map((h) => h.doc).join();
+      check(got.every((h) => canon.includes(h.doc)),
+        'THE VECTOR ARM DOES NOT LEAK THE FACET FILTER — no excluded document appears at any score');
+      check(fusedOrder === canonExpect.join(),
+        `the FUSED image query runs on the main thread: <b>${fusedOrder}</b> (${ms.toFixed(2)} ms), the cosine order restricted to the facet`);
+      check(fusedOrder === NODE.fused,
+        `and it is EXACTLY what Node and Rust return — same documents, same order: <b>${NODE.fused}</b>`);
+    }
+    {
+      const [bp, bl] = put('notanumber=Canon EOS R5');
+      check(u32(e.idx_image_search_fused(ix, 0, 0, bp, bl, 0, 0, pp, DIM, 0, 0, 0, 0, -1, 5)) === ERR,
+        'a malformed filter spec errors rather than matching everything');
+      e.idx_free(bp, bl);
+    }
+    {
+      // Text AND vector: a row both arms found carries both bits, or explicability has not
+      // survived the boundary and the fused plan's advantage is invisible to the application.
+      const [qp, ql] = put('beach');
+      const got = readImageHit(ix, u32(e.idx_image_search_fused(ix, qp, ql, 0, 0, 0, 0, pp, DIM, 0, 0, 0, 0, -1, image.length)));
+      e.idx_free(qp, ql);
+      check(got[0]?.why === 3, 'a row found by BOTH text and vector ranks first — agreement is evidence, not noise');
+      check(got.every((h, i) => u32(e.idx_image_why(ix, i)) === h.why), 'idx_image_why agrees with every decoded record');
+    }
+    {
+      const hi = Number(image[0].dhash >> 32n) >>> 0;
+      const lo = Number(image[0].dhash & 0xffffffffn) >>> 0;
+      const near = readNear(ix, u32(e.idx_image_hash_near(ix, hi, lo, 4)));
+      check(near.map((x) => x.doc).join() === NODE.near,
+        `hash_near finds the re-encode within radius 4: <b>${near.map((x) => x.doc).join()}</b>, as in Node`);
+      check(near.map((x) => x.distance).join() === NODE.distance, 'and reports the true Hamming distances');
+      check(u32(e.idx_image_hash_near(0, hi, lo, 4)) === ERR, 'a null handle returns the sentinel, not a trap');
+    }
+    e.idx_free(pp, DIM * 4);
+    e.idx_image_free(ix);
+    e.idx_image_free(0); // must not trap
+    mark('image teardown');
+
+    // ---- Linear-memory high-water mark, in a TAB ---------------------------------------------
+    //
+    // p53 acceptance item 3, measured where it binds. `docs/research/portability.md` §1: an
+    // mmap-style format does not FAIL to port to WASM, it silently reads the whole index into
+    // linear memory — and a vector column is the largest thing this engine has ever put there.
+    // A wasm32 module addresses at most 4 GiB, shared here with the page's own JS heap.
+    const PAGE = 65536;
+    const row = phase.map(([l, at]) => `<tr><th>${l}</th><td>${at.toLocaleString()} B (${at / PAGE} pages)</td></tr>`).join('');
+    document.getElementById('memory').innerHTML = `
+      <table>${row}
+        <tr><th>HIGH-WATER MARK</th><td><b>${highWater.toLocaleString()} B</b> = ${(highWater / 1024).toFixed(1)} KiB, ${highWater / PAGE} pages</td></tr>
+      </table>`;
+    // Machine-readable, so `js/browser-check.mjs` can assert the browser's fused order against the
+    // Node one from OUTSIDE the page rather than trusting the page's own verdict.
+    document.getElementById('json').textContent = JSON.stringify({
+      abi: u32(e.idx_abi_version()),
+      vector: byCosine.join(),
+      fused: fusedOrder,
+      highWater,
+      page: highWater / PAGE,
+    });
   } catch (err) {
     check(false, `threw: ${err && err.message ? err.message : err}`);
   }

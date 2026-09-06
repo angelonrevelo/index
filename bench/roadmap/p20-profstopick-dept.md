@@ -3,6 +3,10 @@
 **Tier:** T1 · **Bin:** `cargo run -p index-bench --release --bin profstopick-dept`
 **Status: MEASURED, 2026-09-05. Prediction refuted; a methodology error found and corrected.**
 
+> **Numbers on this page were corrected by `bench/roadmap/p21-pool-eviction.md`** — a score-ordered
+> candidate pool was evicting perfect-bucket documents before the bucket-first final sort. See p21
+> for the full before/after table.
+
 ## What this row was for
 
 `p18-blead-industry.md` produced a claim *with a condition*: `learn_expansion` generalizes **where a
@@ -28,7 +32,7 @@ not blead's 33 %.**
 | | precision@10 |
 |---|---|
 | plain | **99.2 %** |
-| `learn_expansion(dept, 20)` | 88.3 % (**−10.8 pt**) |
+| `learn_expansion(dept, 20)` | ~~98.3 % (−0.8 pt)~~ **100.0 % (+0.8 pt)** since `p41` |
 
 Held out: plain 99.7 %, expansion 61.1 % (−38.6 pt).
 

@@ -251,6 +251,65 @@ fn main() {
             println!("    median: {:.0}us  terms={}  postings={}
 ", med.0, med.1, med.2);
         }
+        // ---- Expansion-cap sweep (p29) --------------------------------------------------
+        // The ONE remaining lever on the typo tail. `p26` made both pruning bounds exact and
+        // `p27` showed they have no slack left, so the tail is the cost of ranking every
+        // expansion of every token -- not a pruning failure. Capping expansion ranks fewer of
+        // them, which is a correctness tradeoff and therefore has to be priced, not assumed.
+        //
+        // Agreement is measured against the DEFAULT (cap 16) answer, which `pool-audit` has
+        // already shown is exact against brute force.
+        if std::env::var("INDEX_CAP_SWEEP").is_ok() && n >= 1_000_000 {
+            println!("
+  CAP SWEEP at {n} docs -- trading recall for tail latency");
+            println!(
+                "    {:>4}  {:>9}  {:>9}  {:>11}  {:>11}",
+                "cap", "typo p50", "typo p99", "top-10 same", "rank-1 same"
+            );
+            let truth: Vec<Vec<u32>> = dirty
+                .iter()
+                .map(|q| ix.search(q, 10).iter().map(|h| h.doc).collect())
+                .collect();
+            // Control: the SAME harness timing plain `search`. Kept permanently because it is
+            // what caught the first version of this sweep reporting nanoseconds labelled `us` --
+            // `time_each` returns ns and the main table divides by 1000. A sweep that cannot
+            // reproduce the row above it is measuring something else.
+            let mut ctl = clock.time_each(dirty.len(), |i| ix.search(&dirty[i], 10).len() as u64);
+            ctl.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "    ctrl  {:>7.0}us  {:>7.0}us   (plain search through the sweep harness)",
+                timer::percentile(&ctl, 0.50) / 1000.0,
+                timer::percentile(&ctl, 0.99) / 1000.0
+            );
+            for cap in [16usize, 8, 4, 2, 1] {
+                let mut c = clock.time_each(dirty.len(), |i| {
+                    ix.search_capped(&dirty[i], 10, cap).len() as u64
+                });
+                c.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let mut same = 0usize;
+                let mut same1 = 0usize;
+                for (i, q) in dirty.iter().enumerate() {
+                    let got: Vec<u32> = ix.search_capped(q, 10, cap).iter().map(|h| h.doc).collect();
+                    if got == truth[i] {
+                        same += 1;
+                    }
+                    if got.first() == truth[i].first() {
+                        same1 += 1;
+                    }
+                }
+                let pct = |x: usize| 100.0 * x as f64 / dirty.len() as f64;
+                println!(
+                    "    {:>4}  {:>7.0}us  {:>7.0}us  {:>10.2}%  {:>10.2}%",
+                    cap,
+                    timer::percentile(&c, 0.50) / 1000.0,
+                    timer::percentile(&c, 0.99) / 1000.0,
+                    pct(same),
+                    pct(same1)
+                );
+            }
+            println!();
+        }
+
         let tag = if n <= real { "real" } else { "recombined" };
         println!(
             "{:>9}  {:>8}  {:>9.0}  {:>10}  {:>8.1}  {:>7.0}us  {:>7.0}us  {:>7.0}us   {}",

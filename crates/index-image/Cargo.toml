@@ -1,0 +1,21 @@
+[package]
+name = "index-image"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The image tier: perceptual hashes, OKLab colour buckets, EXIF, and a quantised vector column that fuses with index-text in ONE query."
+
+# Deliberately dependency-free, like `index-core` and `index-geo`.
+#
+# The single most important architectural decision in this crate is what is NOT here: there is no
+# neural network, no ONNX runtime, no image decoder pulling in a C++ toolchain. Embeddings are an
+# INPUT. A host produces them (candle, ort, transformers.js) and hands them over as `&[f32]`.
+#
+# `docs/research/image.md` §2 is the argument: every FOSS photo system that embeds its model --
+# Immich, LibrePhotos, PhotoPrism -- inherits a Python microservice, a GPU dependency, and a
+# server. The one measured thing they all fail at is searching without that server.
+[dependencies]
+# The whole architectural bet: an image IS a document, so the image tier composes with the text
+# engine rather than standing beside it. `image.rs` is that composition and nothing else.
+index-text = { path = "../index-text" }

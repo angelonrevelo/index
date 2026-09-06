@@ -9,6 +9,57 @@ into each app would take, [CHANGELOG.md](CHANGELOG.md) for what shipped,
 [docs/research/](docs/research/) for the evidence every roadmap row rests on, and
 [docs/roadmap-rejected.md](docs/roadmap-rejected.md) for what was deliberately ruled out.
 
+## Any database, over a pipe
+
+**If your database can print rows, `index` can index them** — no driver, no connection string, no
+dialect. Every database already ships a client that prints CSV, TSV or JSON, and every
+change-data-capture tool already emits newline-delimited JSON, so all of them reduce to one pipe.
+
+```sh
+# Postgres
+psql -c "COPY (SELECT sku,name,brand FROM product) TO STDOUT (FORMAT csv, HEADER)" \
+  | index build -d data/ --schema 'sku:0:0.6,name:3:0.4,brand:1:0.6' --key sku --facet brand
+
+# ...and the same tool for everything else
+sqlite3 -header -csv app.db 'SELECT ...'   | index build -d data/ ...
+mysql -B -e 'SELECT ...'                   | index build -d data/ --tsv ...
+mongoexport --type json                    | index build -d data/ --jsonl ...
+curl -s /api/product | jq -c '.[]'         | index build -d data/ --jsonl ...
+
+index search -d data/ 'colgaye tothpaste'  # typo-corrected, from the shell
+```
+
+**Keep it current from whatever already emits changes**, rather than rebuilding:
+
+```sh
+pg_recvlogical -S idx -f - --start -P wal2json | jq -c '...' \
+  | index apply -d data/ --jsonl --key after.sku,before.sku
+```
+
+`apply` takes Debezium and wal2json operation words as they come, resolves the key from fallback
+paths (`after.sku,before.sku`), and **collapses the stream per key** — so a row inserted and deleted
+in one stream ends up absent, whatever order the records arrive in.
+
+**The claim is measured, not asserted.** `cdc-equivalence` runs 8,000 inserts, updates and deletes
+against a model of the table and requires the index to agree on membership *exactly*:
+**0 keys wrong, 14,288 = 14,288.** Ranking drifts as segments and tombstones accumulate — 93 % rank-1
+agreement with a full rebuild after the first delta, 84 % after 8,000 operations — which is
+[measured and explained](bench/roadmap/p50-change-stream.md) rather than hidden, and is what
+`index stat` reports as `needs compaction`.
+
+**Tested against every database in the estate, not just a fixture.** 122 databases across five
+machines — Windows, macOS and three Linux hosts over Tailscale — and three engines (PostgreSQL
+16/17/18, SQLite, DuckDB): **86 indexed, 36 verified empty, 0 failures, 2,226,041 rows**, every one
+built by the local binary from rows streamed over SSH. Typo tolerance held on 86 of 86 probes.
+It also found a real bug — thirteen SQLite databases aborted the build because real `TEXT` columns
+are not always valid UTF-8 — which is now repaired, counted and reported.
+See [`p51`](bench/roadmap/p51-database-sweep.md) and
+[the raw results](bench/evidence/p51-database-sweep.tsv).
+
+**The price, stated up front: the pipe is the integration.** Credentials, pagination and restarts
+belong to whoever runs the command; the tool cannot resume a stream it did not start. That buys
+zero dependencies and a database nobody here has heard of working on day one.
+
 ## Status
 
 **The project was re-baselined on 2026-09-05** after surveying eleven real applications and running
@@ -56,11 +107,26 @@ crates/
   index-geo/    POINT LOCATION. "which polygon contains this point?" as a Hilbert-ordered
                 cell index: interior cells answer with ZERO geometry, ocean with a failed
                 binary search. forbid(unsafe_code), no dependencies.
-  index-wasm/   The binding. Hand-written C ABI, NO wasm-bindgen, so ONE artifact serves
+  index-image/  THE IMAGE TIER. Perceptual hashes (aHash/dHash/pHash 64-bit, PDQ-shaped
+                256-bit), OKLab palette extraction into 77 perceptual colour buckets, a
+                hostile-input-safe EXIF/TIFF/JPEG-structure parser, SHA-256 content
+                addressing, and a quantised vector column (binary popcount prefilter ->
+                int8 rerank -> exact) that fuses with index-text in ONE query plan with
+                ONE top-k selection. Ships NO model: an embedding is an INPUT.
+  index-wasm/   The binding. 61 symbols, hand-written C ABI (v12, facets/ranges/sort/
+                live segments/highlight/clauses/paging/phrases/IMAGE),
+                NO wasm-bindgen,
+                so ONE artifact serves
                 the browser, Node, edge workers, and native FFI (Go/Python/PHP/Ruby).
+                `include/index.h` is that ABI as a real C header; `host/python/` is a
+                second-language host proving it, in the standard library alone.
   index-geo-wasm/  Same ABI, for index-geo. 56,796 bytes raw / 22,334 gzipped.
   index-accel/  onegrid's ratified AccelModule ABI, implemented: 7 analytics kernels
+                verified differentially by `accel-kernel` (2,400 trials, 0 wrong)
                 (sort/filter/group/aggregate/bitmap/topK) in 6.3 KB of no_std wasm.
+  index-cli/    THE `index` BINARY. Build and keep an index current from ANY database, over
+                a pipe -- no driver, no connection string. Hand-written CSV/TSV/JSONL readers,
+                so its only dependency is index-text. `index build` / `apply` / `search` / `stat`.
   index-bench/  bins: beat-btreemap   (bytes/key + p50/p99 vs std BTreeMap)
                       crack-converge   (naive vs stochastic cracking convergence)
                       fuzzy-decision   (fuzzy-over-FM viability: latency vs k and σ)
@@ -72,6 +138,8 @@ crates/
                       sfc-2d           (is a viewport a range scan over an ordered key?)
                       geo-join         (point-in-polygon as an index, on real geometry)
                       maphy-place      (maphy's place search vs the engine; typos vs priors)
+                      image-corpus     (the image tier on a real 17,311-file web scrape:
+                                        census, cheap-tier cost, dedup, fused correctness)
                       presyo-prior     (do static priors pay? held-out, on presyo gold clusters)
                       presyo-broad     (broad/browse queries labelled from presyo's own taxonomy)
                       presyo-catalog   (241,677 REAL products; category retrieval = the open gap)
@@ -80,10 +148,28 @@ crates/
                       blead-industry   (does learn_expansion generalize? second corpus, 26k firms)
                       presyo-categorize (index as analyzer: kNN category prediction, 81% confident)
                       profstopick-dept (third corpus; found the boost-0.0 matching error)
+                      prune-consistency (GREEN: all three pruning sites gated on the
+                                        exact eff bound)
+                      pool-audit       (does that defect hit REAL corpora? it did — 28% of
+                                        presyo product queries; now 0.00% on all six sets)
+                      facet-shop       (the whole filter bar on presyo's catalogue, incl. the
+                                        two sort arms held to one answer, 336 queries x 2)
+                      cdc-equivalence  (does a change stream converge on a rebuild? membership
+                                        exact over 8,000 ops; ranking drift measured)
+                      phrase-cost      (what positions cost, and phrase hits checked against
+                                        raw text — an arm sharing no code with the engine)
+                      accel-kernel     (the 7 analytics kernels, differentially)
+                      segment-scale    (what incremental segments cost as they accumulate)
+                      booted-schema / alec-surface (the house's own databases)
 js/
   index.mjs     JavaScript host for the C ABI (no wasm-bindgen)
+  accel-bench.mjs  the 7 analytics kernels timed INSIDE wasm: 73-93% of native on five
+                of six, 4% on the byte-parallel one (no SIMD). See p34.
+  smoke.mjs     98 checks, and the CI gate: builds an index FROM JavaScript, searches it,
+                corrects typos, facets, filters by clause, pages, runs phrases, serializes,
+                reopens and compares -- no corpus on disk -- then does it again THROUGH
+                `index.mjs`, so the shipped host cannot rot unnoticed the way it did in p44
   demo.mjs      end-to-end proof: real index, real typo queries, in Node
-  smoke.mjs     CI check that the WASM artifact loads and refuses garbage
   geo.mjs       host for index-geo, plus the pure-JS scan it is measured against
   geo-bench.mjs point-in-polygon throughput in Node; CI gates on per-point agreement
   geo-browser-check.mjs   the same, in a REAL browser over HTTP
@@ -245,10 +331,11 @@ refuted hypothesis: [`bench/roadmap/p5-fuzzy-term-feasibility.md`](bench/roadmap
 ## Build & test
 
 ```sh
-cargo test --workspace              # 55 tests: engine + learned-index invariants
+cargo test --workspace              # 162 tests: engine + learned-index invariants + CLI
 
 cargo run -p index-bench --release --bin real-corpus       # THE ENGINE vs production corpora
 
+./scripts/build-wasm.sh    # ALL FOUR artifacts side by side into dist/, with gzipped sizes
 cargo build -p index-wasm  --release --target wasm32-unknown-unknown   # the search binding
 cargo build -p index-accel --release --target wasm32-unknown-unknown   # onegrid's kernels
 node js/demo.mjs                                           # end-to-end, in Node
@@ -340,12 +427,19 @@ production corpora. **`index-core` remains dependency-free.**
   `productSearchToken('Coca-Cola 1.5L') === ['coca','cola','1.5l']`; the analyzer produces `1500ml`,
   because canonicalizing the unit is what makes `1.5L`/`1500ml`/`1.5 liters` one token — worth
   **+4.6 pp recall** by presyo's own measurement. Matching it verbatim would be a regression.
-- **The tail at 1 M is characterized, not fixed.** It is low-selectivity queries: the worst case
-  has two terms, one carrying a 428,654-posting list. Block maxima are uninformative because
-  score is uncorrelated with document id — which is exactly what docID reordering fixes.
-- **No incremental updates.** The index is immutable: adding a document means a rebuild.
+- **The tail at 1 M is characterized, not fixed** — 13.6 ms typo p99 against a 5 ms bar. Three
+  independent attacks have now each moved it under 10 %: better seeding (`p27`), capping expansion
+  (`p29`), and tightening the pruning bounds (`p47`). It is the cost of enumerating documents the
+  bucket-first ranking rule genuinely requires visiting. **The bar is met on every corpus of real
+  documents** — 4.54 ms at presyo's 241,677 products, 1.81 ms at 61,467 real schools — and fails
+  only on the recombined rows above the real data.
+- **Compaction is a rebuild.** `Searcher` appends segments and tombstones documents without one,
+  but postings are never rewritten, so collection statistics still count deleted rows until the
+  application rebuilds from its own database. `Searcher::needs_compaction` says when that matters.
 - **Above 61,467 documents the corpus is recombined, not observed.** Real tokens, synthetic
   combinations; it measures posting-list and top-k scaling, not vocabulary growth on new text.
-- **There is still no CI.** "Green gate" means green on one Windows box.
+- **CI runs the gate on Linux** (`.github/workflows/gate.yml`: tests, doc tests, clippy, the three
+  WASM artifacts, `js/smoke.mjs`, and per-point geo agreement). The `host/python/` host is NOT in
+  it and is still run by hand, so "both hosts pass" means one gated host and one checked one.
 - The FM-index rank `cum` array is u32-per-word (~50 % overhead); `sucds` ships the two-level rank
   that would trim it.

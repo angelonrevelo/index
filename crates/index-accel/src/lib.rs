@@ -29,8 +29,15 @@
 //! # Building
 //!
 //! `no_std` **on wasm32 only**. On the host the crate compiles against `std` so the kernels can be
-//! unit-tested natively against buffers this file allocates — the ABI is pointer-based, so a host
-//! test can exercise exactly the same code paths the browser will run.
+//! exercised natively against buffers the caller allocates — see [`AccelPtr`] for the one thing
+//! that differs.
+//!
+//! **A host run is not the same run the browser makes**, and the earlier wording here said it was.
+//! The kernel bodies are identical, but pointers are 64-bit natively and 32-bit in wasm, so a
+//! defect that depends on 32-bit wraparound cannot surface on the host. Native coverage
+//! (`cargo run -p index-bench --release --bin accel-kernel`) is additional to, not a substitute
+//! for, the consumer's own differential harness, which is what proves the shipped artifact.
+//! `docs/integration.md` and `bench/roadmap/p33-accel-kernel.md` record both.
 //!
 //! ```sh
 //! cargo build -p index-accel --release --target wasm32-unknown-unknown
@@ -46,6 +53,22 @@
 fn panic(_: &core::panic::PanicInfo) -> ! {
     core::arch::wasm32::unreachable()
 }
+
+/// The pointer type the ABI passes.
+///
+/// **`u32` on wasm32 — the ratified `AccelModule` signature, unchanged.** Linear memory is 32-bit
+/// there, so a host-chosen byte offset is exactly a `u32` and the cast to a pointer is exact.
+///
+/// **`usize` on the host**, where this crate is built only so the kernels can be unit-tested
+/// natively. A 64-bit host allocates above 4 GiB routinely, and `u32 as *const T` would truncate
+/// such an address into a different, valid-looking one — silent corruption rather than a crash.
+/// The existing host tests passed only because their buffers were small enough to land low;
+/// `bench/roadmap/p33-accel-kernel.md` records how a 1 M-row bench found it.
+#[cfg(target_arch = "wasm32")]
+pub type AccelPtr = u32;
+/// See [`AccelPtr`].
+#[cfg(not(target_arch = "wasm32"))]
+pub type AccelPtr = usize;
 
 /// Must equal `ACCEL_ABI_VERSION` in `packages/wasm/src/abi.ts`. The host checks it at bind time so
 /// a stale binary fails loudly instead of silently computing `lt` where the caller asked for `gt`.
@@ -84,33 +107,33 @@ pub extern "C" fn og_heap_base() -> u32 {
 // ---------------------------------------------------------------------------------------------
 
 #[inline(always)]
-unsafe fn f64_at(ptr: u32, i: usize) -> f64 {
+unsafe fn f64_at(ptr: AccelPtr, i: usize) -> f64 {
     *((ptr as *const f64).add(i))
 }
 #[inline(always)]
-unsafe fn set_f64(ptr: u32, i: usize, v: f64) {
+unsafe fn set_f64(ptr: AccelPtr, i: usize, v: f64) {
     *((ptr as *mut f64).add(i)) = v;
 }
 #[inline(always)]
-unsafe fn i32_at(ptr: u32, i: usize) -> i32 {
+unsafe fn i32_at(ptr: AccelPtr, i: usize) -> i32 {
     *((ptr as *const i32).add(i))
 }
 #[inline(always)]
-unsafe fn set_i32(ptr: u32, i: usize, v: i32) {
+unsafe fn set_i32(ptr: AccelPtr, i: usize, v: i32) {
     *((ptr as *mut i32).add(i)) = v;
 }
 #[inline(always)]
-unsafe fn u8_at(ptr: u32, i: usize) -> u8 {
+unsafe fn u8_at(ptr: AccelPtr, i: usize) -> u8 {
     *((ptr as *const u8).add(i))
 }
 #[inline(always)]
-unsafe fn set_u8(ptr: u32, i: usize, v: u8) {
+unsafe fn set_u8(ptr: AccelPtr, i: usize, v: u8) {
     *((ptr as *mut u8).add(i)) = v;
 }
 
 /// Bit `i` of a packed, LSB-first bitmap — the layout `bit.ts` writes.
 #[inline(always)]
-unsafe fn is_present(presence: u32, i: usize) -> bool {
+unsafe fn is_present(presence: AccelPtr, i: usize) -> bool {
     (u8_at(presence, i >> 3) & (1u8 << (i & 7))) != 0
 }
 
@@ -135,8 +158,8 @@ fn norm(v: f64) -> f64 {
 /// missing row, which is what lets NaN payloads be arbitrary.
 #[inline(always)]
 unsafe fn key_compare(
-    value: u32,
-    presence: u32,
+    value: AccelPtr,
+    presence: AccelPtr,
     a: usize,
     b: usize,
     descending: u32,
@@ -172,8 +195,8 @@ unsafe fn key_compare(
 /// Key order plus the index tiebreak — the total order `top_k` needs to emit a final ordering.
 #[inline(always)]
 unsafe fn total_compare(
-    value: u32,
-    presence: u32,
+    value: AccelPtr,
+    presence: AccelPtr,
     a: usize,
     b: usize,
     descending: u32,
@@ -226,13 +249,13 @@ fn hash_pair(a: i32, b: i32) -> usize {
 /// All pointers must address host-owned buffers of the documented length.
 #[no_mangle]
 pub unsafe extern "C" fn og_sort_pass(
-    value_ptr: u32,
-    presence_ptr: u32,
+    value_ptr: AccelPtr,
+    presence_ptr: AccelPtr,
     length: u32,
     descending: u32,
     missing_first: u32,
-    perm_ptr: u32,
-    scratch_ptr: u32,
+    perm_ptr: AccelPtr,
+    scratch_ptr: AccelPtr,
 ) {
     let n = length as usize;
     if n < 2 {
@@ -285,15 +308,15 @@ pub unsafe extern "C" fn og_sort_pass(
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn og_filter_mask(
-    value_ptr: u32,
-    presence_ptr: u32,
+    value_ptr: AccelPtr,
+    presence_ptr: AccelPtr,
     length: u32,
     op: u32,
     operand: f64,
     upper: f64,
-    set_ptr: u32,
+    set_ptr: AccelPtr,
     set_length: u32,
-    out_ptr: u32,
+    out_ptr: AccelPtr,
 ) {
     let n = length as usize;
     for i in 0..byte_length_for(n) {
@@ -357,12 +380,12 @@ pub unsafe extern "C" fn og_filter_mask(
 /// a power of two.
 #[no_mangle]
 pub unsafe extern "C" fn og_group_code(
-    value_ptr: u32,
-    presence_ptr: u32,
+    value_ptr: AccelPtr,
+    presence_ptr: AccelPtr,
     length: u32,
-    out_ptr: u32,
-    slot_key_ptr: u32,
-    slot_code_ptr: u32,
+    out_ptr: AccelPtr,
+    slot_key_ptr: AccelPtr,
+    slot_code_ptr: AccelPtr,
     slot_capacity: u32,
 ) -> i32 {
     let cap = slot_capacity as usize;
@@ -415,13 +438,13 @@ pub unsafe extern "C" fn og_group_code(
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn og_group_combine(
-    a_ptr: u32,
-    b_ptr: u32,
+    a_ptr: AccelPtr,
+    b_ptr: AccelPtr,
     length: u32,
-    out_ptr: u32,
-    slot_a_ptr: u32,
-    slot_b_ptr: u32,
-    slot_code_ptr: u32,
+    out_ptr: AccelPtr,
+    slot_a_ptr: AccelPtr,
+    slot_b_ptr: AccelPtr,
+    slot_code_ptr: AccelPtr,
     slot_capacity: u32,
 ) -> i32 {
     let cap = slot_capacity as usize;
@@ -472,15 +495,15 @@ pub unsafe extern "C" fn og_group_combine(
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn og_aggregate(
     op: u32,
-    value_ptr: u32,
-    presence_ptr: u32,
+    value_ptr: AccelPtr,
+    presence_ptr: AccelPtr,
     length: u32,
-    index_ptr: u32,
+    index_ptr: AccelPtr,
     index_length: i32,
-    slot_key_ptr: u32,
-    slot_state_ptr: u32,
+    slot_key_ptr: AccelPtr,
+    slot_state_ptr: AccelPtr,
     slot_capacity: u32,
-    out_ptr: u32,
+    out_ptr: AccelPtr,
 ) -> u32 {
     let n = length as usize;
     let count = if index_length < 0 { n } else { index_length as usize };
@@ -595,10 +618,10 @@ pub unsafe extern "C" fn og_aggregate(
 #[no_mangle]
 pub unsafe extern "C" fn og_bitmap_op(
     op: u32,
-    a_ptr: u32,
-    b_ptr: u32,
+    a_ptr: AccelPtr,
+    b_ptr: AccelPtr,
     bit_length: u32,
-    out_ptr: u32,
+    out_ptr: AccelPtr,
 ) {
     let byte_count = byte_length_for(bit_length as usize);
     for i in 0..byte_count {
@@ -634,14 +657,14 @@ pub unsafe extern "C" fn og_bitmap_op(
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn og_top_k(
-    value_ptr: u32,
-    presence_ptr: u32,
+    value_ptr: AccelPtr,
+    presence_ptr: AccelPtr,
     length: u32,
     k: u32,
     descending: u32,
     missing_first: u32,
-    out_ptr: u32,
-    scratch_ptr: u32,
+    out_ptr: AccelPtr,
+    scratch_ptr: AccelPtr,
 ) -> u32 {
     let n = length as usize;
     let want = (k as usize).min(n);

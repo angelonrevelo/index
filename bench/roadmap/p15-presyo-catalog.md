@@ -9,6 +9,10 @@
 > not looked hard enough for corpora. `presyo/data/endless-prep/catalog-active.csv` — 30 MB,
 > 241,793 rows — was on disk the whole time.
 
+> **Numbers on this page were corrected by `bench/roadmap/p21-pool-eviction.md`** — a score-ordered
+> candidate pool was evicting perfect-bucket documents before the bucket-first final sort. See p21
+> for the full before/after table.
+
 ## The corpus
 
 presyo's **active product catalogue, exported from production**: 241,677 usable rows with product
@@ -104,8 +108,8 @@ rather than in a benchmark. Measured on this same corpus:
 | index | precision@10 | |
 |---|---|---|
 | name + brand only | 61.7 % | no facet field at all |
-| **+ boost-0.0 category field, no expansion** | **71.1 %** | **the fair baseline** |
-| **+ `learn_expansion(category, 20)`** | **96.6 %** | **+25.5 pt from expansion** |
+| **+ boost-0.0 category field, no expansion** | **76.0 %** | **the fair baseline** (75.3 % before `p41`) |
+| **+ `learn_expansion(category, 20)`** | **97.0 %** | **+21.0 pt from expansion** (+21.8 before `p41`) |
 
 145 facet values learned, **+3.4 s of build time** on 241,677 products, and category-query latency
 p50 **316 µs** against 178 µs for an exact product query — expansion adds terms, so it is not free.

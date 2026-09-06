@@ -17,6 +17,7 @@ file that hides its own errors is worthless.
 | [`portability.md`](portability.md) | WASM limits, browser storage, native bindings, edge runtimes, in-database extensions, zero-copy. Ends with a ranked ten-item distribution strategy. |
 | [`business.md`](business.md) | Who makes money selling search, with verified prices. Five ranked market positions. Whether a library can make money. |
 | [`claim.md`](claim.md) | What practitioners say publicly, each with a credibility verdict. Includes the learned-index verdict reached independently of `demand.md`. |
+| [`image.md`](image.md) | **The image tier.** Who is alive in FOSS photo search and what they measurably fail at. Why the gap is fusion, not vectors. Why brute force beats ANN below ~1 M. The measured ceiling on "lossless" compression. The face licence trap and the legal envelope. |
 | [`build-or-buy.md`](build-or-buy.md) | crates.io maturity audit. The rule, the verdicts, and the two Triage rows it closed. |
 
 ## The three findings that matter most

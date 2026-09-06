@@ -138,3 +138,85 @@ multilingual segmentation. The PH-specific rules layer on top; that layer is the
 current stack fails at; maphy serves 41,966 barangays from a 1.2 MB gzipped index. They return when
 a consumer measures a failure. `bench/roadmap/p3-sfc-dimensionality.md` stays on disk because it
 settles the question cheaply if the topic reopens.
+
+---
+
+## 2026-09-06 — image-tier sweep
+
+Evidence for every entry: [`docs/research/image.md`](research/image.md).
+
+**Writing an image codec, or any lossless compressor for pixels.**
+→ REJECTED, permanently. "Byte-exact but smaller" is lossless compression and is bounded by
+information theory. An already-JPEG corpus is already entropy-coded — zstd and brotli win **1–3%**
+on it. The measured ceiling is JPEG XL's lossless JPEG transcode at **~20%** (13–22%), which
+**fails outright on ~1% of real JPEGs**, and libjxl already ships it under BSD-3. Everyone who
+attempted this independently is dead or absorbed: **Lepton** archived 2023-02-14, **PackJPG** last
+released 2016-01-22, **brunsli** survives only as JXL's internal transport, **FLIF/FUIF** folded
+into JPEG XL. Neural lossless compression (L3C, CALLIC, FLLIC) is GPU-only with no deployable
+decoder. Meanwhile **~30% of a scraped corpus is duplicate bytes**, so dedup beats the codec by a
+wide margin. The engine ships the SHA-256 content address that *proves* a round-trip was 1:1 and
+leaves the transcode to the host.
+
+**Taking a libjxl dependency.**
+→ REJECTED. There is no pure-Rust JXL *encoder*; adopting it would put a C++ toolchain inside a
+crate whose entire thesis is that it has none. Also moot for browser delivery: Chrome 145 merged a
+Rust decoder but it is **still behind a flag as of Chrome 151**, Firefox 152 ships it **disabled by
+default**, and only Safari 17+ is on by default (without progressive decode).
+
+**An HNSW / IVF / any ANN graph index.**
+→ REJECTED at this scale, DEFERRED above it. Measured: brute force over **1 M × 384-d runs at 79.7
+QPS single-thread** (12 ms) on a laptop. 30 k images at 512-d is **1.9 MB as binary codes** — a
+popcount scan over that is sub-millisecond. A graph costs build time, memory, recall and mutability
+and buys nothing below roughly 1 M vectors, and it would break the no-rebuild live update
+`searcher` already has. Returns as its own row, with its own evidence, if a corpus crosses that
+line — not pre-emptively.
+
+**Bundling an embedding model, an ONNX runtime, or an image decoder in `index-image`.**
+→ REJECTED. The licence spread is a minefield that moves yearly: SigLIP and DINOv2 are Apache-2.0,
+**MobileCLIP2 is an Apple sample licence**, **Jina CLIP v2 is CC BY-NC 4.0**, **DINOv3 is a bespoke
+gated Meta licence**. Keeping the model out is what preserves the crate's near-zero dependency
+footprint, its WASM shippability, and its MIT OR Apache-2.0 licence against seven AGPL incumbents.
+An embedding is an **input**. The cost is stated rather than hidden: the crate cannot embed an image
+for you.
+
+**Bundling any face detection or recognition weight.**
+→ REJECTED, permanently. **InsightFace's code is MIT but its weights (`buffalo_l`, `antelopev2`,
+ArcFace, AdaFace's official checkpoints) are research-only and require a separate paid commercial
+licence** — the MIT badge does not cover the weights, and this is the most common mistake in the
+field. Ultralytics YOLOv8/v11-face is AGPL-3.0. Separately, EU AI Act **Art. 5(1)(e)** absolutely
+prohibits building facial-recognition databases by untargeted scraping (no proportionality test, no
+exception), every European Clearview decision rejects the "publicly available photos" defence, and
+the UK Upper Tribunal named **clustering facial vectors** as the triggering processing step. Google
+paid **$100 M** under BIPA for face-grouping inside users' own libraries. `p55` ships the clustering
+arithmetic over caller-supplied vectors and nothing else.
+
+**Claiming PDQ compatibility for the 256-bit hash.**
+→ REJECTED as a claim. The implementation is PDQ-*shaped* — same construction, not bit-identical
+(Meta additionally applies a Jarosz box blur and tent-filter decimation). A code from it cannot be
+matched against a ThreatExchange blocklist: comparison would sit at the 128/256 chance level and
+silently find nothing, which is worse than not offering it. Documented as incompatible rather than
+approximately compatible.
+
+**Frame-by-frame video indexing.**
+→ REJECTED as framing, goal kept as `p54`. Keyframe-aware selection uses **63–99% fewer frames than
+uniform sampling** and scores **better** (R@1 63.9% on MSR-VTT); retrieval accuracy flattens past
+**2 fps**. A 10-minute video is ~18,000 frames and ~120–170 shots. Sampling one frame per shot is a
+~100x reduction the literature says costs nothing.
+
+**Bundling an H.264 or HEVC decoder.**
+→ REJECTED on patent grounds. A BSD-2 licence on a pure-Rust H.264 decoder does **not** remove the
+patent obligation — patents cover the technique, not the implementation. HEVC runs ~$2.07/unit
+across the pools. AV1 is royalty-free by AOMedia commitment; a shipped product decodes through the
+OS/browser (`WebCodecs`, ~95.5% coverage) or AV1.
+
+**Error Level Analysis and PRNU as ingest-tier signals.**
+→ REJECTED for bulk ingest. Standalone ELA is not a reliable "edited: yes/no" test — the recent
+literature only reports gains when it is fed as one feature into a CNN, which concedes the point.
+PRNU costs **seconds per image** plus a reference set per candidate camera, and is destroyed by the
+resize/recompress cycles every social-sourced image has already been through. Both are lab
+forensics, not a cheap tier.
+
+**Asserting a single near-duplicate rate for a corpus.**
+→ REJECTED as a reporting practice. Published methods span **3% to 37%** on comparable web corpora
+— a 12x spread — so any single headline number is a methodology choice wearing the costume of a
+fact. `p52` prints the count at every threshold, with the threshold beside it.

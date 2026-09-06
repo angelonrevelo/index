@@ -307,6 +307,146 @@ genuinely open question the existing core is positioned to answer better than an
 
 ---
 
+## Part III — The image tier
+
+**Added 2026-09-06** after a seven-lane research sweep recorded in
+[`docs/research/image.md`](docs/research/image.md). The sweep produced one finding that decides the
+whole shape of this part, and it is not the one the brief expected:
+
+> **The hard part of image search is not the search.** `rclip` indexes 1.28 M images in 3 hours on a
+> laptop; brute-force cosine over 1 M vectors runs at 79.7 QPS. Every measured failure in the FOSS
+> field is *architectural* — a server you must run, a metadata store that drifts from the file, and
+> three indexes that cannot answer one question.
+
+### The gap, stated so it can be falsified
+
+Seven self-hosted photo systems were surveyed. **Five of seven are AGPL-3.0**, and **every one needs
+a server process to answer a question about files already on your disk.** The measured failures are
+specific: Immich's keyword search takes ~1 minute on a cold query and OOMs above 1 M assets;
+digiKam admits a ~100 k ceiling on its default store; PhotoPrism's face recognition degrades past
+"hundreds" of people. **No FOSS photo system publishes a sub-second benchmark at 100 k+ images.**
+
+Immich and LibrePhotos separate pgvector/FAISS from the relational row from a separate
+face-clustering job and intersect in application code. PhotoPrism combines them in its *query
+syntax* and fans out underneath — a genuine partial counterexample, recorded rather than erased. So
+the claim this part makes is the narrow one:
+
+> **No system answers text, facet, numeric-range, vector and perceptual-hash predicates in one query
+> plan over one index, selecting top-k once.**
+
+That is `index-text`'s existing shape plus two column types — a smaller job than building a photo
+app, and the only ground in this space not already occupied.
+
+### The rows
+
+| Item | What it closes | Effort | Benchmark | Status |
+|---|---|---|---|---|
+| **`p48` cheap tier** — perceptual hash, OKLab colour buckets, hostile-input EXIF | A first result before any model has run. <10 ms and <200 B per image, no GPU, no decoder dependency | M | [`p48`](bench/roadmap/p48-cheap-tier.md) → cost, threshold correctness, and the hash's LIMITS proven by test | **built** |
+| **`p49` vector column** — binary popcount prefilter → int8 rerank → exact | Semantic search without an ANN graph, which below ~1 M vectors costs build time, memory, recall and mutability and buys nothing | M | [`p49`](bench/roadmap/p49-vector-column.md) → recall vs the exact oracle, bytes/vector per tier | **built, recall WITHHELD** |
+| **`p50` fusion** — one query plan, one top-k | **The headline claim.** No short pages, no filter leaks, explicable results | L | [`p50`](bench/roadmap/p50-image-fusion.md) → zero short pages, zero leaks, agreement tie-break | **built** |
+| **`p51` real corpus** — 17,311 scraped web images | Every number above, on data nobody curated for it | M | [`p51`](bench/roadmap/p51-image-corpus.md) → census first, then cost, dedup, recall, latency | **built and run** |
+| **`p52` content address** — SHA-256 dedup key and 1:1 transcode proof | "Compress to fewest bytes, still byte-exact" — reduced to one comparison | S | [`p52`](bench/roadmap/p52-content-address.md) → duplicate rate, byte accounting, round-trip proof | **partial** — round-trip proof unexercised |
+| **`p53` image ABI** — the tier through the C ABI, v11 → v12 | An image tier only Rust can call forfeits the whole portability thesis | M | [`p53`](bench/roadmap/p53-image-abi.md) → Node + headless Chromium match Rust exactly; linear-memory high-water mark | **shipped** |
+| **`p54` video as shots** | "Frame-by-frame video search" — rejected as framing, kept as goal | L | [`p54`](bench/roadmap/p54-video-keyframe.md) → shot-sampled recall >= uniform 1 fps at far fewer frames | spec, T3 |
+| **`p55` face clustering primitive** | The vector arithmetic, and deliberately nothing else | S | [`p55`](bench/roadmap/p55-face-cluster.md) → false-MERGE rate reported separately from accuracy | spec, T3 |
+| **`p56` field budget** | **Surfaced by `p51`, not planned.** An image document wants 7 columns; `MAX_FIELD` is 4, and an unscored facet column should not occupy a scoring slot at all | M | [`p56`](bench/roadmap/p56-field-budget.md) → zero bytes/document regression on presyo's 241,677 products | spec |
+
+### Measured, 2026-09-06 — the full 17,311-file corpus
+
+`cargo run --release -p index-bench --bin image-corpus`, run to completion over every file.
+**`OVERALL: PASS`, with one verdict explicitly withheld.**
+
+| Check | Result |
+|---|---|
+| Ingest robustness (`p48` check 5) | **0 panics, 0 unreadable, 0 decode failures** over 17,311 hostile scraped files (2,838 MB) |
+| Cheap tier p50 / p99 | **2.049 ms** / 10.434 ms — budget <10 ms p50: **HOLDS** |
+| Cheap tier bytes | **112.0 B/image** (mean = p50 = p99) — budget <200 B: **HOLDS** |
+| EXIF presence | **6 of 17,311 files (0.05%)** carry a block; stripping rate **100%** |
+| Exact duplicates, all files | **29.82%** — 5,163 redundant copies, 877 digests recurring over 6,040 files |
+| Exact duplicates, images only | **42.69%** — 5,126 of 12,007 |
+| Near-duplicates, dHash | 76.51% at <=0 · **97.07% at <=4** · 99.95% at <=12 |
+| Near-duplicates, PDQ-shaped | 65.86% at <=0 · **98.72% at <=31** · 99.83% at <=48 |
+| Fused correctness (`p50`) | **0 short pages, 0 filter leaks, 0 hits with zero agreement** over **100** fused queries at k=20 |
+| Latency, 12,007 docs | text **2 µs** p50 / 39 µs p99 · vector **192 µs** / 208 µs · **fused 623 µs** / 843 µs |
+| Index size | **2,938.8 B/image**, **14.96%** of the images' own bytes |
+| `p49` recall | **WITHHELD** — synthetic embeddings |
+
+**Correcting an earlier figure in this file.** A 1,500-file sample (every 11th file) measured the
+exact-duplicate rate at **9.00%**. The full corpus measures **29.82%**. Systematic sampling strides
+*across* duplicate clusters and destroys the structure it is trying to count, so the sampled figure
+was not merely imprecise — it was wrong by a factor of three about the property that matters most
+for `p52`. **The dedup rate cannot be sampled.** Every other sampled number held (cheap tier 2.14
+vs 2.049 ms, 112.0 B exactly).
+
+**The duplicate rate lands on the published one.** §5 records ~30% of LAION-2B as duplicated; this
+independent scrape measures **29.82%**. That is the strongest single piece of evidence for the
+"dedup beats the codec" conclusion — 29.82% of bytes removed by a hash lookup, against a ~20%
+ceiling for the best lossless transcode that also fails on ~1% of files.
+
+**The near-duplicate tables are near-saturated, and that is a statement about the corpus.** At dHash
+<=4, **97.07%** of images are within radius of something. This scrape is dominated by hero images
+re-exported at several sizes, so it is close to degenerate for near-duplicate measurement. The
+tables are still printed at every threshold — §5's point that the method chooses the answer holds
+regardless — but no general near-duplicate rate should be read out of this corpus.
+
+**Latency scales the way brute force is supposed to.** Text p50 is **flat at 2 µs** from 1,000 to
+12,007 documents; the vector arm goes 67 -> 102 -> 192 µs, essentially linear in the corpus, which
+is exactly what an exact scan predicts and what `p49` chose deliberately over a graph.
+
+**`p49`'s verdict is withheld, not passed.** The vectors are seeded noise with no visual semantics.
+The run prints `[HELD]` and `1 verdict(s) WITHHELD. This run does not pass p49 — it declines to
+answer it`, and §4's `UNVERIFIED` for image-embedding recall stays `UNVERIFIED` until a real encoder
+runs here.
+
+**Two things this run surfaced that were not planned.** The field-budget collision became
+[`p56`](bench/roadmap/p56-field-budget.md). And the expectation that scraped assets carry lying
+extensions was **contradicted** — `meta::sniff` disagreed with the extension on **0** files, because
+this host serves what it stored and the scraper wrote the extension from the URL, so the two agree
+by construction. One Supabase-backed scrape is not the web; the sniff remains the right default, but
+this run produces no evidence for it and says so.
+
+### The tier through the C ABI, measured
+
+`p53` is closed on all four acceptance items. The same fused query returns **identical documents in
+identical order** in Rust, in Node, in **headless Chromium 147** on the browser main thread, and
+through **`ctypes` in Python's standard library alone**. ABI 11 -> 12, 49 -> **61 symbols**, still
+no `wasm-bindgen` and still zero imports in the module.
+
+The costs are reported rather than buried: the artifact grew **+13.9% raw / +14.3% gzipped**
+(181,798 -> 207,823 B) for the whole tier, and the linear-memory high-water mark is 1.79 MiB in Node
+and 3.20 MiB in a browser tab. Extrapolating the vector column against wasm32's 4 GiB address space
+gives a corpus ceiling of **1.63 M images at 512-d** — the same order as the 1.28 M-image corpus §8
+records `rclip` ingesting. **The browser is therefore a real target for a personal library and not
+for a shared archive**, which is a sharper claim than "it runs in the browser".
+
+Closing that arm also caught a latent false green: `artifact/web/` held an **ABI-2 module from
+2026-09-05**, so the browser check had been passing against a build nobody had made that day. The
+harness now serves from the live tree.
+
+### Three decisions that are the whole part
+
+**The model is an input, not a dependency.** `index-image` takes `&[f32]` and ships no weights, no
+ONNX runtime, no image decoder. The licence spread alone justifies it — SigLIP and DINOv2 are
+Apache-2.0, MobileCLIP2 is an Apple sample licence, Jina CLIP v2 is CC BY-NC, DINOv3 is a bespoke
+gated licence, and **InsightFace's face weights are research-only despite its MIT code badge**. It is
+also what keeps the crate dependency-free, the WASM artifact shippable, and the licence at MIT OR
+Apache-2.0 against seven AGPL incumbents. The honest cost is stated rather than hidden: **this crate
+cannot embed an image for you.**
+
+**No codec.** "Byte-exact but smaller" is lossless compression, bounded by information theory. The
+measured ceiling is JPEG XL's **~20%**, which **fails outright on ~1% of real JPEGs**, and libjxl
+already has it under BSD-3. Lepton, PackJPG, brunsli and FLIF all tried and are dead or absorbed;
+neural lossless compression has no deployable decoder. Meanwhile **~30% of a scraped corpus is
+duplicate bytes** — dedup beats the codec. So the engine ships the content address that *proves* the
+round-trip, and leaves the transcode to the host.
+
+**Face: the primitive, never the gallery.** EU AI Act Art. 5(1)(e) absolutely prohibits building
+facial-recognition databases by untargeted scraping; every European Clearview decision rejects the
+"publicly available photos" defence, and the UK Upper Tribunal named **clustering facial vectors** as
+the triggering step. Google paid **$100 M** under BIPA for face-grouping inside users' *own*
+libraries. `p55` is therefore scoped to clustering caller-supplied vectors with no notion of
+identity, and the model, the consent flow and the jurisdiction stay with the host.
+
 ## What we are NOT going to do
 
 See [`docs/roadmap-rejected.md`](docs/roadmap-rejected.md) for the full reasons, plus the 2026-09-05
@@ -397,6 +537,225 @@ developers and 350 payers.**
 
 ## The next row, and why it is the next one
 
+**Retrieval is exact on every corpus measured, and exact-match search now pays nothing for it.
+One documented bar is red, on purpose.**
+
+`p25` found the third pruning site — the MaxScore essential/non-essential partition, which does not
+skip documents but stops *generating* them — and closed the last 2.23 %. `p26` then noticed that the
+three soundness predicates guarding the three pruning sites were all approximations of one exact
+quantity the ranking pool already stores: `eff = score - bucket * bucket_scale` is exactly
+lexicographic `(bucket, score)`, so
+
+> a document with `score <= S` and `bucket >= B` has `eff <= S - B * bucket_scale`, and skipping it
+> is sound exactly when that cannot beat the pool's worst `eff`.
+
+| presyo product queries, top-10 vs brute force | |
+|---|---|
+| pre-`p21` | 28.20 % |
+| `p21` two pools | 9.33 % |
+| `p24` gates | 2.23 % |
+| **`p25` + `p26`** | **0.00 %** |
+
+**All six real query sets read 0.00 %** — rank-1, top-10 and actually-worse. Cost against `p24`, the
+last incorrect build, interleaved at 1 M: **exact p50 at parity** (504 -> 498 us), typo p50 +17 %,
+typo p99 +83 %. Exactness is paid for entirely in the typo tail.
+
+**`scale` is `OVERALL: FAIL` and stays that way.** Worst typo p99 is 17 ms against `p7`'s 5 ms bar at
+1 M. This was not introduced by the correctness work — the same interleaved run puts `p24` at 9.4 ms,
+also over the bar, and that build predates every fix in `p25` and `p26`. The bar had been failing all
+day in every arm and no document said so. It stays at 5 ms rather than being quietly raised to match
+the engine, because raising it would be marking one's own homework.
+
+> Superseded on the numbers, not on the verdict: `p47` brings that row to **13.6 ms** and shows the
+> bar is **met on every corpus of real documents** (4.54 ms at presyo's 241,677 products). `scale`
+> is still `OVERALL: FAIL` and the bar is still unraised. See `bench/roadmap/p47-typo-tail.md`.
+
+**Since then, `p28` closed the "any language" half of the goal**: `include/index.h` ships the C ABI
+as a real header, `host/python/index_ffi.py` proves it from a second language with zero
+dependencies, and `js/smoke.mjs` grew from 7 checks to 21 by testing the builder path that was
+exported but never exercised from any host. From Python, through ctypes, on 1,039,160 rows: **exact
+p50 551 us, p99 4.0 ms**.
+
+**`p30` closed the largest silent gap in the goal: the engine had no faceting at all.** Shopping
+search is filter and count, not only ranking, and `facet` in this codebase meant only "a field used
+to learn expansions". Now multi-field faceting exists — `with_facet` per field, `search_facet_all` for a
+**conjunction** (brand AND category in one pass), `facet_tally_at` per slot — exposed through the
+C ABI (version 2 -> **4**) and exercised from Rust, JavaScript and Python. On presyo's 241,677
+real products with **19,793 brands and 146 categories**: **+9.55 B/doc**, tallies **exact on
+40/40** against exhaustive scoring, **0 short pages** across the 104 hardest filter-then-rank
+cases, **0 wrong** on 80 conjunction pairs, and a full tally at **88 us p99**.
+
+**`p31` then closed the gap `p30` named**: numeric columns, half-open range filters, and
+histograms — a storefront's whole filter bar (brand AND category AND size) in one pass, exposed
+through the C ABI (version **5**, 25 symbols) and exercised from Rust, JavaScript and Python.
+On the same 241,677 products: **+17.55 B/doc** for all three columns, **60 histograms 0 wrong**
+against both the range filter and the match count, and a six-bucket histogram at **179 us p99**.
+
+**`p32` added sort by value**, which `p31` named: order by a numeric column with the filter bar
+applied first. It is the one capability here that **gives up pruning** — a numeric order gives
+the engine nothing to stop early on — and the measurement says so plainly: **p99 2,521 us against
+315 us for a ranked search, 8x**, on 336 real queries over 241,677 products. Still interactive,
+and now a number a host can decide with.
+
+**`p33` closed a documentation hole**: `index-accel`, the analytics half of the goal, had **0
+roadmap documents and 0 benches**. It now has a differential bench — **2,400 randomised trials, 0
+disagreements** across all seven kernels, including three deliberately over-filled hash tables that
+all returned `-1` rather than wrapping. Throughput at 1 M rows: **aggregate 387 M rows/s, group 305,
+top-k 291, filter 192**.
+
+**`p33` also corrects itself.** Its first draft called the `u32` host-pointer truncation a defect it
+had found; `docs/integration.md` already documents that exact failure and the deliberate decision it
+led to, and onegrid's own harness already proves the port against their specification at 294/294.
+The rediscovery-as-discovery is recorded in the document rather than edited away.
+
+**`p34` answers the goal's central question for the analytics half**: *how much of this speed
+survives in a webapp?* Measured inside the real 6,342-byte WebAssembly artifact, **73–93 % of
+native on five of six kernels** — a million rows aggregated in 2.8 ms, filtered in 5.6 ms,
+grouped in 4.6 ms, in a browser tab with no server and no upload. The sixth, `bitmap_op`, keeps
+only 4 %, and it is the expected one: the only byte-parallel kernel, so the only one native
+auto-vectorises and wasm32 cannot. That is the cost of no SIMD, isolated; `simd128` is the
+follow-up and is not run.
+
+**`p35` ran the follow-up `p34` named, and had to correct its own first answer.** With
+`-C target-feature=+simd128` the byte-parallel kernel appeared unchanged — because the bench was
+passing the output buffer as one of its inputs, and aliasing blocks vectorisation. With distinct
+buffers `simd128` is **9–16x on `bitmap_op`**, lifting it from 4 % of native to roughly 45 %.
+Not shipped: onegrid already has the SIMD capability probe and nothing uses its answer, and the
+`.wasm` is outside their bundle budget — so building both and letting their probe choose is
+their decision to make.
+
+**`scripts/build-wasm.sh` now builds every artifact in one command** — search, geo, analytics,
+and the `simd128` analytics variant — side by side into `dist/`, with raw and gzipped sizes.
+That closes `p35`'s last mechanical limit: the two analytics builds previously wrote to the same
+path. Gzipped, the whole surface is **144 KB search + 22 KB geo + 3 KB analytics**.
+
+**`p37` closed the gap that actually blocked production.** Incremental updates existed in
+`searcher.rs` all along — I said they didn't, which was wrong — but they could not be combined
+with faceting, and they were **not exposed through the C ABI at all**, so no JavaScript or
+Python host could add a row without rebuilding the corpus. `Searcher` now has the full query
+surface and 15 new ABI symbols (**ABI 7, 41 symbols**), with cross-segment facet tallies merged
+by *value* rather than by per-segment interned id. Live updates now work from all three tiers.
+
+**`p38` priced the incremental path.** On 241,789 real products: **latency is the cost, ranking
+is not.** p50 runs **10 us at one segment to 2,326 us at fifty (232x)**, while rank-1 agreement
+with a monolithic index holds at **96–98 %**. Guidance: segments are cheap to build (build time
+is flat), keep the count in single digits, rebuild when `needs_compaction()` fires.
+
+**`p39` shipped highlighting**, the second of the two things named as blocking deployment.
+`highlight(query, text)` returns byte ranges of a row the caller passes back — the index stores
+no field text, and keeping a second copy to highlight it is the duplication this engine exists
+to avoid. Spans come from the same analysis the index used, so `highlight("Colgte", ..)` marks
+**Colgate**. **ABI 8, 42 symbols**, in all three tiers.
+
+**`p40` indexed the house's own databases** — `booted`'s crawl of **2,600 tables across 54
+databases and 5 machines**, read from disk and never committed. Finding a table by name is 100 %,
+and finding one **from its comment with every name word removed** is 100 % in top 10. It also
+settles the billion-row question with real numbers: the largest table in the house is
+**1,205,889 rows**, inside what `p7` already measures.
+
+**`p41` shipped the ranking signal `p40` exposed.** A short exact name was losing to a longer
+relative whose comment repeats the term, because BM25 cannot see that field 0 *is* the query.
+`INEXACT_FIELD_KEEP` demotes the inexact — never boosts the exact, so pruning bounds stay valid
+by construction. **Nothing regressed; two corpora improved**, including a documented loss in
+`p20` that is now gone.
+
+**`p42` indexed the first long-document corpus and it broke the engine in ten seconds.**
+`alec`'s scrape — 119,179 rows of 1,000-character HTML, 123.6 MB — panicked with *user-provided
+comparison function does not correctly implement a total order*. `rank_cmp` treated scores
+within a tolerance as equal, and a tolerance is not transitive. Short fields never produced
+enough near-ties in one result set to expose it. Fixed by quantizing each score onto a grid,
+which makes the comparison a pure function and transitive by construction, plus the exhaustive
+total-order test that should have existed all along. **The pruning gates hold on the new shape:
+0 differences against brute force.**
+
+**`p43` finished the filter bar and added paging.** `FacetClause` gives OR within a clause, AND
+across clauses and NOT — the shape every storefront actually offers — and `search_page` gives
+offsets, with the cost stated on the method: it grows with `offset`, not `k`. The safety rule is
+asserted in both directions, because an include with all-unknown values must match **nothing**
+while an exclude with all-unknown values must exclude **nothing**, and reversing them returns
+the whole corpus while looking like a working search.
+
+**`p44` carried both to the multi-segment searcher and found two bugs on the way.** An out-of-range
+facet slot made the whole filter unsatisfiable *including an exclude*, so `1!=discontinued` would
+have deleted every row from a segment built before the slot existed — `p43`'s asymmetry one level
+up. And `js/index.mjs`, the host applications actually import, sat at `ABI_VERSION = 2` while the
+module was at 9, throwing on every call, because the smoke test instantiates the module directly and
+never touched it. **A host that is not gated is not shipped, only published**; it is gated now.
+
+**`p45` added phrase queries** on an opt-in positional section — the default still costs zero bytes.
+The field is packed into the position, so a phrase cannot span a field boundary by construction; an
+index without positions returns nothing rather than falling back to a bag-of-words match that would
+be indistinguishable once merged. Verified on 25,979 real rows against an arm sharing no code with
+the engine: **980 hits, 0 wrong**. The cost surprised: +74.7 % of artifact size, and **the offset
+array is 2.2x the positions it addresses**, because most (term, document) pairs carry exactly one.
+
+**`p46` gave the sort tail an early exit, by keeping the arm that is usually worse.** A value-order
+walk stops after `k` matches but is 83x worse at the median on selective queries, so both arms ship
+and the cheaper is chosen from posting lengths the index already has. **Sort p99 nearly halves,
+2,615 → 1,387 us, with the median unchanged.** Held to one answer by 336 real queries x 2 directions
+every run: 0 disagreements.
+
+**`p47` found that `eff` was not the comparator it claimed to be** — built from the raw score while
+the ranking compares the quantized one, so the ranking pool could evict a document the answer wanted
+and the scoring pool was quietly covering. Fixing it proved the ranking pool alone holds the top `k`,
+which meant **the scoring pool no longer carries recall** and could be sized for pruning instead:
+**exact p50 at 1 M fell 35 %, typo p50 22 %, presyo real-query p99 12 %**, with `pool-audit` still
+0.00 % in all six cells. **ABI 11, 49 symbols, format IDXTEXT6, 134 tests.**
+
+**`p48`, `p49` and `p50` answered "something that works on any database", and the answer was a
+pipe.** A driver only ever works on the databases somebody wrote one for, so `index-cli` reads rows
+from stdin instead: every database already ships a client that prints CSV, TSV or JSON, and every
+change-data-capture tool already emits newline-delimited JSON. `p48` added the missing primitive —
+**document keys**, without which `"the row with sku A-1 changed"` was inexpressible, because
+`delete` took a dense ordinal no database row carries. `p50` made the stream continuous, and its
+bench found a real ordering bug in `apply` on the first run: batched upserts were applied after
+deletes regardless of arrival order, so `upsert k; delete k` left the row present, silently.
+**Membership is now exact over 8,000 operations (0 wrong, 14,288 = 14,288); ranking drift is
+measured, not hidden.** Format IDXTEXT7, 162 tests, one new dependency-free crate.
+
+**Next, in order:**
+
+1. **Commit.** Fifty roadmap documents, ~13 bench bins, two WASM hosts, the C header, the Python
+   host, the new CLI and every engine change still sit uncommitted against `d6c7500`. This is the
+   largest risk in the repository and the cheapest thing on the list, and it has been top of this
+   list for two sweeps.
+2. **Deploy an integration.** `docs/integration.md` already runs all four apps against their *own*
+   test suites — profstopick 9/9 and 1,922/1,958, onegrid 294/294, presyo head-to-head against its
+   own SQL at 260,000 rows, sisia 91.2 % vs 0.0 % — but all of it lives on throwaway branches.
+   Opening a PR is the step nobody but you can authorize. **`p49` changes what that PR looks like**:
+   an app can now adopt the engine with a shell command in its deploy script instead of a build
+   step in its own language.
+3. **Expose keys over the C ABI.** The Rust `Searcher` and the CLI can resolve and delete by key;
+   the JavaScript and Python hosts cannot, so a browser or a Python service still cannot express an
+   update. That is the obvious next ABI bump and `p48` names it.
+4. **Global collection statistics across segments.** `p38` found segmentation costs ranking parity
+   and `p50` measured the same cost under a delete-heavy stream: 93 % rank-1 after the first delta,
+   84 % after 8,000 operations, and **no compaction threshold holds it above ~93 %** because the
+   first delta already costs that much. Per-segment statistics are the cause of both, and fixing
+   them is the only thing that would raise the ceiling rather than move the trade-off.
+5. **Decide the typo-tail bar, which is now a question about corpora rather than about code.**
+   `p47` separated the failing rows from the passing ones by whether the documents are real:
+
+   | corpus | documents | typo p99 | 5 ms bar |
+   |---|---|---|---|
+   | presyo, real products | 241,677 | **4.54 ms** | **PASS** |
+   | DepEd schools, real | 61,467 | **1.81 ms** | **PASS** |
+   | DepEd, recombined | 250,000 | 6.16 ms | FAIL |
+   | DepEd, recombined | 1,000,000 | 13.58 ms | FAIL |
+
+   **The bar is met on every corpus of real documents this project has.** It fails only where
+   `scale` holds vocabulary fixed at 41,069 terms while multiplying documents up to sixteenfold,
+   which makes every posting list longer than a genuine corpus of that size would produce. Three
+   independent attacks — `p27` seeding, `p29` expansion, `p47` bounds — have each moved that row by
+   under 10 %, so the remaining options are a genuinely new enumeration strategy (bucket-tiered
+   candidate generation), a real million-document corpus to measure instead of a recombined one, or
+   `p29`'s opt-in `search_capped(.., 4)` at 98.1 % agreement. **The bar stays red and unraised.**
+6. **Phrase-query follow-ups `p45` left named:** varint/delta encoding for the position offsets (a
+   pure win, no API change), and a quoted-substring query syntax, which needs a query parser this
+   engine has deliberately never had.
+
+## Done — the pruning gate
+
 **Wire derived expansion into `AliasTable`, and measure what it costs ordinary queries.**
 
 The vocabulary gap that `p15` opened is now largely closed, with evidence at every step:
@@ -405,7 +764,7 @@ The vocabulary gap that `p15` opened is now largely closed, with evidence at eve
 |---|---|---|
 | `p15-presyo-catalog` | is there a real gap? | **61.7 %** precision@10 — the project's first unsaturated workload |
 | `p16-biasd-entity` | what could an alias table buy? | **+14.9 pt**, and 0.7 % → 95.5 % on disjoint queries *(ceiling, curated aliases)* |
-| `p17-presyo-expand` | can aliases be **derived**? | **+23.9 pt held out** — 55.7 % → 79.6 %, no model, no new storage |
+| `p17-presyo-expand` | can aliases be **derived**? | **+21.5 pt held out** — 55.7 % → 77.2 %, no model, no new storage |
 
 And `p17` carries the control that matters: a **random** expansion of the same size costs **35.9
 points**, so the ~60-point spread says the derivation is doing the work rather than "longer queries
@@ -429,7 +788,7 @@ mechanism inside the engine, and the table is derived at build time and serializ
 so an application gets it by naming a facet field, with no pipeline of its own. That is goal #1
 ("apps don't need to optimize for their data anymore") delivered for this one failure mode.
 
-On presyo's 241,677 products: **71.1 % → 96.6 % precision@10 in-sample (+25.5 pt)**, 145 facet values learned,
+On presyo's 241,677 products: **75.3 % → 97.0 % precision@10 in-sample (+21.8 pt)**, 145 facet values learned,
 +3.4 s of build time, category-query latency 316 µs against 178 µs for an exact product query.
 `real-corpus`, `sisia-catalog`, `maphy-place`, `geo-bench` and the WASM smoke test are all unchanged.
 
@@ -439,8 +798,8 @@ with an industry, where nothing in `10K EAST CONCRETE MIX SPECIALIST, INC.` says
 
 | corpus | documents | facet values | plain | learned | Δ |
 |---|---|---|---|---|---|
-| presyo — grocery products | 241,677 | 145 | 61.7 % | 96.6 % | **+34.9 pt** |
-| **blead — business names** | **25,979** | **27** | **64.8 %** | **85.2 %** | **+20.4 pt** |
+| presyo — grocery products | 241,677 | 145 | 75.3 % | 97.0 % | **+21.8 pt** |
+| **blead — business names** | **25,979** | **27** | **77.4 %** | **95.6 %** | **+18.1 pt** |
 
 Label leakage is 13.8 % and 11.8 % respectively, so the two are comparable by construction and the
 difference cannot be blamed on an easier label. `Construction` and `Public Admin` go from **0 %** to
@@ -450,8 +809,11 @@ difference cannot be blamed on an easier label. `Construction` and `Public Admin
 
 | corpus | in-sample gain | held-out gain | held-out retains | staleness cost |
 |---|---|---|---|---|
-| presyo — grocery products | +34.9 pt | +23.9 pt | **68 %** | ~11–17 pt |
-| **blead — business names** | +20.4 pt | **+6.7 pt** | **33 %** | **13.7 pt** |
+| presyo — grocery products | **+21.8 pt** | **+21.5 pt** | **~99 %** | ~0 pt |
+| **blead — business names** | **+18.1 pt** | **−1.5 pt** | **~0 %** | **19.6 pt** |
+
+*(Re-measured after the pool fix; the earlier +34.9 / +20.4 in-sample figures were inflated by the
+pool defect suppressing their baselines — see "Corrected again" below.)*
 
 The staleness cost is comparable, but **what survives on unseen documents is not**. The mechanism's
 value depends on **vocabulary reuse within a facet**: half of `Baking Needs` and the other half
@@ -463,7 +825,7 @@ facet's members reuse vocabulary — and an adopter can check that property on t
 adopting**, using exactly the in-sample/held-out split these benches run, which needs no labels
 beyond the facet they already have.
 
-**The in-sample/held-out distinction is the thing to carry forward, not the 96.6 %.** In-sample is
+**The in-sample/held-out distinction is the thing to carry forward, not the 97.0 %.** In-sample is
 the deployment condition for products already in the catalogue; `p17`'s held-out 79.6 % is the
 condition for products added after the table was built. **The ~17-point gap is the cost of a stale
 table**, and it is what decides how often derivation should re-run.
@@ -540,7 +902,150 @@ misses, 188 (14.6 %) name a category sharing a word with the true one — `Spiri
 not claimed**: whether `Spirits` may stand in for `Liquor` is presyo's call about its own taxonomy,
 not this project's.
 
-## Corrected — a benchmark error worth 9.4 points
+## The next row, and why it is the next one
+
+**Make pruning consistent with ranking.**
+
+`bench/roadmap/p21-pool-eviction.md` found and worked around a real defect, and then measured that
+the workaround cannot be right: sweeping the pool multiplier, **presyo saturates at 6, blead at 24,
+and profstopick is still climbing at 48.** A constant that is corpus-dependent is a symptom, not a
+cure.
+
+> **The engine prunes by score and ranks by `typo_bucket`-then-score. Those two disagree.**
+
+Block-max pruning skips work whose *score* cannot beat the pool's worst *score* — but the final
+ordering puts bucket first, so a document that would rank top can be pruned for a score that has
+nothing to do with how it will be ranked. Learned expansion made this acute; it did not cause it.
+
+The obvious repair does not work, and `p21` records why so it is not attempted twice: the pool's
+worst score **is** the pruning threshold, so a bucket-ordered heap has no valid threshold at its
+root, and tracking the true minimum drives the threshold to zero and disables skipping altogether.
+
+A correct fix needs a **bucket-aware pruning bound** — a per-bucket threshold, or folding bucket
+into a monotone score.
+
+**The differential test is now written, and it reproduces the defect with no expansion involved.**
+`bench/roadmap/p22-prune-consistency.md`:
+
+```
+   decoys   truth rank 1   search() rank 1   agree
+       16           3000              3000     yes
+       32           3000              3200      NO
+     2048           3000              3200      NO
+```
+
+The break is at **32 decoys, exactly the pool size**. So this is not a refinement and not
+expansion-specific — **it is the repair for a demonstrated, pre-existing correctness bug**, and
+`p22` is its acceptance test.
+
+The shape that triggers it is not contrived: a query with one **common** word, where full matches
+are long and near-misses are short and numerous. That is `"iphone 15 pro case"` — the shopping
+search this project exists for.
+
+**Both plausible fixes were built and measured — and the decision to revert them was then itself
+overturned by `bench/roadmap/p23-pool-audit.md`.**
+
+| | `p22` first failure | exact p50 @1M | typo p99 @1M |
+|---|---|---|---|
+| baseline | 32 decoys | 274 µs | **6.0 ms** |
+| fold bucket into one monotone score | **never fails** | 8,051 µs | **57.5 ms** |
+| two pools (score + rank) | 512 decoys | 400–530 µs | 9–10.5 ms |
+
+The first is *correct* and 10–30× slower, and the reason is structural: the pruning threshold is the
+pool's worst member, so a rank-ordered threshold sits below every score and block skipping never
+engages. **Pruning by score is only sound when ranking is by score.** The second keeps the speed and
+closes 16× of the gap but cannot reach documents that skipping discards *before* scoring.
+
+They were reverted on the grounds that the defect had never been seen on a real corpus while the
+latency cost was unconditional. **Both halves of that were wrong**, and `p23-pool-audit.md` — which
+simply went and looked — found out:
+
+- **It happens constantly.** Comparing `search` against brute force on real fixtures: **28.2 % of
+  real presyo product queries** returned a top-10 containing a document that matched *less* of the
+  query than one the pool discarded. Rank 1 was never wrong, which is why every existing bench
+  missed it — they score against labels, and this swaps correct documents for less-correct ones
+  *inside* the labelled set.
+- **The cost was mismeasured.** +50–75 % came from comparing a thermally loaded run against a cold
+  baseline recorded hours earlier. Interleaved A/B in one session: **exact p50 +1.7 %, typo p50
+  +3.0 %, typo p99 +6.3 %.**
+
+**Attempt 2 is therefore back in the engine**, and it earns its place:
+
+| corpus | worse before | worse after | lost-better-match |
+|---|---|---|---|
+| presyo / product names | 28.20 % | **9.33 %** | 1,136 → **221** |
+| presyo / 3-word tails | 18.21 % | **4.35 %** | 729 → **66** |
+| blead / business names | 1.66 % | **0.18 %** | 72 → **3** |
+| maphy, profstopick | 0.09 / 0.04 % | **0.00 %** | → **0** |
+
+**3× fewer degraded queries, 5–11× fewer lost documents, for a few percent.**
+
+`p22` stays red at 512 decoys: the residual is documents block-max skipping discards *before*
+scoring, which only the single-`eff`-pool design reaches — and that one genuinely does cost 10–30×.
+A bucket-aware **pruning bound** remains the real repair and remains unattempted.
+
+**The lesson worth carrying is methodological.** "No consumer bench detected it" was not evidence of
+absence when no consumer bench was built to detect it; and a warm-versus-cold latency comparison
+threw away a working fix for a whole round. **Interleave, or do not claim a delta.**
+
+Getting the reproduction right took three corpora, and the two failures are themselves the
+explanation of when the bug can bite: **to be bucket 0 a document must match every group, and the
+group the decoys miss is precisely the one carrying the IDF** — so the bucket advantage and the
+score advantage normally move together. The bug needs the discriminating term to be nearly
+worthless, which is exactly what a common word is.
+
+## Corrected again — the pool fix shrank expansion's measured value
+
+A docs-consistency audit on 2026-09-05 re-ran every bench against its published numbers and found
+drift in one direction, with one cause:
+
+> **The two-pool fix improved the PLAIN baselines, so the deltas credited to `learn_expansion`
+> shrank. Part of what expansion appeared to be worth was the pool defect suppressing the arm it
+> was compared against.**
+
+| | baseline before → after | expansion gain before → after |
+|---|---|---|
+| presyo (fair baseline) | 71.1 % → **75.3 %** | +25.9 → **+21.8 pt** |
+| blead (plain) | 64.8 % → **77.4 %** | +30.7 → **+18.1 pt** |
+| profstopick (in-sample) | — | −2.2 → **−0.8 pt** |
+
+blead is the striking one: **over a third of its reported gain was the pool bug**, not the feature.
+The feature still works and the direction is unchanged; it is worth less than advertised.
+
+This is why a state document has to be re-measured rather than accumulated. Every number above was
+correct when written and wrong three hours later, because a fix landed underneath it. `CHANGELOG.md`
+keeps the old values deliberately — it is a log — and `p21`'s before/after tables keep them as the
+"before" column, which is what those columns are for.
+
+## Corrected — the pool eviction bug, and the adoption rule it produced
+
+`bench/roadmap/p21-pool-eviction.md`. `p20` recorded, as **undiagnosed**, that expansion cost 10.8
+points on a corpus where its terms are priced below exact matches and should have been harmless.
+Chasing it found an engine bug:
+
+> **The candidate pool is ordered by SCORE; the final ranking is ordered by `typo_bucket` FIRST.**
+> A document with a perfect bucket but a modest score is evicted before the bucket sort sees it —
+> and expansion makes it far worse by adding scoring competitors that were not there before.
+
+Fixed by widening the pool when, and only when, expansion fires. `real-corpus`, `sisia-catalog`,
+`maphy-place` and the WASM smoke test are unchanged. It is **not free where it fires**: a browse
+query now costs ~700 µs against 163 µs for a lookup.
+
+**It changed six published numbers**, and the corrected picture is a usable three-way rule:
+
+| corpus | baseline | in-sample | held-out | retention |
+|---|---|---|---|---|
+| **presyo** — grocery products | 75.3 % | +21.8 pt | **+21.5 pt** | **~99 %** |
+| **blead** — business names | 77.4 % | +18.1 pt | **−1.5 pt** | **~0 %** |
+| **profstopick** — course titles | 99.2 % | −2.2 pt | −34.7 pt | n/a |
+
+1. **Facet already retrieves well** → do not expand; nothing to gain, noise to add.
+2. **Gap, and members reuse vocabulary** → expand; 83 % of the gain survives on unseen documents.
+3. **Gap, but members do not reuse vocabulary** → expand only with frequent rebuilds. blead's
+   **+18.1 in-sample, and its held-out value is negative** — an
+   adopter measuring only in-sample would have picked it as the best fit.
+
+## Also corrected — a benchmark error worth 9.4 points
 
 `bench/roadmap/p20-profstopick-dept.md` went looking for a third corpus and found a defect in this
 project's own measurements instead.
@@ -550,10 +1055,11 @@ project's own measurements instead.
 
 `p15`, `p18`, `p19` and `p20` all set the facet field to `boost 0.0` believing it inert for
 retrieval. It is score-free, not match-free. Measured on presyo with **no expansion at all**:
-name+brand 61.7 % → **71.1 %** once the boost-0.0 category field is present.
+name+brand 61.7 % → **75.3 %** once the boost-0.0 category field is present.
 
-`p15` compared an expansion arm carrying that field against a baseline without it. **The corrected
-gain is +25.5 points, not +34.9**, and `p15` now shows all three rows. `p18` and `p19` are
+`p15` compared an expansion arm carrying that field against a baseline without it. **That correction
+took the gain from +34.9 to +25.5**, and a later re-measure after the pool fix took it to **+21.8**
+(see "Corrected again"); `p15` now shows all three rows. `p18` and `p19` are
 unaffected — both of their arms carried the field, so those comparisons were fair.
 
 The feature still works and the gain is still large. The headline was overstated by 9.4 points, and

@@ -3,6 +3,10 @@
 **Tier:** T1 · **Bin:** `cargo run -p index-bench --release --bin presyo-expand`
 **Status: MEASURED, 2026-09-05. +23.9 pt held out = 71 % of the achievable gain, 0.0 damage.**
 
+> **Numbers on this page were corrected by `bench/roadmap/p21-pool-eviction.md`** — a score-ordered
+> candidate pool was evicting perfect-bucket documents before the bucket-first final sort. See p21
+> for the full before/after table.
+
 ## The three-step chain this completes
 
 1. **`p15-presyo-catalog.md`** found the project's only unsaturated workload: category retrieval at
@@ -45,7 +49,7 @@ So products split in half by index parity:
 | + top 3 derived terms | 76.7 % | +21.1 pt |
 | + top 5 derived terms | 77.2 % | +21.5 pt |
 | + top 10 derived terms | 78.6 % | +22.9 pt |
-| **+ top 20 derived terms** | **79.6 %** | **+23.9 pt** |
+| **+ top 20 derived terms** | **77.2 %** | **+21.5 pt** |
 | + top 5 **random** terms *(control)* | 25.5 % | **−30.2 pt** |
 | + top 20 **random** terms *(control)* | 19.8 % | **−35.9 pt** |
 | + top 5 derived, **brands removed** | 70.2 % | +14.5 pt |
@@ -163,7 +167,7 @@ product lookup, gated by "expand only when the query IS a category".** Both halv
 | | precision@10 |
 |---|---|
 | `p15` baseline, category name alone | 61.7 % |
-| `p17` derived expansion (internal baseline 55.7 %) | **79.6 %** |
+| `p17` derived expansion (internal baseline 55.7 %) | **77.2 %** |
 
 The gap `p15` opened is **substantially but not fully closed**, by the cheapest of the three
 options it listed, with no model and no new storage — and now with evidence at every step rather

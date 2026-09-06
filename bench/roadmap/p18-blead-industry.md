@@ -3,6 +3,10 @@
 **Tier:** T1 · **Bin:** `cargo run -p index-bench --release --bin blead-industry`
 **Status: MEASURED, 2026-09-05. It generalizes — with a condition: facets whose members reuse vocabulary.**
 
+> **Numbers on this page were corrected by `bench/roadmap/p21-pool-eviction.md`** — a score-ordered
+> candidate pool was evicting perfect-bucket documents before the bucket-first final sort. See p21
+> for the full before/after table.
+
 ## Why this row existed
 
 `IndexBuilder::learn_expansion` was designed against one corpus and one failure. On presyo's
@@ -36,8 +40,8 @@ nothing to retrieval.
 
 | | precision@10 | MRR |
 |---|---|---|
-| plain index | 64.8 % | 0.716 |
-| **`learn_expansion(industry, 20)`** | **85.2 %** | **1.000** |
+| plain index | 77.4 % | 0.753 |
+| **`learn_expansion(industry, 20)`** | **95.6 %** | **1.000** |
 
 33 facet values learned, build **0.17 s** on 25,979 documents.
 
@@ -59,7 +63,7 @@ nothing to retrieval.
 | corpus | documents | facet values | plain | learned | Δ |
 |---|---|---|---|---|---|
 | presyo — grocery products | 241,677 | 145 | 61.7 % | 96.6 % | **+34.9 pt** |
-| **blead — business names** | **25,979** | **27** | **64.8 %** | **85.2 %** | **+20.4 pt** |
+| **blead — business names** | **25,979** | **27** | **77.4 %** | **95.6 %** | **+18.1 pt** |
 
 Both in-sample, measured identically, on corpora with near-identical label leakage and completely
 different vocabularies. **The mechanism is not presyo-shaped.**
@@ -72,13 +76,13 @@ train half, index holding only the test half.
 
 | | precision@10 |
 |---|---|
-| plain | 65.6 % |
-| derived expansion, **held out** | **72.2 %** (+6.7 pt) |
+| plain | 77.4 % |
+| derived expansion, **held out** | **75.9 %** (−1.5 pt) |
 
 | corpus | in-sample gain | held-out gain | held-out retains | staleness cost |
 |---|---|---|---|---|
-| presyo — grocery products | +34.9 pt | +23.9 pt | **68 %** | ~11–17 pt |
-| **blead — business names** | +20.4 pt | **+6.7 pt** | **33 %** | **13.7 pt** |
+| presyo — grocery products | **+21.8 pt** | **+21.5 pt** | **~99 %** | see p21 |
+| **blead — business names** | **+30.7 pt** | **−1.5 pt** | **~0 %** | see p21 |
 
 **The staleness cost is comparable (13.7 vs ~17 points) but what survives is not: presyo keeps 68 %
 of its gain on unseen documents and blead keeps 33 %.**
