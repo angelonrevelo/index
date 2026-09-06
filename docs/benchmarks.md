@@ -42,15 +42,21 @@ arms are timed **interleaved in one process** rather than compared across runs, 
 >   5,183 → 3,286 us**, at 500 K 5,601 → 5,392 us. The 5 ms bar's crossing point therefore moved
 >   **up** from ~250 K, and the "holds to ~250 K" verdict below is now **conservative** rather than
 >   current.
-> - **`p73`, `p75` and `p79` together cut the `build` column by ~3.6x.** On the `scale` bin's
->   million recombined documents, measured on this tree: **18,436 → 5,166 ms**, with the serialized
->   bytes identical at every rung throughout. `p73` threaded the build, `p75` rewrote the tokenizer
->   byte-wise, `p79` deleted the per-token allocation. The `build` figures below are single-threaded
->   pre-`p73` numbers and are now an upper bound by roughly that factor.
+> - **`p73`, `p75` and `p79` together cut the `build` column by ~3.9x.** `p73` threaded the build,
+>   `p75` rewrote the tokenizer byte-wise, `p79` deleted the per-token allocation. Measured on
+>   `bin/scale` by rebuilding the pre-`p73` tree (`0073828`) and running it beside the merged one,
+>   **minimum of three runs each side, on a quiet box:**
 >
->   *Both figures are a minimum over repeated runs on a workstation running its owner's normal
->   desktop applications — this machine never presents a genuinely quiet box, and a minimum is the
->   right estimator when the only available noise adds time.*
+>   | documents | pre-`p73` | now | speedup | bytes |
+>   |---|---|---|---|---|
+>   | 61,467 (real) | 671 ms | **223 ms** | **3.01x** | identical |
+>   | 250,000 | 2,945 ms | **778 ms** | **3.79x** | identical |
+>   | 1,000,000 | 12,404 ms | **3,180 ms** | **3.90x** | identical |
+>
+>   The `build` figures below are single-threaded pre-`p73` numbers and are an upper bound by
+>   roughly that factor. **The query columns are not affected**: the same pair measures a 1 M typo
+>   p99 of 14,146 us before and 14,432 us after, so the build work moved latency in neither
+>   direction.
 >
 > **Why it is not simply re-run here.** The corpus is a live pull from presyo's `raw_product`;
 > `bench/fixture/presyo-1m.tsv` is not committed. Re-timing it also requires an otherwise-idle box,
@@ -244,8 +250,14 @@ Nothing here is hidden elsewhere in this file.
 - **Ranking drifts under a change stream** — 92.7 % → 88.7 % rank-1 over 8,000 operations. Exact on
   membership, approximate on order, until a rebuild.
 - **Segmentation costs ~310x p50 at 50 segments.** Usable only in single digits.
-- **Every query is single-threaded.** Nothing shards a query across cores. `p73` threaded the
-  *build* (1.89x at a million, bytes identical); the query path is untouched by it.
+- **Every query here is single-threaded, and that is now the shipped default.** `p74` added a
+  per-segment fan-out across cores; `p80` made it **opt-in** (`INDEX_PARALLEL=1` or
+  `Searcher::set_parallel(true)`) after measuring the enabled-by-default path **2.2-2.4x slower**
+  than serial at 25 and 50 segments on a machine running its owner's ordinary applications. On a
+  quiet box the same code measured 2.9x faster on the p99. Both hold; the default is the safe one.
+- **`p73`/`p75`/`p79` threaded and rewrote the *build*** — 3.90x at a million, bytes identical — and
+  it is on by default, because a build is a batch operation whose caller is waiting on exactly that
+  work. That is a different bet from spending a process's cores on one interactive query.
 - **10 M is unmeasured** because 10 M of real text does not exist in this estate, and recombining to
   reach it would report a number ~2x worse than reality.
 - **Learned-expansion queries still score per segment** — the expansion table stores term ids, not

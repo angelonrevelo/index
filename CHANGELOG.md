@@ -159,6 +159,121 @@ document wants seven columns and `index_text::MAX_FIELD` allows four.
 
 
 
+## p78-p80 — the browser payload, the last allocation, and a default that had to be inverted (2026-09-07)
+
+The close of the fan-out, and the point at which the box finally went quiet enough to measure
+properly. Two lanes landed; one earlier lane was **partially reverted** on the evidence.
+
+### p78 — the browser payload nobody was watching
+
+`README.md` had claimed **173,700 bytes** for the WASM module for a long time. The real figure was
+**604,184** — a 3.5x growth, found only because a literal transcript in the README was *re-run*
+instead of hand-edited. The browser tier is this repo's uniquely defensible position, so nobody
+watching that number was a gap in the gate, not merely in the docs.
+
+- `.cargo/config.toml` scopes `-C strip=symbols` to the `wasm32` triple, removing a **46,513-byte
+  `name` section** of Rust symbol names only a profiler reads. Deliberately a cargo config rather
+  than a `[profile]` key: `strip = true` at the workspace root applies to *every* target and would
+  cost `cargo test --release` its symbolised backtraces while buying zero bytes natively.
+- Measured on the merged tree: `index_wasm` **559,970 raw / 203,769 gzipped** (code now 93.3 % of
+  the module), `index_geo_wasm` 77,065 / 31,072, `index_accel` 5,946 / 2,802.
+- **The finding is larger than what shipped.** `core::slice::sort` is **199,029 bytes — 38.3 % of
+  all code — across 146 monomorphizations**; all of `index-text` is 148,753 by comparison.
+- The lane's own main hypothesis **failed**: rewriting every `sort_by` to `sort_unstable_by` bought
+  9,249 bytes and was *worse* gzipped, because `ipnsort` is nearly as big as `driftsort`. The cost
+  is the number of distinct `(T, comparator)` pairs, not stability.
+- `opt-level="z"` was the smallest on the board (477,121) and **2.1x slower per query**.
+  `opt-level=2` was the near miss — speed-neutral *in wasm* — rejected because a target-wide
+  rustflag also hits `index-accel`, where `bitmap_op` collapses **7,344 → 2,408 M rows/s**, and the
+  obvious carve-out does not work: rustflags are appended *after* cargo's own `-C opt-level`.
+- Ships `scripts/wasm-section.mjs`, a dependency-free section reporter, so the number stops being
+  invisible.
+
+### p79 — the allocation was jointly owned
+
+`p75` named `Vec<Token>` as the last large build item and listed three shapes to fix it. **The
+measurement picked none of them.** Reusing the vector and freeing the token strings is worth 180 ms
+of a 1,536 ms item — 12 %. The other 1,356 ms is 13.69 M malloc/free pairs.
+
+And the buffer **alone measured 32 ms slower** in the real build. The old map insert *moved* the
+token's string in, so the free belonged to the map: one malloc in the analyzer, one free in the map.
+Reusing the buffer without changing the map merely relocates the malloc into the clone. **Either
+half alone removes one end of a pair and therefore removes nothing** — which is why the lane needed
+`index.rs` as well as `analyze.rs`.
+
+`tokenize` is unchanged as public API (a three-line wrapper), so `p75`'s four `mod legacy`
+equivalence tests pass **unmodified, with no adapter**.
+
+### p80 — the query fan-out is opt-in now, because the default was 2.4x slower
+
+`p74` shipped threaded per-segment queries **enabled by default** and noted its speedup had not been
+independently reproduced. Reproducing it inverted the default.
+
+`segment-scale` on presyo's 241,789 real products, alternating `INDEX_PARALLEL=0` and `=1` so both
+arms meet the same machine, at the rungs the gate actually selects:
+
+| segments | serial p50 | threaded p50 | |
+|---|---|---|---|
+| 25 | 5,141 / 5,792 us | **12,528 us** | **2.2-2.4x SLOWER** |
+| 50 | 14,235 / 11,296 us | **26,966 us** | **1.9-2.4x SLOWER** |
+
+25 x 241,789 = 6.0e6 clears the 4.5e6 gate, so **the threaded column is literally what `p74` shipped
+as the default.** Both measurements are correct — `p74`'s were taken on a quiet box, and this
+machine was running its owner's ordinary applications. `p74` predicted the pathology precisely and
+then defaulted the other way. **The error was treating contention as an exceptional condition worth
+a kill switch, when for an embedded library it is the ordinary one.**
+
+`INDEX_PARALLEL=1` is now an opt-in rather than a kill switch, plus `Searcher::set_parallel(bool)`
+and `Searcher::parallel()`. `PARALLEL_WORK_MIN`, the work estimate, the claim queue and the
+segment-index sort are untouched: nothing about `p74`'s machinery was wrong, only its default.
+
+### The build number, finally measured on a quiet box
+
+Every speedup in `p73`-`p79` was reported as the lane's own, taken before merge, because three to
+four build-heavy agents held cores throughout. With the fan-out finished the machine went quiet, and
+the pre-`p73` tree (`0073828`) was rebuilt and re-run beside the merged one. **Minimum of three runs
+each side, `bin/scale`:**
+
+| documents | pre-`p73` | now | speedup | bytes |
+|---|---|---|---|---|
+| 61,467 (real) | 671 ms | **223 ms** | **3.01x** | identical |
+| 250,000 | 2,945 ms | **778 ms** | **3.79x** | identical |
+| 1,000,000 | 12,404 ms | **3,180 ms** | **3.90x** | identical |
+
+This **supersedes the ~3.6x figure** recorded in the `p74`-`p77` entry below, which was computed
+against an 18,436 ms baseline measured while the box was loaded. It also settles a question the
+earlier entries could not: the typo p99 at 1 M is **14,146 us before and 14,432 us after** — the
+build work did not touch query latency in either direction.
+
+### Fixed
+
+- **`README.md` claimed the browser tier had no persistence**, three lanes after `p68` shipped OPFS
+  and one after `p72` shipped range reads.
+- **`README.md` claimed no WASM artifact existed.** One has existed and been gated in CI for a while.
+- **`README.md` claimed the 5 ms typo bar "is met on every corpus of real documents."** `p55` had
+  already corrected that claim in the roadmap; the README kept it. It holds to ~250 K; `p56`
+  measured 8.29 M real rows at 33 ms.
+- **The README scaling table was stale in every column** — 796 ms / 10.2 MB at 61,467 against a
+  measured 223 ms / 5.2 MB.
+- **`scripts/build-wasm.sh` said "C ABI v13, 69 symbols."** `ABI_VERSION` is 14 and the module
+  exports 81 `idx_*` of 84 total, counted out of the binary.
+- **~20 harness environment variables were documented nowhere.** Now in `bench/README.md`, with the
+  library's single variable in the README's new Configuration section.
+
+### Honest gaps
+
+- **`pool-audit` is not in CI.** The ranking gate that every merge in this repo is checked against
+  runs by hand, because it needs sibling corpora that are not vendored. Nor are
+  `host/python/index_ffi.py`, `js/demo.mjs` or `js/accel-bench.mjs`.
+- **`p74`'s 2.9x tail win has been reproduced by nobody but the lane that found it.** It is gated
+  behind an opt-in and remains unconfirmed on a second quiet measurement.
+- **The `docs/benchmarks.md` headline grid still predates `p69`.** Regenerating it needs a live pull
+  from presyo; the fixture is not committed. It carries a staleness banner rather than a fix.
+- **`core::slice::sort` at 38.3 % of the wasm module is untouched.** `p78` sketches the collapse —
+  pack `(f32 score, u32 doc)` into one `u64` whose natural order is the ranking order — and nobody
+  has built it. It is the largest single lever left in the repo.
+- **Safari is untested** for the OPFS tier; only Chromium is checked.
+
 ## p74-p77 — concurrency on both sides, the tokenizer, and a geo bug that answered confidently (2026-09-06)
 
 The second half of the fan-out, after the free-model tier's quota ran out and the remaining lanes

@@ -95,8 +95,8 @@ Full numbers, including what fails: [`docs/benchmarks.md`](docs/benchmarks.md).
 
 ## Status
 
-**The project was re-baselined on 2026-09-05** after surveying eleven real applications and running
-six research lanes. The headline finding is uncomfortable and is stated first:
+**The project has been re-baselined** after surveying eleven real applications and running six
+research lanes. The headline finding is uncomfortable and is stated first:
 
 > **The learned-index core that this repo spent its first phase building solves a problem none of
 > the eleven consumer apps has.** Their hot paths are *text → ranked documents*, *predicate → row
@@ -113,15 +113,16 @@ BM25F, and a portable index format. Full argument: [ROADMAP.md](ROADMAP.md) and
 - A piecewise-linear (PLA) learned index over sorted `u64` keys whose prediction is guaranteed within
   `±epsilon` of the true position (proven by test), with a bounded last-mile search. At ε=16 it
   **beats `std::BTreeMap` on space, p50 and p99** across four distributions at n=1M and n=10M
-  (median-of-5, `rdtsc` timer). Re-verified 2026-09-05.
+  (median-of-5, `rdtsc` timer). Reproduce with
+  `cargo run -p index-bench --release --bin beat-btreemap`.
 - A recursive `PgmIndex` — correct, but measures ≈ the single-level index up to 10M. The
   tail-latency lever is ε, not the top layer.
 - A succinct `FmIndex` (BWT + wavelet tree + sparse SA) at ~5.9/9.7/14.6 bits/char at σ=4/26/256,
   with `count`/`locate`/k-mismatch correct.
 - `CrackerColumn` — stochastic database cracking, proven to avoid the adversarial case that naive
   cracking fails.
-- **New (2026-09-05):** `index-text`, the retrieval engine itself — analyzer, typo-tolerant term
-  dictionary, BM25F, MaxScore top-k and RRF — **measured against two production corpora**. See
+- `index-text`, the retrieval engine itself — analyzer, typo-tolerant term dictionary, BM25F,
+  MaxScore top-k and RRF — **measured against two production corpora**. See
   [Headline measurement](#headline-measurement).
 
 ```
@@ -374,16 +375,18 @@ ABI shape onegrid already ratified on this machine, so it drops into a socket th
 
 | docs | build | index bytes | exact p50 | typo p50 | typo p99 | |
 |---|---|---|---|---|---|---|
-| **61,467** | 796 ms | 10.2 MB | **137 us** | **336 us** | **2.19 ms** | **real** |
-| 250,000 | 3.2 s | 39.7 MB | 155 us | 414 us | 3.60 ms | recombined |
-| 1,000,000 | 14.2 s | 157 MB | **279 us** | **643 us** | **6.4-7.2 ms** | recombined |
+| **61,467** | 223 ms | 5.2 MB | **173 us** | **451 us** | **2.33 ms** | **real** |
+| 250,000 | 778 ms | 19.3 MB | 334 us | 672 us | 6.34 ms | recombined |
+| 1,000,000 | 3.2 s | 75.6 MB | **642 us** | **1,127 us** | **14.5 ms** | recombined |
 
-**Sub-millisecond p50 at a million documents. p99 is 6.4-7.2 ms against a 5 ms bar - that row
-still FAILS.** The spread across three identical runs is ~0.9 ms, which is itself a finding: a
-5 ms bar is below this harness's resolution at this scale, so the row is not declared met by
-picking the best run. 250 K passes. Five retrieval defects were found here, including a
-soundness bug in the candidate heap; details and the remaining levers:
-[`bench/roadmap/p7-scale.md`](bench/roadmap/p7-scale.md).
+**Sub-millisecond exact p50 at a million documents. The typo p99 fails a 5 ms bar above ~250 K**,
+and that bar is the one number in this repo that has never been met at a million — see
+[`docs/benchmarks.md`](docs/benchmarks.md) for where it does hold and why the ceiling is vocabulary
+rather than document count.
+
+`cargo run -p index-bench --release --bin scale` reproduces the table. Numbers are the minimum of
+three runs on one Windows workstation; the build column is threaded and the query column is not.
+Details and the remaining levers: [`bench/roadmap/p7-scale.md`](bench/roadmap/p7-scale.md).
 
 ### And the term dictionary in isolation
 
@@ -391,6 +394,25 @@ soundness bug in the candidate heap; details and the remaining levers:
 dictionary — 3.8 % of the 2.5 MB JSON index that app ships today** — takes typo recall from 6.8 % to
 99.9 % at a p99 of 0.66 ms. Holds to 861 K distinct terms. Spec, thresholds, two open reds and one
 refuted hypothesis: [`bench/roadmap/p5-fuzzy-term-feasibility.md`](bench/roadmap/p5-fuzzy-term-feasibility.md).
+
+## Configuration
+
+The engine reads **one** environment variable. Everything else it needs is passed in code.
+
+| variable | default | what it does |
+|---|---|---|
+| `INDEX_PARALLEL` | unset (off) | `1` opts a `Searcher` into spreading its per-segment work across OS threads, for collections that also clear `PARALLEL_WORK_MIN`. Anything else, including unset, stays single-threaded. |
+
+**Threading is off unless asked for, and that is deliberate.** Spawning a thread per core per query
+is a bet that the cores are free, and a library embedded in someone else's process cannot check.
+Measured on one workstation running its owner's ordinary applications, the threaded path was
+**2.2-2.4x slower** than serial at 25 and 50 segments; measured on a quiet box it was **2.9x faster
+on the p99**. Both are real, so the default is the safe one. `Searcher::set_parallel(true)` is the
+programmatic form for a process that does own its machine, and `Searcher::parallel()` reports the
+decision. Full measurement: [`bench/roadmap/p80-parallel-default.md`](bench/roadmap/p80-parallel-default.md).
+
+The benchmark harness reads a further ~20 variables — corpus paths and sweep parameters, none of
+which the library itself consults. They are documented in [`bench/README.md`](bench/README.md).
 
 ## Build & test
 
@@ -501,9 +523,12 @@ production corpora. **`index-core` remains dependency-free.**
 - **`real-corpus` depends on sibling checkouts being present**, so it is gate-excluded until the
   corpora (or a fixture subset) are vendored here. A gate that silently skips is not a gate.
 - **The engine has not been run inside any consumer application yet.** It is measured against their
-  data, not wired into their code. No napi-rs or WASM artifact exists (ROADMAP P8/P9).
-- **1 M documents still misses the interactive p99 bar** (6.39 ms vs 5 ms). The named remaining
-  levers - PEF postings compression, docID reordering, SIMD block decode - are unbuilt.
+  data, not wired into their code. A WASM artifact and a C ABI both exist and are exercised from
+  JavaScript and Python; no napi-rs binding does.
+- **1 M documents still misses the interactive p99 bar.** The bar holds to roughly 250 K real
+  documents and not beyond; `p56` measured 8.29 M real rows at a 33 ms typo p99. The ceiling tracks
+  vocabulary rather than document count. PEF postings compression, docID reordering and SIMD block
+  decode remain unbuilt.
 - **Nothing is deployed.** All four integrations are measurements on throwaway worktree branches; no
   `main` was modified and no PR opened. [`docs/adoption.md`](docs/adoption.md) has the per-app plan,
   gate, cost and rollback so that becomes one decision rather than an investigation.
@@ -512,8 +537,11 @@ production corpora. **`index-core` remains dependency-free.**
   of the collection can reorder its near-ties. A *selective* query still identifies the same
   document — that split is asserted in `searcher::tests::ranking_skew_is_bounded_for_a_small_delta`
   rather than assumed. `needs_compaction()` says when to rebuild from the source of truth.
-- **The browser tier has no persistence.** The index is re-fetched on every load; OPFS caching
-  (ROADMAP P8) is unbuilt, and Safari evicts script-written storage after 7 days regardless.
+- **The browser tier persists, on one browser.** The index is stored in OPFS and survives a page
+  navigation, and a query can be answered from byte ranges without reading the whole file. Only
+  Chromium is checked; Safari's `opfs-sahpool` behaviour is untested here, and Safari evicts
+  script-written storage after 7 days regardless. Nothing writes to OPFS from the engine side — a
+  browser can persist and query an index, but not update one in place.
 - **The 260 K presyo run is padded** — only 1,940 rows are real exported data, and it does not
   populate their `search_text` column or their ~296 K aliases.
 - **sisia's hybrid path is still untouched** — the `ts_rank_cd` sparse arm fused with pgvector by
@@ -527,16 +555,21 @@ production corpora. **`index-core` remains dependency-free.**
   corpus against a 5 ms bar (13.6 ms on the recombined one, which overstates it ~1.6x). Three
   independent attacks have now each moved it under 10 %: better seeding (`p27`), capping expansion
   (`p29`), and tightening the pruning bounds (`p47`). It is the cost of enumerating documents the
-  bucket-first ranking rule genuinely requires visiting. **The bar is met on every corpus of real
+  bucket-first ranking rule genuinely requires visiting. **The bar is met on real corpora up to roughly 250 K
   documents** — 4.54 ms at presyo's 241,677 products, 1.81 ms at 61,467 real schools — and fails
-  only on the recombined rows above the real data.
+  above that on real data too, not merely on recombined rows: `p56` measured 8.29 M real rows at
+  33 ms. An earlier revision of this line claimed the bar held on *every* corpus of real documents,
+  which was true only because the largest real corpus available at the time was 241,677 rows.
 - **Compaction is a rebuild.** `Searcher` appends segments and tombstones documents without one,
   but postings are never rewritten, so collection statistics still count deleted rows until the
   application rebuilds from its own database. `Searcher::needs_compaction` says when that matters.
 - **Above 61,467 documents the corpus is recombined, not observed.** Real tokens, synthetic
   combinations; it measures posting-list and top-k scaling, not vocabulary growth on new text.
 - **CI runs the gate on Linux** (`.github/workflows/gate.yml`: tests, doc tests, clippy, the three
-  WASM artifacts, `js/smoke.mjs`, and per-point geo agreement). The `host/python/` host is NOT in
-  it and is still run by hand, so "both hosts pass" means one gated host and one checked one.
+  WASM artifacts, `js/smoke.mjs`, `js/image-smoke.mjs`, `scripts/cli-smoke.sh`, `js/opfs-check.mjs`
+  in real Chromium, and per-point geo agreement). **`pool-audit` is NOT in it** — the ranking gate
+  that every merge in this repo is checked against runs by hand, because it needs sibling corpora
+  that are not vendored here. Nor are `host/python/index_ffi.py`, `js/demo.mjs` or
+  `js/accel-bench.mjs`, so "both hosts pass" means one gated host and one checked by hand.
 - The FM-index rank `cum` array is u32-per-word (~50 % overhead); `sucds` ships the two-level rank
   that would trim it.
