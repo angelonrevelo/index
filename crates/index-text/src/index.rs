@@ -22,7 +22,7 @@
 //! 553 ms vs **MaxScore 220 ms** (`docs/research/speed.md` §1). MaxScore needs no per-document heap
 //! sorting, degrades better at large k, and Lucene and PISA converged on it independently.
 
-use crate::analyze::{apply_alias, tokenize, AliasTable, Token};
+use crate::analyze::{apply_alias, tokenize, tokenize_into, AliasTable, Token};
 use crate::dict::TermDict;
 use std::collections::BTreeMap;
 
@@ -523,6 +523,11 @@ pub struct IndexBuilder {
     /// document order — the same order and the same reasoning as `term_post`. Empty unless
     /// `position_on`.
     term_pos: std::collections::HashMap<String, Vec<(u32, Vec<u32>)>>,
+    /// The token buffer [`IndexBuilder::add`] hands to [`tokenize_into`] and reuses for every
+    /// field of every document. Owning it here is what keeps a million-document build from
+    /// allocating three million `Vec<Token>`s and fifteen million `String`s of text that is
+    /// consulted once and thrown away.
+    tok_buf: Vec<Token>,
 }
 
 impl IndexBuilder {
@@ -544,6 +549,7 @@ impl IndexBuilder {
             key_store: Vec::new(),
             position_on: false,
             term_pos: std::collections::HashMap::new(),
+            tok_buf: Vec::new(),
         }
     }
 
@@ -786,32 +792,58 @@ impl IndexBuilder {
         let mut len = [0u16; MAX_FIELD];
         let mut first = String::new();
         let mut facet = String::new();
+        // Taken out of `self` for the duration so the token buffer, `term_post` and `term_pos` are
+        // three plainly disjoint borrows; put back below, so the next document reuses it.
+        let mut tok = std::mem::take(&mut self.tok_buf);
         for (fi, text) in doc.field_text.iter().enumerate().take(self.schema.field_count()) {
-            let mut tok: Vec<Token> = tokenize(text);
-            apply_alias(&mut tok, &self.alias);
-            len[fi] = tok.len().min(u16::MAX as usize) as u16;
+            // The tokens are `tok[..n]`. `tok.len()` is the high-water mark of every field seen so
+            // far, retained as scratch on purpose — see [`tokenize_into`].
+            let n = tokenize_into(text, &mut tok);
+            apply_alias(&mut tok[..n], &self.alias);
+            len[fi] = n.min(u16::MAX as usize) as u16;
             if fi == 0 {
-                first.clone_from(&tok.first().map(|t| t.text.clone()).unwrap_or_default());
+                first.clear();
+                if n > 0 {
+                    first.push_str(&tok[0].text);
+                }
             }
             if self.expansion_cfg.is_some_and(|(f, _)| f == fi) {
-                facet = tok.iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
+                facet.clear();
+                for (at, t) in tok[..n].iter().enumerate() {
+                    if at > 0 {
+                        facet.push(' ');
+                    }
+                    facet.push_str(&t.text);
+                }
             }
-            for (at, t) in tok.into_iter().enumerate() {
+            for (at, t) in tok[..n].iter().enumerate() {
                 if self.position_on {
                     // Positions above `u16::MAX` are dropped rather than wrapped: `doc_len` is
                     // already `u16`, so a field that long is truncated everywhere else too, and a
                     // wrapped position would place a token at a phrase offset it does not occupy.
                     if let Ok(at) = u16::try_from(at) {
-                        let per_doc = self.term_pos.entry(t.text.clone()).or_default();
-                        match per_doc.last_mut() {
-                            Some((d, p)) if *d == id => p.push(pack_position(fi, at)),
-                            _ => per_doc.push((id, vec![pack_position(fi, at)])),
+                        let pos = pack_position(fi, at);
+                        // Looked up by `&str` first: a term already in the map — which is all but
+                        // a few hundred thousand of the fifteen million hits a large build makes —
+                        // then costs no allocation at all. Only a genuinely new term pays for one.
+                        if let Some(per_doc) = self.term_pos.get_mut(t.text.as_str()) {
+                            match per_doc.last_mut() {
+                                Some((d, p)) if *d == id => p.push(pos),
+                                _ => per_doc.push((id, vec![pos])),
+                            }
+                        } else {
+                            self.term_pos.insert(t.text.clone(), vec![(id, vec![pos])]);
                         }
                     }
                 }
-                self.term_post.entry(t.text).or_default().hit(id, fi);
+                if let Some(post) = self.term_post.get_mut(t.text.as_str()) {
+                    post.hit(id, fi);
+                } else {
+                    self.term_post.entry(t.text.clone()).or_default().hit(id, fi);
+                }
             }
         }
+        self.tok_buf = tok;
         self.doc_len.push(len);
         self.raw_prior.push(1.0);
         self.first_text.push(first);

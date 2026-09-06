@@ -127,6 +127,17 @@ pub enum BaseUnit {
 impl Quantity {
     /// The canonical token text for this quantity — what actually enters the index.
     pub fn token(&self) -> String {
+        let mut out = String::new();
+        self.write_token(&mut out);
+        out
+    }
+
+    /// Append [`Self::token`] to `out`.
+    ///
+    /// Exists so the tokenizer can rewrite a quantity straight into the token buffer it already
+    /// owns, instead of allocating a `String` per quantity only to move its bytes one slot over.
+    fn write_token(&self, out: &mut String) {
+        use std::fmt::Write;
         let unit = match self.unit {
             BaseUnit::Gram => "g",
             BaseUnit::Millilitre => "ml",
@@ -134,11 +145,11 @@ impl Quantity {
         };
         // Emit a whole number when the fractional part is zero, so `1.5L` and `1500ml` produce
         // the byte-identical token `1500ml`.
-        if self.milli_base % 1000 == 0 {
-            format!("{}{}", self.milli_base / 1000, unit)
+        let _ = if self.milli_base % 1000 == 0 {
+            write!(out, "{}{}", self.milli_base / 1000, unit)
         } else {
-            format!("{}.{:03}{}", self.milli_base / 1000, self.milli_base % 1000, unit)
-        }
+            write!(out, "{}.{:03}{}", self.milli_base / 1000, self.milli_base % 1000, unit)
+        };
     }
 }
 
@@ -336,11 +347,28 @@ thread_local! {
 }
 
 pub fn tokenize(text: &str) -> Vec<Token> {
-    FOLD_BUF.with(|buf| {
-        let mut folded = buf.borrow_mut();
+    let mut out = Vec::new();
+    let n = tokenize_into(text, &mut out);
+    out.truncate(n);
+    out
+}
+
+/// Tokenize into a buffer the caller owns and reuses, returning **how many tokens were written**.
+///
+/// The tokens are `buf[..count]`. Anything beyond `count` is retained scratch from an earlier call:
+/// this function deliberately does **not** truncate, because the whole point is that the `String`
+/// inside each slot keeps its heap allocation and is refilled by `clear` + `push_str` rather than
+/// freed and malloc'd again. A caller that wants an owned `Vec` should use [`tokenize`].
+///
+/// `add()` calls this three million times on the `scale` ladder for 13.69 M tokens. As a
+/// `Vec<Token>` return that is 3 M vector allocations and 13.69 M `String` allocate/free pairs of
+/// text nobody keeps; through a reused buffer it is a handful of both.
+pub fn tokenize_into(text: &str, buf: &mut Vec<Token>) -> usize {
+    FOLD_BUF.with(|fold_buf| {
+        let mut folded = fold_buf.borrow_mut();
         folded.clear();
         fold_into(text, &mut folded);
-        tokenize_folded(&folded)
+        tokenize_folded(&folded, buf)
     })
 }
 
@@ -358,10 +386,17 @@ pub fn tokenize(text: &str) -> Vec<Token> {
 /// loop collected the whole field into a `Vec<char>` first, purely to look one character back and
 /// one forward; the two guards it needed are `is_ascii_digit`, which no multi-byte character can
 /// satisfy, so a byte index answers both.
-fn tokenize_folded(folded: &str) -> Vec<Token> {
+fn tokenize_folded(folded: &str, out: &mut Vec<Token>) -> usize {
     let b = folded.as_bytes();
-    // ~5 bytes per token across the consumer corpora; one reserve beats regrowing a `Vec<Token>`.
-    let mut out: Vec<Token> = Vec::with_capacity(b.len() / 5 + 1);
+    // ~5 bytes per token across the consumer corpora. Only worth doing for a buffer that has never
+    // been used: a reused one is already at the high-water mark of every field seen so far, and
+    // reserving on top of that would grow it without bound.
+    if out.is_empty() {
+        out.reserve(b.len() / 5 + 1);
+    }
+    // How many slots of `out` the current field has claimed. `out.len()` is the high-water mark,
+    // not the token count.
+    let mut n = 0usize;
     let mut position = 0u32;
     // Start of the token in progress, or `None`. `sep` records that it contains a kept `,` or `-`
     // still to be normalized — false for all but a handful of tokens in any real corpus.
@@ -401,7 +436,7 @@ fn tokenize_folded(folded: &str) -> Vec<Token> {
                 i += 1;
                 continue;
             }
-            flush(folded, &mut start, i, sep, &mut out, &mut position);
+            flush(folded, &mut start, i, sep, out, &mut n, &mut position);
             i += 1;
         } else {
             let ch = folded[i..].chars().next().unwrap_or('\u{0}');
@@ -411,14 +446,27 @@ fn tokenize_folded(folded: &str) -> Vec<Token> {
                     sep = false;
                 }
             } else {
-                flush(folded, &mut start, i, sep, &mut out, &mut position);
+                flush(folded, &mut start, i, sep, out, &mut n, &mut position);
             }
             i += ch.len_utf8();
         }
     }
-    flush(folded, &mut start, b.len(), sep, &mut out, &mut position);
-    merge_split_quantity(&mut out);
-    out
+    flush(folded, &mut start, b.len(), sep, out, &mut n, &mut position);
+    merge_split_quantity(out, &mut n);
+    n
+}
+
+/// The slot `out[*n]`, appending a fresh one only when the buffer has never been that long.
+///
+/// Reusing the slot is the point: its `String` keeps the allocation it had on the previous field,
+/// so a token costs a `clear` plus a memcpy instead of a malloc and, one field later, a free.
+fn slot<'a>(out: &'a mut Vec<Token>, n: &mut usize) -> &'a mut Token {
+    let at = *n;
+    if at == out.len() {
+        out.push(Token { text: String::new(), position: 0, is_numeric: false });
+    }
+    *n += 1;
+    &mut out[at]
 }
 
 /// Emit `folded[start..end]` as a token, if a token is in progress.
@@ -428,22 +476,25 @@ fn flush(
     end: usize,
     sep: bool,
     out: &mut Vec<Token>,
+    n: &mut usize,
     position: &mut u32,
 ) {
     let Some(at) = start.take() else { return };
     let raw = &folded[at..end];
-    let text = if sep {
+    let tok = slot(out, n);
+    tok.text.clear();
+    if sep {
         // Every `,` or `-` still inside a token is by construction a kept separator.
-        raw.chars().map(|c| if c == ',' || c == '-' { '.' } else { c }).collect()
+        tok.text.extend(raw.chars().map(|c| if c == ',' || c == '-' { '.' } else { c }));
     } else {
-        raw.to_owned()
-    };
-    let text = match parse_quantity(&text) {
-        Some(q) => q.token(),
-        None => text,
-    };
-    let is_numeric = text.as_bytes().iter().any(u8::is_ascii_digit);
-    out.push(Token { text, position: *position, is_numeric });
+        tok.text.push_str(raw);
+    }
+    if let Some(q) = parse_quantity(&tok.text) {
+        tok.text.clear();
+        q.write_token(&mut tok.text);
+    }
+    tok.is_numeric = tok.text.as_bytes().iter().any(u8::is_ascii_digit);
+    tok.position = *position;
     *position += 1;
 }
 
@@ -453,9 +504,9 @@ fn flush(
 /// own normalizer carries an explicit `"180 g" -> "180g"` rule for exactly this reason. Without
 /// this pass the number and the unit become two independent terms, the size stops being a single
 /// comparable token, and the numeric-token guard has nothing to guard.
-fn merge_split_quantity(token: &mut Vec<Token>) {
+fn merge_split_quantity(token: &mut Vec<Token>, n: &mut usize) {
     let mut i = 0;
-    while i + 1 < token.len() {
+    while i + 1 < *n {
         // Byte-wise: no multi-byte character can be an ASCII digit, `.` or an ASCII letter, so a
         // byte test rejects exactly what the character test rejected, without decoding.
         let number_only = !token[i].text.is_empty()
@@ -465,9 +516,14 @@ fn merge_split_quantity(token: &mut Vec<Token>) {
         if number_only && unit_only {
             let joined = format!("{}{}", token[i].text, token[i + 1].text);
             if let Some(q) = parse_quantity(&joined) {
-                token[i].text = q.token();
+                token[i].text.clear();
+                q.write_token(&mut token[i].text);
                 token[i].is_numeric = true;
-                token.remove(i + 1);
+                // Retired to the far end of the buffer rather than dropped, so the `String` it
+                // holds is available as scratch to the next field instead of being freed.
+                let spare = token.remove(i + 1);
+                token.push(spare);
+                *n -= 1;
                 // Positions stay monotonic but are no longer dense; nothing depends on density.
                 continue;
             }
