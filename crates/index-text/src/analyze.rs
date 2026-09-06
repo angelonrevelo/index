@@ -39,7 +39,35 @@ pub struct Token {
 /// route through it, or links break.
 pub fn fold(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
+    fold_into(s, &mut out);
+    out
+}
+
+/// Append the fold of `s` to `out`.
+///
+/// Byte-wise with an ASCII fast path: no ASCII character carries a diacritic and none of them
+/// case-maps outside ASCII, so a maximal ASCII run is a `push_str` (memcpy) followed by
+/// `make_ascii_lowercase` (vectorized in place). Only the non-ASCII remainder pays for character
+/// decoding, the diacritic table and `char::to_lowercase`. The consumer corpora measure 97.7 %
+/// ASCII, so this is the path that runs.
+///
+/// Exists so [`tokenize`] can fold into a buffer it reuses across documents instead of allocating
+/// a `String` per field. `fast_fold_matches_the_legacy_fold` pins it to the character-at-a-time original.
+fn fold_into(s: &str, out: &mut String) {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let run = i;
+        while i < b.len() && b[i] < 0x80 {
+            i += 1;
+        }
+        if i > run {
+            let at = out.len();
+            out.push_str(&s[run..i]);
+            out[at..].make_ascii_lowercase();
+        }
+        let Some(ch) = s[i..].chars().next() else { break };
+        i += ch.len_utf8();
         match strip_diacritic(ch) {
             Some(base) => out.extend(base.to_lowercase()),
             None => {
@@ -50,7 +78,6 @@ pub fn fold(s: &str) -> String {
             }
         }
     }
-    out
 }
 
 /// Map a precomposed accented character to its base letter. Returns `None` when the character has
@@ -121,6 +148,13 @@ impl Quantity {
 /// Returns `None` when the token is not a quantity, which is the common case.
 pub fn parse_quantity(tok: &str) -> Option<Quantity> {
     let t = tok.trim();
+    // A quantity is `<digits>[.<digits>]<unit>`, and the integer part below must be non-empty and
+    // all ASCII digits — so a token whose first character is anything else can never parse. This
+    // is an exact restatement of the checks further down, hoisted so the overwhelmingly common
+    // case (an ordinary word) costs one byte compare instead of a scan plus a `replace`.
+    if !t.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
     let split = t.find(|c: char| c.is_ascii_alphabetic())?;
     if split == 0 {
         return None; // no leading number
@@ -293,52 +327,124 @@ pub fn tokenize_span(text: &str) -> Vec<(Token, usize, usize)> {
     out
 }
 
+thread_local! {
+    /// The fold buffer [`tokenize`] reuses. `add()` calls `tokenize` once per field per document —
+    /// three million times on the `scale` ladder — and a fresh `String` per call is three million
+    /// allocations of text nobody keeps. Never borrowed re-entrantly: nothing reachable from
+    /// `tokenize_folded` calls `tokenize`.
+    static FOLD_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
 pub fn tokenize(text: &str) -> Vec<Token> {
-    let folded = fold(text);
-    let bytes: Vec<char> = folded.chars().collect();
-    let mut out = Vec::new();
-    let mut cur = String::new();
+    FOLD_BUF.with(|buf| {
+        let mut folded = buf.borrow_mut();
+        folded.clear();
+        fold_into(text, &mut folded);
+        tokenize_folded(&folded)
+    })
+}
+
+/// Split an ALREADY-FOLDED string into tokens.
+///
+/// The token text is a contiguous byte range of the folded string. That is not an accident of this
+/// corpus, it is structural: the only rewrite the split performs is a kept separator becoming `.`,
+/// and `,`, `-` and `.` are all one byte, so the rewrite is length-preserving. So a token is
+/// materialized by one exact-capacity copy of a slice instead of being grown a character at a time
+/// into a `String` that is then moved out — which is what made the old loop allocate, and
+/// reallocate, per token.
+///
+/// Scanning is byte-wise. A byte below `0x80` decides alphanumeric-ness on its own; only a
+/// non-ASCII lead byte pays for `char` decoding and the Unicode `is_alphanumeric` tables. The old
+/// loop collected the whole field into a `Vec<char>` first, purely to look one character back and
+/// one forward; the two guards it needed are `is_ascii_digit`, which no multi-byte character can
+/// satisfy, so a byte index answers both.
+fn tokenize_folded(folded: &str) -> Vec<Token> {
+    let b = folded.as_bytes();
+    // ~5 bytes per token across the consumer corpora; one reserve beats regrowing a `Vec<Token>`.
+    let mut out: Vec<Token> = Vec::with_capacity(b.len() / 5 + 1);
     let mut position = 0u32;
+    // Start of the token in progress, or `None`. `sep` records that it contains a kept `,` or `-`
+    // still to be normalized — false for all but a handful of tokens in any real corpus.
+    let mut start: Option<usize> = None;
+    let mut sep = false;
 
-    let flush = |cur: &mut String, out: &mut Vec<Token>, position: &mut u32| {
-        if cur.is_empty() {
-            return;
-        }
-        let text = match parse_quantity(cur) {
-            Some(q) => q.token(),
-            None => std::mem::take(cur),
-        };
-        cur.clear();
-        let is_numeric = text.chars().any(|c| c.is_ascii_digit());
-        out.push(Token { text, position: *position, is_numeric });
-        *position += 1;
-    };
-
-    for i in 0..bytes.len() {
-        let c = bytes[i];
-        if c.is_alphanumeric() {
-            cur.push(c);
-        } else if (c == '.' || c == ',' || c == '-')
-            && i > 0
-            && bytes[i - 1].is_ascii_digit()
-            && bytes.get(i + 1).is_some_and(|n| n.is_ascii_digit())
-        {
-            // A separator BETWEEN DIGITS is normalized to `.` and kept, so `1.5l`, `1,5l` and
-            // `30-23` survive as single tokens and, crucially, as the SAME token whichever way
-            // they were typed. profstopick's contract test demands `MATH 30.23`, `math30.23` and
-            // `MATH  30-23` all reach the same course.
-            //
-            // The cost is real and accepted: a hyphenated numeric RANGE (`3-4`) folds to `3.4`.
-            // Index and query normalize identically, so matching stays consistent; only the
-            // semantics of a range are lost, and no consumer corpus expresses ranges this way.
-            cur.push('.');
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if c < 0x80 {
+            if c.is_ascii_alphanumeric() {
+                if start.is_none() {
+                    start = Some(i);
+                    sep = false;
+                }
+                i += 1;
+                continue;
+            }
+            if (c == b'.' || c == b',' || c == b'-')
+                && i > 0
+                && b[i - 1].is_ascii_digit()
+                && b.get(i + 1).is_some_and(u8::is_ascii_digit)
+            {
+                // A separator BETWEEN DIGITS is normalized to `.` and kept, so `1.5l`, `1,5l` and
+                // `30-23` survive as single tokens and, crucially, as the SAME token whichever way
+                // they were typed. profstopick's contract test demands `MATH 30.23`, `math30.23`
+                // and `MATH  30-23` all reach the same course.
+                //
+                // The cost is real and accepted: a hyphenated numeric RANGE (`3-4`) folds to `3.4`.
+                // Index and query normalize identically, so matching stays consistent; only the
+                // semantics of a range are lost, and no consumer corpus expresses ranges this way.
+                if start.is_none() {
+                    start = Some(i);
+                    sep = false;
+                }
+                sep |= c != b'.';
+                i += 1;
+                continue;
+            }
+            flush(folded, &mut start, i, sep, &mut out, &mut position);
+            i += 1;
         } else {
-            flush(&mut cur, &mut out, &mut position);
+            let ch = folded[i..].chars().next().unwrap_or('\u{0}');
+            if ch.is_alphanumeric() {
+                if start.is_none() {
+                    start = Some(i);
+                    sep = false;
+                }
+            } else {
+                flush(folded, &mut start, i, sep, &mut out, &mut position);
+            }
+            i += ch.len_utf8();
         }
     }
-    flush(&mut cur, &mut out, &mut position);
+    flush(folded, &mut start, b.len(), sep, &mut out, &mut position);
     merge_split_quantity(&mut out);
     out
+}
+
+/// Emit `folded[start..end]` as a token, if a token is in progress.
+fn flush(
+    folded: &str,
+    start: &mut Option<usize>,
+    end: usize,
+    sep: bool,
+    out: &mut Vec<Token>,
+    position: &mut u32,
+) {
+    let Some(at) = start.take() else { return };
+    let raw = &folded[at..end];
+    let text = if sep {
+        // Every `,` or `-` still inside a token is by construction a kept separator.
+        raw.chars().map(|c| if c == ',' || c == '-' { '.' } else { c }).collect()
+    } else {
+        raw.to_owned()
+    };
+    let text = match parse_quantity(&text) {
+        Some(q) => q.token(),
+        None => text,
+    };
+    let is_numeric = text.as_bytes().iter().any(u8::is_ascii_digit);
+    out.push(Token { text, position: *position, is_numeric });
+    *position += 1;
 }
 
 /// Merge a bare number followed by a bare unit into one quantity token.
@@ -350,10 +456,12 @@ pub fn tokenize(text: &str) -> Vec<Token> {
 fn merge_split_quantity(token: &mut Vec<Token>) {
     let mut i = 0;
     while i + 1 < token.len() {
+        // Byte-wise: no multi-byte character can be an ASCII digit, `.` or an ASCII letter, so a
+        // byte test rejects exactly what the character test rejected, without decoding.
         let number_only = !token[i].text.is_empty()
-            && token[i].text.chars().all(|c| c.is_ascii_digit() || c == '.');
+            && token[i].text.as_bytes().iter().all(|&c| c.is_ascii_digit() || c == b'.');
         let unit_only = !token[i + 1].text.is_empty()
-            && token[i + 1].text.chars().all(|c| c.is_ascii_alphabetic());
+            && token[i + 1].text.as_bytes().iter().all(u8::is_ascii_alphabetic);
         if number_only && unit_only {
             let joined = format!("{}{}", token[i].text, token[i + 1].text);
             if let Some(q) = parse_quantity(&joined) {
@@ -378,6 +486,10 @@ fn merge_split_quantity(token: &mut Vec<Token>) {
 #[derive(Clone, Debug, Default)]
 pub struct AliasTable {
     entry: std::collections::HashMap<String, String>,
+    /// Byte length of the longest folded surface form in `entry`. A token longer than this cannot
+    /// be a key, so `apply_alias` skips its hash entirely — the starter table's longest row is
+    /// `condensada` at 10 bytes, and most corpus tokens are longer than that.
+    max_surface_len: usize,
 }
 
 impl AliasTable {
@@ -387,7 +499,9 @@ impl AliasTable {
 
     /// Insert `surface -> canonical`. Both sides are folded, so callers may pass raw text.
     pub fn insert(&mut self, surface: &str, canonical: &str) -> &mut Self {
-        self.entry.insert(fold(surface), fold(canonical));
+        let key = fold(surface);
+        self.max_surface_len = self.max_surface_len.max(key.len());
+        self.entry.insert(key, fold(canonical));
         self
     }
 
@@ -475,12 +589,19 @@ impl AliasTable {
 ///
 /// Numeric tokens are never rewritten — an alias table must not be able to change a size.
 pub fn apply_alias(token: &mut [Token], alias: &AliasTable) {
+    if alias.entry.is_empty() {
+        return;
+    }
     for t in token.iter_mut() {
-        if t.is_numeric {
+        // A token longer than the longest key, or a numeric one, can never be rewritten. Both are
+        // decided without hashing the string, which is what the lookup would otherwise cost on
+        // every token of every field.
+        if t.is_numeric || t.text.len() > alias.max_surface_len {
             continue;
         }
         if let Some(canon) = alias.get(&t.text) {
-            t.text = canon.to_string();
+            t.text.clear();
+            t.text.push_str(canon);
         }
     }
 }
@@ -488,6 +609,282 @@ pub fn apply_alias(token: &mut [Token], alias: &AliasTable) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tokenizer as it stood before this lane — character-at-a-time, `Vec<char>`, a `String`
+    /// grown and moved out per token — copied here verbatim, dependencies included.
+    ///
+    /// This is not documentation. It is the oracle: the fast tokenizer is only allowed to be fast,
+    /// never different, because a change to the token stream silently changes every ranking in the
+    /// engine. Compared against the live one by `fast_tokenizer_matches_the_legacy_one`. If a rule
+    /// ever legitimately changes, this copy changes with it in the same commit, deliberately.
+    mod legacy {
+        use crate::analyze::{strip_diacritic, BaseUnit, Quantity, Token};
+
+        pub fn fold(s: &str) -> String {
+            let mut out = String::with_capacity(s.len());
+            for ch in s.chars() {
+                match strip_diacritic(ch) {
+                    Some(base) => out.extend(base.to_lowercase()),
+                    None => {
+                        if !('\u{0300}'..='\u{036F}').contains(&ch) {
+                            out.extend(ch.to_lowercase());
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        pub fn parse_quantity(tok: &str) -> Option<Quantity> {
+            let t = tok.trim();
+            let split = t.find(|c: char| c.is_ascii_alphabetic())?;
+            if split == 0 {
+                return None;
+            }
+            let (num_s, unit_s) = t.split_at(split);
+            let num_s = num_s.replace(',', ".");
+            if num_s.matches('.').count() > 1 {
+                return None;
+            }
+            let (int_part, frac_part) = match num_s.split_once('.') {
+                Some((a, b)) => (a, b),
+                None => (num_s.as_str(), ""),
+            };
+            if int_part.is_empty() || !int_part.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            if !frac_part.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let int_v: u64 = int_part.parse().ok()?;
+            let mut frac_v: u64 = 0;
+            for i in 0..3 {
+                frac_v =
+                    frac_v * 10 + frac_part.as_bytes().get(i).map_or(0, |b| (b - b'0') as u64);
+            }
+            let thousandths = int_v.checked_mul(1000)?.checked_add(frac_v)?;
+            let (mult, unit) = match unit_s {
+                "g" | "gram" | "grams" | "gr" => (1_000, BaseUnit::Gram),
+                "kg" | "kilo" | "kilos" | "kilogram" | "kilograms" => (1_000_000, BaseUnit::Gram),
+                "mg" => (1, BaseUnit::Gram),
+                "ml" | "milliliter" | "millilitre" | "mls" => (1_000, BaseUnit::Millilitre),
+                "l" | "li" | "lit" | "liter" | "liters" | "litre" | "litres" => {
+                    (1_000_000, BaseUnit::Millilitre)
+                }
+                "cl" => (10_000, BaseUnit::Millilitre),
+                "pc" | "pcs" | "piece" | "pieces" | "s" | "pack" | "packs" | "ct" | "count" => {
+                    (1_000, BaseUnit::Piece)
+                }
+                _ => return None,
+            };
+            let milli_base = thousandths.checked_mul(mult)? / 1_000;
+            Some(Quantity { milli_base, unit })
+        }
+
+        pub fn tokenize(text: &str) -> Vec<Token> {
+            let folded = fold(text);
+            let bytes: Vec<char> = folded.chars().collect();
+            let mut out = Vec::new();
+            let mut cur = String::new();
+            let mut position = 0u32;
+
+            let flush = |cur: &mut String, out: &mut Vec<Token>, position: &mut u32| {
+                if cur.is_empty() {
+                    return;
+                }
+                let text = match parse_quantity(cur) {
+                    Some(q) => q.token(),
+                    None => std::mem::take(cur),
+                };
+                cur.clear();
+                let is_numeric = text.chars().any(|c| c.is_ascii_digit());
+                out.push(Token { text, position: *position, is_numeric });
+                *position += 1;
+            };
+
+            for i in 0..bytes.len() {
+                let c = bytes[i];
+                if c.is_alphanumeric() {
+                    cur.push(c);
+                } else if (c == '.' || c == ',' || c == '-')
+                    && i > 0
+                    && bytes[i - 1].is_ascii_digit()
+                    && bytes.get(i + 1).is_some_and(|n| n.is_ascii_digit())
+                {
+                    cur.push('.');
+                } else {
+                    flush(&mut cur, &mut out, &mut position);
+                }
+            }
+            flush(&mut cur, &mut out, &mut position);
+            merge_split_quantity(&mut out);
+            out
+        }
+
+        fn merge_split_quantity(token: &mut Vec<Token>) {
+            let mut i = 0;
+            while i + 1 < token.len() {
+                let number_only = !token[i].text.is_empty()
+                    && token[i].text.chars().all(|c| c.is_ascii_digit() || c == '.');
+                let unit_only = !token[i + 1].text.is_empty()
+                    && token[i + 1].text.chars().all(|c| c.is_ascii_alphabetic());
+                if number_only && unit_only {
+                    let joined = format!("{}{}", token[i].text, token[i + 1].text);
+                    if let Some(q) = parse_quantity(&joined) {
+                        token[i].text = q.token();
+                        token[i].is_numeric = true;
+                        token.remove(i + 1);
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+
+    /// A corpus chosen to bend every rule the tokenizer has: empty and whitespace-only fields,
+    /// accents both precomposed and combining, mixed case, every separator class, digit/unit
+    /// splits, quantities that must and must not parse, scripts with no case and no ASCII
+    /// (CJK, Arabic, Devanagari, emoji), a character whose lowercase is two characters, a
+    /// character whose lowercase is longer in bytes, and a field far longer than any real one.
+    fn demanding_corpus() -> Vec<String> {
+        let mut c: Vec<String> = [
+            "",
+            " ",
+            "   \t\n  ",
+            "-",
+            "---",
+            "9",
+            ".",
+            ",",
+            "1.5",
+            "1,5",
+            "3-4",
+            "a,b.c-d",
+            "Colgate Total Toothpaste 150g",
+            "LUCKY ME PANCIT CANTON 60G",
+            "Lucky Me! Pancit Canton (Chilimansi)",
+            "1.5L Coke Zero",
+            "1,5 L Coke Zero",
+            "1500ml Coke Zero",
+            "500 ml bottle",
+            "1000 grams of rice",
+            "MATH 30-23 section",
+            "MATH  30.23",
+            "math30.23",
+            "300g vs 800g vs 300xyz vs 1.2.3g",
+            "12s 6pcs 1kg 1mg 1cl 0.1l",
+            "Pe\u{f1}a-Reyes",
+            "Para\u{f1}aque City, Metro Manila",
+            "Nestl\u{e9} Nescaf\u{e9} 3-in-1",
+            "Caf\u{65}\u{301} Espan\u{6e}\u{303}ol nin\u{6e}\u{303}o",
+            "\u{c5}NGSTR\u{d6}M \u{d8}RSTED \u{160}KODA \u{17d}U\u{17d}U \u{e6}on \u{c6}ON",
+            "\u{df}rasse 12,5 kg",
+            "\u{130}stanbul",
+            "\u{1e9e}RASSE",
+            "\u{fb00}ame",
+            "\u{1c5}ungla",
+            "\u{3a3}\u{38a}\u{3a3}\u{3a5}\u{3a6}\u{39f}\u{3a3}",
+            "\u{416}\u{423}\u{420}\u{41d}\u{410}\u{41b} \u{416}\u{443}\u{440}\u{43d}\u{430}\u{43b}",
+            "\u{6771}\u{4eac}\u{90fd}\u{6e0b}\u{8c37}\u{533a} 100g",
+            "\u{65e5}\u{672c}\u{8a9e}\u{306e}\u{30c6}\u{30ad}\u{30b9}\u{30c8}",
+            "\u{d55c}\u{ad6d}\u{c5b4} 500ml",
+            "\u{627}\u{644}\u{639}\u{631}\u{628}\u{64a}\u{629} 1.5l",
+            "\u{939}\u{93f}\u{928}\u{94d}\u{926}\u{940} \u{92a}\u{93e}\u{920}",
+            "emoji \u{1f600} between \u{1f1f5}\u{1f1ed} tokens",
+            "tab\tseparated\rvalues\nhere",
+            "trailing separator 100g-",
+            "-100g leading",
+            "under_score dot.dot 1.a a.1",
+            "12,345,678 units",
+            "A1.5B 1-2-3 4.5.6",
+            "\u{a0}nbsp\u{a0}bound\u{a0}",
+            "\u{ff14}\u{ff12} fullwidth \u{ff44}\u{ff49}\u{ff47}\u{ff49}\u{ff54}\u{ff53}",
+            "\u{2168} roman numeral",
+            "\u{bd} vulgar fraction 2g",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        // A field far longer than any real one, mixing scripts so neither path is skipped.
+        c.push("Brgy. San Jos\u{e9} Elementary School \u{d1}u\u{f1}oa 1.5L \u{6771}\u{4eac} ".repeat(2_000));
+        // Every ASCII byte, so no character class is left untested.
+        c.push((0u8..128).map(|b| b as char).collect());
+        c
+    }
+
+    /// **The lane's whole contract.** The fast tokenizer must produce the byte-identical token
+    /// stream the old one did — text, position and the numeric flag — or every ranking in the
+    /// engine moves without anything failing.
+    #[test]
+    fn fast_tokenizer_matches_the_legacy_one() {
+        for text in demanding_corpus() {
+            let cut = text.len().min(120);
+            assert_eq!(
+                legacy::tokenize(&text),
+                tokenize(&text),
+                "token streams diverge for {:?}",
+                &text[..text.char_indices().map(|(i, _)| i).take_while(|&i| i <= cut).last().unwrap_or(0)]
+            );
+        }
+    }
+
+    /// The fold is used to derive keys and slugs outside the tokenizer, so it is pinned separately.
+    #[test]
+    fn fast_fold_matches_the_legacy_fold() {
+        for text in demanding_corpus() {
+            assert_eq!(legacy::fold(&text), fold(&text), "fold diverges");
+            // A prefix must fold the same way — the ASCII fast path runs over maximal runs, so a
+            // run boundary must not be observable in the output.
+            for cut in [1usize, 2, 3, 7, 13, 64] {
+                if cut <= text.len() && text.is_char_boundary(cut) {
+                    assert_eq!(legacy::fold(&text[..cut]), fold(&text[..cut]), "fold prefix");
+                }
+            }
+        }
+    }
+
+    /// `parse_quantity` grew a fast rejection; it must reject and accept exactly what it did.
+    #[test]
+    fn quantity_parsing_matches_the_legacy_one() {
+        let mut probe: Vec<String> = Vec::new();
+        for text in demanding_corpus() {
+            for t in legacy::tokenize(&text) {
+                probe.push(t.text);
+            }
+        }
+        for extra in [
+            "1.5l", "1,5l", ",5l", ".5l", "-5l", "5", "l", "", " 300g ", "0.1l", "100ml", "1e3g",
+            "\u{f1}5g", "5\u{f1}g", "1.2.3g", "300xyz", "\u{661}\u{662}\u{663}g",
+        ] {
+            probe.push(extra.to_string());
+        }
+        for t in probe {
+            assert_eq!(legacy::parse_quantity(&t), parse_quantity(&t), "parse_quantity({t:?})");
+        }
+    }
+
+    /// The alias pass grew a length gate and an in-place rewrite. Same output, every table.
+    #[test]
+    fn alias_application_matches_the_legacy_one() {
+        let alias = AliasTable::philippine_grocery();
+        let empty = AliasTable::new();
+        for text in demanding_corpus() {
+            for table in [&alias, &empty] {
+                let mut want = tokenize(&text);
+                for t in want.iter_mut() {
+                    if !t.is_numeric {
+                        if let Some(canon) = table.get(&t.text) {
+                            t.text = canon.to_string();
+                        }
+                    }
+                }
+                let mut got = tokenize(&text);
+                apply_alias(&mut got, table);
+                assert_eq!(want, got, "alias application diverges");
+            }
+        }
+    }
 
     /// The span tokenizer is a second implementation of the tokenizing rules, so it can drift from
     /// the first. It must not: a highlight that disagrees with what was indexed marks the wrong
