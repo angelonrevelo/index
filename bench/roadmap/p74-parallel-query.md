@@ -4,6 +4,13 @@
 **Status: SHIPPED, 2026-09-06. Tail-led: ~2.9x p99 at 25 and 50 segments. Ranking bit-identical.
 288 tests. No new dependency.**
 
+> **SUPERSEDED IN PART BY `p80`.** The machinery here is unchanged and correct, but the
+> **default is inverted**: threading is now opt-in via `Searcher::set_parallel(true)` or
+> `INDEX_PARALLEL=1`. Re-measured on the same workstation running its owner's ordinary
+> applications, the default shipped below was **2.2-2.4x SLOWER** than serial at 25 and 50
+> segments. The win recorded here is real and still available — on a machine this process
+> owns. See `bench/roadmap/p80-parallel-default.md`.
+
 `p56` closed with *"No concurrency. Every number here is single-threaded."* `p73` took the build
 half. This takes the query half — `Searcher` fans its per-segment pass across OS threads.
 
