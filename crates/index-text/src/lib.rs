@@ -38,6 +38,7 @@ pub mod dict;
 pub mod format;
 pub mod fuse;
 pub mod index;
+pub mod query;
 pub mod searcher;
 
 pub use analyze::{fold, parse_quantity, tokenize, AliasTable, BaseUnit, Quantity, Token};

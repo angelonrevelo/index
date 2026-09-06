@@ -81,6 +81,17 @@ APPLY  reads change records and updates the collection in place.
                     silently blanks that field in the index and search quietly
                     stops finding the row. Measured: every table with a TOAST
                     relation in this estate holds TOASTed data (7.8 GB in one).
+  --placeholder VALUE
+                    refuse an upsert in which ANY schema field is exactly VALUE.
+                    A producer that will not re-read a TOASTed column says so
+                    with a marker -- Debezium uses the literal
+                    '__debezium_unavailable_value' -- and that marker means
+                    UNCHANGED, not empty. `apply` replaces whole documents and
+                    the engine keeps no field text, so writing it as empty
+                    would make search stop finding the row. Refusing is the
+                    only correct answer here; the fix is to configure the
+                    producer to re-read the row by key on update. Composes with
+                    --require: either one is enough to refuse the record.
 
 INPUT FORMAT (both verbs)
   --csv             comma-separated, RFC-4180 quoting. Default.
