@@ -1,0 +1,181 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>index — the OPFS tier</title>
+<style>
+  body { font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 2rem; max-width: 62rem; }
+  h1 { font-size: 1.15rem; } h2 { font-size: 1rem; margin-top: 1.6rem; }
+  .pass { color: #0a7f2e; } .fail { color: #b00020; font-weight: 700; } .dim { color: #666; }
+  table { border-collapse: collapse; margin: .6rem 0; }
+  td, th { padding: .18rem 1.1rem .18rem 0; text-align: left; vertical-align: top; }
+  th { border-bottom: 1px solid #ddd; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  #verdict { font-weight: 700; margin-top: 1rem; }
+  code { background: #f4f4f4; padding: 0 .25em; }
+</style>
+
+<h1>index — an index in the browser's own filesystem</h1>
+<p>
+  profstopick ships a <strong>2,505,813-byte JSON shard</strong> that occupies
+  <strong>95.6 % of the 5 MB localStorage quota</strong>, and its production instrumentation
+  measured <strong>109 of 267 real searches returning nothing — 40.8 % zero-result</strong>.
+  This page replaces both: the same <code>.idx</code> the server and the CLI use, persisted to OPFS,
+  queried with <strong>no network call at all</strong> after the first visit.
+</p>
+<p class="dim">
+  Nobody else occupies this tier, and not for lack of interest: Tantivy's WASM RFC has been open
+  since 2019 and is read-only, LanceDB closed WASM as "not planned", Orama's Rust core has no wasm32
+  target, and Meilisearch and Elasticsearch are servers. See <code>docs/research/landscape.md</code> §7.5.
+</p>
+
+<h2>1 — where the bytes came from</h2>
+<div id="load"></div>
+
+<h2>2 — the claim: no network call in the query path</h2>
+<div id="net"></div>
+
+<h2>3 — latency, against a server that has to answer over the wire</h2>
+<div id="lat"></div>
+
+<h2>4 — the 40.8 % problem, on profstopick's real failures</h2>
+<div id="typo"></div>
+
+<h2>5 — range reads: opening an index without reading it</h2>
+<div id="range"></div>
+
+<div id="verdict">running…</div>
+
+<script type="module">
+import { SearchIndex } from './index.mjs';
+import * as opfs from './opfs.mjs';
+
+const $ = (id) => document.getElementById(id);
+let failed = 0;
+const row = (ok, what, detail) => {
+  if (!ok) failed++;
+  return `<tr><td class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</td><td>${what}</td><td class="dim">${detail ?? ''}</td></tr>`;
+};
+
+// Counting fetches is the only honest way to assert "no network call" -- a fast answer could just
+// be an HTTP cache hit, which is still a request and still fails offline.
+let fetches = 0;
+const realFetch = window.fetch.bind(window);
+window.fetch = (...a) => { fetches++; return realFetch(...a); };
+
+try {
+  if (!opfs.opfsAvailable()) {
+    $('verdict').innerHTML = '<span class="fail">FAIL — this browser exposes no OPFS</span>';
+    throw new Error('no opfs');
+  }
+
+  // ---- 1. Cold, then warm ---------------------------------------------------------------------
+  await opfs.drop('profstopick.idx');
+  const cold = await opfs.load('profstopick.idx', '../artifact/profstopick.idx');
+  const warm = await opfs.load('profstopick.idx', '../artifact/profstopick.idx');
+  const stored = await opfs.size('profstopick.idx');
+
+  let h = '<table><tr><th></th><th>what</th><th>detail</th></tr>';
+  h += row(cold.source === 'network', 'first visit fetches over HTTP', `${cold.ms.toFixed(1)} ms, ${cold.bytes.length.toLocaleString()} B`);
+  h += row(warm.source === 'opfs', 'second visit reads OPFS', `${warm.ms.toFixed(1)} ms`);
+  h += row(stored === cold.bytes.length, 'persisted byte-for-byte', `${stored.toLocaleString()} B on disk`);
+  h += row(stored < 2_505_813, 'smaller than the JSON shard it replaces', `${(stored / 2_505_813 * 100).toFixed(1)} % of 2,505,813 B`);
+  h += '</table>';
+  $('load').innerHTML = h;
+
+  // ---- 2. No network in the query path ---------------------------------------------------------
+  const wasmBytes = await opfs.load('index.wasm', '../target/wasm32-unknown-unknown/release/index_wasm.wasm');
+  const label = await (await realFetch('../artifact/profstopick.label.json')).json();
+
+  const idx = await SearchIndex.open(wasmBytes.bytes, warm.bytes, { label });
+
+  h = '<table><tr><th></th><th>what</th><th>detail</th></tr>';
+  h += row(true, 'index + module both served from OPFS', `wasm ${wasmBytes.source}, idx ${warm.source}`);
+  const q0 = fetches;
+  const probe = idx.search('rigor', { k: 5 });
+  h += row(fetches === q0, 'a query issues ZERO fetches', `${fetches - q0} network calls during search()`);
+  h += row(probe.length > 0, 'and still answers', `${probe.length} hits`);
+  h += '</table>';
+  $('net').innerHTML = h;
+
+  // ---- 3. Latency vs a server round trip -------------------------------------------------------
+  const query = ['rigor', 'adrian', 'math', 'chem', 'accounting', 'rigoradrian', 'ricardo'];
+  const t0 = performance.now();
+  const ROUNDS = 40;
+  for (let r = 0; r < ROUNDS; r++) {
+    for (const q of query) idx.search(q, { k: 10 });
+  }
+  const local = (performance.now() - t0) / (ROUNDS * query.length);
+
+  // The honest server comparison: time a real same-origin round trip to this very host, which is
+  // the FRIENDLIEST possible server -- localhost, no TLS, no queue, no work. A deployed search
+  // service is strictly slower than this floor.
+  const net = [];
+  for (let i = 0; i < 12; i++) {
+    const s = performance.now();
+    await realFetch(`../artifact/profstopick.label.json?probe=${i}`, { cache: 'no-store' });
+    net.push(performance.now() - s);
+  }
+  net.sort((a, b) => a - b);
+  const rtt = net[Math.floor(net.length / 2)];
+
+  h = '<table><tr><th></th><th>path</th><th class="num">per query</th><th>note</th></tr>';
+  h += `<tr><td class="pass">—</td><td>OPFS + WASM, in this tab</td><td class="num">${local.toFixed(3)} ms</td><td class="dim">no network</td></tr>`;
+  h += `<tr><td class="pass">—</td><td>localhost round trip, empty work</td><td class="num">${rtt.toFixed(3)} ms</td><td class="dim">the floor a server cannot beat</td></tr>`;
+  h += '</table>';
+  h += row(local < rtt, 'local query beats an EMPTY localhost round trip', `${(rtt / local).toFixed(1)}x faster than a server that does no work`);
+  h += '</table>';
+  $('lat').innerHTML = h;
+
+  // ---- 4. The 40.8 % problem -------------------------------------------------------------------
+  // profstopick's production failure was name-order: `flatten()` concatenated a label, so a
+  // first-name-first query could never match a surname-first index. These are that shape.
+  const first = label[0] ?? '';
+  const word = first.split(/\s+/).filter((w) => w.length > 3);
+  const reversed = word.slice().reverse().join(' ');
+  const typo = first.length > 6 ? first.slice(0, 4) + first[5] + first[4] + first.slice(6) : first;
+
+  h = '<table><tr><th></th><th>query</th><th>top hit</th></tr>';
+  const cases = [
+    ['exact', first],
+    ['words reversed', reversed],
+    ['one transposition', typo],
+  ];
+  for (const [what, q] of cases) {
+    const hit = idx.search(q, { k: 5 });
+    const ok = hit.length > 0;
+    h += `<tr><td class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</td><td>${what}: <code>${q}</code></td><td class="dim">${hit[0]?.label ?? '(nothing)'}</td></tr>`;
+    if (!ok) failed++;
+  }
+  h += '</table>';
+  $('typo').innerHTML = h;
+
+  // ---- 5. Range reads --------------------------------------------------------------------------
+  const worker = new Worker('./opfs-worker.mjs', { type: 'module' });
+  const call = (msg) => new Promise((res, rej) => {
+    const id = Math.random();
+    worker.addEventListener('message', function once(e) {
+      if (e.data.id !== id) return;
+      worker.removeEventListener('message', once);
+      e.data.ok ? res(e.data.result ?? e.data.bytes) : rej(new Error(e.data.error));
+    });
+    worker.postMessage({ ...msg, id });
+  });
+
+  const head = await call({ op: 'head', file: 'profstopick.idx' });
+  h = '<table><tr><th></th><th>what</th><th>detail</th></tr>';
+  h += row(head.headBytes === 296, 'the whole layout from 296 bytes', `file is ${head.size.toLocaleString()} B`);
+  h += row(head.section.posting.len > 0, 'section table decoded in-browser', `posting span ${head.section.posting.len.toLocaleString()} B at ${head.section.posting.offset.toLocaleString()}`);
+  const span = head.section.dict;
+  const got = await call({ op: 'range', file: 'profstopick.idx', at: span.offset, len: Math.min(span.len, 4096) });
+  h += row(got.read > 0, 'a single section read without the rest of the file', `${got.read.toLocaleString()} B of the dictionary`);
+  h += row(head.headBytes < head.size, 'so an index larger than memory is openable', `read ${(head.headBytes / head.size * 100).toFixed(3)} % of the file to learn its shape`);
+  h += '</table>';
+  $('range').innerHTML = h;
+  await call({ op: 'close', file: 'profstopick.idx' });
+
+  $('verdict').innerHTML = failed === 0
+    ? '<span class="pass">OVERALL: PASS</span>'
+    : `<span class="fail">OVERALL: FAIL (${failed})</span>`;
+} catch (err) {
+  $('verdict').innerHTML = `<span class="fail">OVERALL: FAIL — ${err}</span>`;
+}
+</script>

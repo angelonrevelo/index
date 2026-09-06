@@ -72,6 +72,15 @@ APPLY  reads change records and updates the collection in place.
                     present wins — 'after.sku,before.sku' covers a stream that
                     puts the row in `after` on upsert and `before` on delete.
                     Defaults to the collection's own key field name.
+  --require NAME    refuse an upsert whose schema field NAME is empty. Repeatable.
+                    USE THIS ON ANY LARGE TEXT COLUMN. Postgres logical decoding
+                    emits a PLACEHOLDER, not the value, for a TOASTed column the
+                    update did not touch -- and since a segment stores whole
+                    documents and the engine keeps no field text, `apply` cannot
+                    do a partial update. Without --require, an unrelated UPDATE
+                    silently blanks that field in the index and search quietly
+                    stops finding the row. Measured: every table with a TOAST
+                    relation in this estate holds TOASTed data (7.8 GB in one).
 
 INPUT FORMAT (both verbs)
   --csv             comma-separated, RFC-4180 quoting. Default.
@@ -138,6 +147,8 @@ struct Opt {
     header: Option<bool>,
     field: Vec<(String, String)>,
     op: Option<String>,
+    /// Schema fields an upsert must carry a non-empty value for. See `cmd_apply`.
+    require: Vec<String>,
     k: usize,
     prefix: bool,
     rest: Vec<String>,
@@ -159,6 +170,7 @@ impl Opt {
                 "--facet" => o.facet.push(take(&mut i, "--facet")?),
                 "--numeric" => o.numeric.push(take(&mut i, "--numeric")?),
                 "--op" => o.op = Some(take(&mut i, "--op")?),
+                "--require" => o.require.push(take(&mut i, "--require")?),
                 "--position" => o.position = true,
                 "--prefix" => o.prefix = true,
                 "--csv" => o.format = Some(Format::Csv),
@@ -438,12 +450,31 @@ fn cmd_apply(o: &Opt) -> Result<(), String> {
         b.set_position();
     }
 
+    // Fields an upsert must carry. Resolved to (schema slot, input path) once, outside the loop.
+    let mut required: Vec<(usize, &str)> = Vec::new();
+    for name in &o.require {
+        let slot = slot_of(name, &schema)?;
+        required.push((slot, path[slot].as_str()));
+    }
+
     let mut upserted = 0usize;
     let mut deleted = 0usize;
     let mut missing = 0usize;
     for c in &change {
         match c {
-            Change::Upsert(rec, _) => {
+            Change::Upsert(rec, key) => {
+                // A TOASTed column the update did not touch arrives as a PLACEHOLDER, not a value,
+                // and `apply` replaces whole documents because the engine stores no field text --
+                // so accepting it would blank the field and search would quietly stop finding the
+                // row. Refusing is the only correct answer available at this layer.
+                for (slot, p) in &required {
+                    if rec.get(*p).map(String::as_str).unwrap_or("").trim().is_empty() {
+                        return Err(format!(
+                            "key {key:?}: required field {:?} is empty at {p:?}. A change stream                              cannot express a partial update here -- if this is an unchanged                              TOASTed column, have the producer re-read the row (see                              bench/roadmap/p67-postgres-connector.md)",
+                            schema[*slot].0
+                        ));
+                    }
+                }
                 b.add(&doc_of(rec, &path));
                 upserted += 1;
             }

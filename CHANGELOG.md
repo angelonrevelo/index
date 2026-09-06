@@ -159,6 +159,64 @@ document wants seven columns and `index_text::MAX_FIELD` allows four.
 
 
 
+## p56, p67, p68 — the browser tier, the scaling grid, and the connector priced (2026-09-06)
+
+### p68 — the OPFS tier (see also `js/opfs.mjs`, `js/opfs-worker.mjs`, `js/opfs.html`)
+
+- **Shipped the tier `docs/research/landscape.md` §7.5 says nobody occupies**: an index living in the
+  browser's own filesystem, queried with **zero network calls**, and range-readable so a file larger
+  than the tab's memory can still be opened. It is open architecturally, not by neglect — Tantivy's
+  WASM RFC has been open since 2019 and is read-only, LanceDB closed WASM as "not planned", Orama has
+  no wasm32 target, and Meilisearch and Elasticsearch are servers.
+- **0.086 ms per query in-tab against a 2.300 ms empty localhost round trip — ~27x faster than a
+  server that does no work.** The comparison is deliberately the friendliest possible server: no TLS,
+  no queue, no distance, no work.
+- **296 bytes to learn the layout of the whole file** (0.077 % of it), via a sync access handle in a
+  worker. That is what the fixed section table in `format.rs` was always for; nothing had exercised
+  it from a browser until now.
+- Replaces profstopick's 2,505,813-byte JSON shard — 95.6 % of the 5 MB localStorage quota — with
+  **15.4 % of that**, and resolves the name-order misses behind its 40.8 % production zero-result rate.
+- `node js/opfs-check.mjs` drives a real Chromium and is in CI. Fixed a missing `await` in `drop()`
+  that leaked an unhandled rejection on every first visit.
+
+### p56 — 10 M: the capacity holds, the bar was never at a million
+
+- **8,290,639 real product rows indexed** (presyo `raw_product` + `extraction_insight`, one pipe).
+  84 s, 729 MB, **91.2 B/doc — bytes per document IMPROVE with scale** (106.4 → 91.2).
+- **The 5 ms typo-p99 bar holds to ~250,000 documents.** Not 1 M, where `p7` set it. Two independent
+  corpora agree: this ladder crosses between 100 K and 250 K, and presyo's real 241,677-product
+  catalogue measures 4.54 ms. **The bar was set 4x too high, not the engine 1.7x too slow.**
+- **Capacity was never the ceiling; latency is.** Median stays under a millisecond to a million and
+  reaches 3 ms at eight.
+- **10 M of real text does not exist in this estate** and was not manufactured: `p55` measured
+  recombination overstating the tail ~2x, so padding to a round number would report a worse answer
+  than admitting the ladder stops at 8.29 M.
+
+### docs/benchmarks.md — the grid nobody in this category publishes
+
+- The survey found that **almost nobody publishes p50/p99 at 100 k / 1 M / 10 M** in the embedded
+  category, and that **no search product publishes an end-to-end index-visibility number at all**.
+  Both are now published here, including a §6 that collects every failure in one place.
+
+### p67 — §7.1 and §7.2 priced against the estate
+
+- **Measured 255 real tables across 8 databases: all 255 are `REPLICA IDENTITY DEFAULT`, none
+  `FULL`.** That is normally a connector's most invasive prerequisite; `p50`'s state-based design
+  never needs a before-image, so the estate is consumable as-is. Not luck, but not foreseen either.
+- **Found a latent correctness bug in what `p50` shipped.** Every table with a TOAST relation in the
+  estate holds TOASTed data — 7.8 GB in presyo alone — and logical decoding emits a **placeholder**
+  for a TOASTed column an update did not touch. `apply` replaces whole documents and the engine
+  stores no field text, so **a partial update is not expressible**: an unrelated UPDATE would
+  silently blank the column and search would stop finding the row.
+- **Added `index apply --require NAME`**, which refuses such an upsert with the key and input path.
+  It is a guard, not a fix — the real answer is a producer that re-SELECTs the row on update, which
+  is exactly what "correctness-first" means in §7.2 and is unbuilt. Gated both ways in `cli-smoke`.
+- **Noted the prerequisite nobody mentions**: the estate runs `wal_level = replica`, and logical
+  decoding needs `logical` plus a server restart.
+- **§7.1 (reading Postgres' own storage) rejected**, recorded in `docs/roadmap-rejected.md`: it costs
+  the browser tier, it inherits rather than fixes the 54 ms → 188,442 ms GIN problem, and the
+  category has four competing extensions, none in core and none on RDS.
+
 ## p52-p55 — the segmentation ceiling, keys on the ABI, varint positions, and a real million (2026-09-06)
 
 ### p52 — collection-wide statistics

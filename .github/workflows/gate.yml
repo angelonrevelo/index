@@ -62,6 +62,16 @@ jobs:
       - name: CLI builds an index from a pipe and keeps it current
         run: bash scripts/cli-smoke.sh
 
+      # The OPFS tier is the position `docs/research/landscape.md` §7.5 says nobody occupies, so
+      # "it compiles" is worth nothing here: this drives a real Chromium, persists the index to the
+      # browser's own filesystem, asserts the query path issues ZERO fetches, and reads the section
+      # table with a 296-byte range read. Playwright is not a dependency of this repo, so the step
+      # installs it for CI only and the check exits 2 (skip) if it is unavailable locally.
+      - name: Install Playwright (CI only)
+        run: npm i -D playwright && npx playwright install --with-deps chromium
+      - name: The index persists in a browser and answers offline
+        run: node js/opfs-check.mjs
+
       # This one is a correctness gate, not a performance gate. `geo-bench` asserts that the WASM
       # index and a pure-JS scan return the IDENTICAL polygon for every one of 53,715 real points,
       # and throws otherwise. The timings it prints are informational here — CI runners are far too

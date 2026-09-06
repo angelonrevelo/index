@@ -60,6 +60,39 @@ See [`p51`](bench/roadmap/p51-database-sweep.md) and
 belong to whoever runs the command; the tool cannot resume a stream it did not start. That buys
 zero dependencies and a database nobody here has heard of working on day one.
 
+## In the browser, with no server in the query path
+
+`docs/research/landscape.md` §7.5 found a position nobody occupies, and found that it is
+**architectural rather than neglected**: Tantivy's WASM RFC has been open since 2019 and is
+read-only, LanceDB closed WASM as *"not planned"*, Orama's Rust core has no wasm32 target, and
+Meilisearch and Elasticsearch are servers with no "run it in the tab" mode to add.
+
+The same `.idx` the server and the CLI use, persisted to the browser's own filesystem:
+
+```sh
+node js/opfs-check.mjs      # a real Chromium, the real artifact
+```
+
+| | |
+|---|---|
+| first visit, over HTTP | 17.7 ms |
+| **second visit, from OPFS** | **2.8 ms** |
+| **network calls during `search()`** | **0** |
+| **per query, in-tab** | **0.086 ms** |
+| localhost round trip doing *no work* | 2.300 ms |
+| **speed-up over a server that does nothing** | **~27x** |
+| bytes read to learn the file's layout | **296** (0.077 % of it) |
+
+It replaces profstopick's 2,505,813-byte JSON shard — **95.6 % of the 5 MB localStorage quota** —
+with **15.4 %** of that, in a quota measured in gigabytes, and fixes the failure that shard caused:
+**109 of 267 real searches returned nothing** in production, mostly name-order misses that now
+resolve.
+
+The 296-byte figure is the point of the section table: a browser can open an index far larger than
+the tab's memory, which is what an object-store cold tier looks like from the client side.
+
+Full numbers, including what fails: [`docs/benchmarks.md`](docs/benchmarks.md).
+
 ## Status
 
 **The project was re-baselined on 2026-09-05** after surveying eleven real applications and running
@@ -333,6 +366,7 @@ refuted hypothesis: [`bench/roadmap/p5-fuzzy-term-feasibility.md`](bench/roadmap
 ```sh
 cargo test --workspace              # engine + learned-index invariants + image tier + CLI
 bash scripts/cli-smoke.sh           # the `index` CLI end to end: build, apply, search, over a pipe
+node js/opfs-check.mjs              # the OPFS tier: persists in a real browser, answers offline
 
 cargo run -p index-bench --release --bin real-corpus       # THE ENGINE vs production corpora
 

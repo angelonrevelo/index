@@ -249,3 +249,34 @@ same residue — **embeddable, dependency-free, MIT/Apache, browser-capable**. T
 LanceDB, which all ship Hamming distance on binary vectors. Facet counts under a vector arm (`p66`)
 fell to Postgres and Solr. **The engineering in this tier is sound; the novelty was not there, and
 this file is where that is written down rather than discovered later by a reviewer.**
+
+## Reading Postgres' own storage instead of copying rows (§7.1) — 2026-09-06
+
+`docs/research/landscape.md` §7.1 named it as a gap nobody fills: every "no upload" claim today means
+"we copy your rows into our pages", and even ParadeDB and pg_textsearch — which do put Tantivy
+segments into Postgres 8 KB blocks — still pay a full second copy and **cannot add an indexed column
+without a full REINDEX**.
+
+**Rejected, for three reasons measured rather than assumed. See `bench/roadmap/p67-postgres-connector.md`.**
+
+**It costs the tier that is actually open.** `p57`'s position is one index file serving a browser, an
+embedded process and an object-store cold tier — a claim no competitor can follow, because Tantivy is
+mmap-based (WASM RFC open since 2019, read-only), LanceDB closed WASM as "not planned", and
+Meilisearch and Elasticsearch are servers. An index living in Postgres' block storage serves exactly
+one of those tiers and can never be fetched into a tab.
+
+**It does not fix the measured pain.** presyo's problem is the query model, not the storage: GIN
+produces a bitmap and never an ordered iterator, so `ORDER BY` + `LIMIT 24` at 12 M rows goes
+**54 ms → 188,442 ms**. Living inside Postgres' pages inherits that rather than fixing it — which is
+why ParadeDB and pg_textsearch both had to bring their own iterator anyway.
+
+**The category is fragmenting.** ParadeDB (AGPL), pg_textsearch (PostgreSQL licence),
+VectorChord-BM25 (AGPL/ELv2) and pg_fts are all competing; **none is in core and none is on RDS or
+Cloud SQL**, and the most honest of them discloses that Elasticsearch still wins Top-10 at 341 vs
+271.91 QPS. Entering means a Postgres extension, a version matrix and a licence position, to arrive
+fourth.
+
+**What was NOT rejected:** §7.2, the correctness-first connector. `p67` found the estate needs no
+`REPLICA IDENTITY FULL` (255 of 255 tables are `DEFAULT`, and `p50`'s state-based design never needs
+a before-image), and found one real bug — TOAST placeholders blanking fields — now guarded by
+`index apply --require`.

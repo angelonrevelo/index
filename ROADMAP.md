@@ -808,39 +808,38 @@ changed. `p54` delta-varint encoded the position sections and **phrase support f
 bar: **it fails on real data too, at 8.1-8.8 ms**, and recombination had been overstating it ~1.6x
 rather than inventing it — which corrects a claim `p47` made and this file repeated.
 
+**`p56`, `p67` and `p68` took the four items that were next.** `p68` shipped the OPFS tier — the
+position `landscape.md` §7.5 found empty **for architectural reasons**, since Tantivy is mmap-based
+with a WASM RFC open since 2019, LanceDB closed WASM as "not planned", and the other two are servers.
+It measures **0.086 ms per query with zero network calls, ~27x faster than an empty localhost round
+trip**, and opens a file of any size by reading **296 bytes**. `p56` used `p51`'s 8.29 M real rows to
+settle the scaling question: capacity was never the ceiling — 8 M builds in 84 s at 91 B/doc — but
+**the 5 ms typo bar holds only to ~250 K documents**, so `p7` set it 4x too high rather than the
+engine being 1.7x too slow. [`docs/benchmarks.md`](docs/benchmarks.md) publishes both grids plus the
+staleness contract, which the survey found **no search product publishes at all**. `p67` priced the
+Postgres work: §7.2 turns out two thirds done — all 255 real tables are `REPLICA IDENTITY DEFAULT`
+and `p50`'s state-based design never needs a before-image — but it found **a real bug in `p50`**,
+TOAST placeholders silently blanking fields, now guarded by `index apply --require`. §7.1 was
+rejected with reasons.
+
 **Next, in order:**
 
-1. **Deploy an integration.** `docs/integration.md` already runs all four apps against their *own*
-   test suites — profstopick 9/9 and 1,922/1,958, onegrid 294/294, presyo head-to-head against its
-   own SQL at 260,000 rows, sisia 91.2 % vs 0.0 % — but all of it lives on throwaway branches.
-   Opening a PR is the step nobody but you can authorize, and it is now the only item on this list
-   that nobody here can do. **`p49` changes what that PR looks like**: an app adopts the engine with
-   a shell command in its deploy script instead of a build step in its own language.
-2. **Decide the typo bar, which `p55` turned from a methodology argument into a product decision.**
-   It fails at a real million — 8.1–8.8 ms against 5 ms — and no measured arm reaches the bar:
-
-   | corpus | documents | typo p99 | 5 ms bar |
-   |---|---|---|---|
-   | DepEd schools, real | 61,467 | **1.81 ms** | **PASS** |
-   | presyo, real products | 241,677 | **4.54 ms** | **PASS** |
-   | **presyo raw_product, REAL** | **1,000,000** | **8.1–8.8 ms** | **FAIL** |
-   | DepEd, recombined | 1,000,000 | 13.58 ms | FAIL |
-
-   The remaining options are unchanged and now priced on real vocabulary: build a genuinely
-   different enumeration strategy (bucket-tiered candidate generation, still unbuilt), accept ~8 ms
-   at a million and publish it as the number, or adopt `search_capped` and publish the agreement
-   beside it — cap 8 gives 6.96 ms at 99.45 % top-10 agreement. **The bar stays red and unraised.**
-3. **Recover `p52`'s second dictionary expansion.** Collection-wide statistics cost ~2x on the typo
-   tail because both passes traverse the same automaton over the same dictionary; the first could
-   hand its expansion to the second. That needs `plan` split into an expand phase and a weigh
-   phase, and it is where the whole cost lives.
-4. **Delta-encode the posting lists**, the idea `p54` proved out on the position sections. Doc ids
-   are monotone within a list and the postings are the largest section in the file — but they are
-   also the hot path, so varint decoding is a latency cost where the offsets were only a size cost.
-   Measure before believing.
-5. **A second change-stream consumer.** `index apply` is the only complete one; the hosts can now
-   express every operation it performs (`p53`) but nobody has written the JavaScript or Python
-   equivalent, so that ABI is proven by tests rather than by use.
+1. **Deploy an integration.** Still the only item nobody here can do, and now the cheapest it has
+   ever been: `p68` makes profstopick's case a static file plus a `<script>`, against a shard that
+   misses 40.8 % of real searches today.
+2. **Wire range reads to `idx_open`.** `p68` proves a section can be read in isolation and `p56`
+   shows a 10 M index is ~910 MB; the module still takes a whole buffer, so that size is *openable*
+   but not yet *queryable* in a tab. This is the difference between the demo and the claim.
+3. **A producer that re-reads the row on update.** `p67`'s `--require` turns silent TOAST blanking
+   into a loud stop, which is a guard, not a fix. The fix is a connector that re-SELECTs by key —
+   the actual content of "correctness-first" in §7.2.
+4. **Recover `p52`'s second dictionary expansion**, worth ~2x on the typo tail. Needs `plan` split
+   into an expand phase and a weigh phase.
+5. **Decide the typo bar now that it has a number.** `p56` reframes it: the engine is interactive to
+   ~250 K documents and exact beyond that. Either publish that as the product statement, adopt
+   `search_capped` with its agreement figure, or build bucket-tiered enumeration. **Still red.**
+6. **Concurrency.** Every number in `docs/benchmarks.md` is one core. A 33 ms tail at 8 M is a
+   single-threaded tail, and nothing in the engine shards a query.
 
 ## Done — the pruning gate
 

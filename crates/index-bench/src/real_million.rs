@@ -80,6 +80,13 @@ fn main() {
         println!("SKIP: only {} usable rows; this bin exists to test a MILLION", row.len());
         return;
     }
+    if row.len() < 10_000_000 {
+        println!(
+            "  NOTE: {} rows available; 10 M of REAL text does not exist in this estate.
+               The ladder runs to what is real. See the ceiling note at the end.",
+            row.len()
+        );
+    }
 
     let clock = timer::Clock::new();
     println!("real-million :: the 5 ms typo bar on REAL documents, not recombined ones");
@@ -91,7 +98,10 @@ fn main() {
          corpus, which is what a real deployment does and what decides posting length.\n"
     );
 
-    let ladder: Vec<usize> = [50_000usize, 250_000, 500_000, 1_000_000]
+    // 10 M is the number `p7` set the bar at; 8.6 M is all the real text this estate holds, so the
+    // ladder runs to whatever is actually available and the gap is reported rather than papered
+    // over by recombination -- which `p55` measured overstating the tail by ~1.6x.
+    let ladder: Vec<usize> = [100_000usize, 250_000, 500_000, 750_000, 1_000_000, 2_000_000, 4_000_000, 8_000_000, 10_000_000]
         .into_iter()
         .filter(|&n| n <= row.len())
         .collect();

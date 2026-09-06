@@ -84,6 +84,31 @@ for q in toothpaste colgate sensodyne milk brush charcoal 'colgaye tothpaste' 'b
   check "applied == rebuilt for '$q'" "$(keys "$WORK/data" "$q")" "$(keys "$WORK/rebuilt" "$q")"
 done
 
+# ---- the TOAST guard --------------------------------------------------------------------------
+# Postgres logical decoding emits a PLACEHOLDER for a TOASTed column an update did not touch. Since
+# a segment stores whole documents and the engine keeps no field text, `apply` cannot merge -- so an
+# unrelated UPDATE would silently blank the column and search would stop finding the row. Refusing
+# is the only correct answer at this layer.
+toast_json='{"op":"u","after":{"sku":"A-1","name":"","brand":"Colgate"}}'
+ok_json='{"op":"u","after":{"sku":"A-1","name":"Colgate Total Charcoal Toothpaste 150g","brand":"Colgate"}}'
+apply_req() {
+  echo "$1" | "$IDX" apply -d "$WORK/data" --jsonl --key after.sku --require name \
+    --field sku=after.sku --field name=after.name --field brand=after.brand >/dev/null 2>&1
+}
+if apply_req "$toast_json"; then
+  echo "  FAIL  an upsert blanking a required field must be refused"
+  fail=$((fail + 1))
+else
+  echo "  PASS  an upsert blanking a required field is refused (TOAST placeholder guard)"
+fi
+# ...and the same record is accepted when the field is actually present.
+if apply_req "$ok_json"; then
+  echo "  PASS  ...and a complete row still applies"
+else
+  echo "  FAIL  a complete row must still apply under --require"
+  fail=$((fail + 1))
+fi
+
 # ---- refusals: a tool that silently does the wrong thing is worse than one that stops ------------
 if "$IDX" build -d "$WORK/nokey" --schema "$SCHEMA" < "$WORK/rows.csv" 2>/dev/null; then
   if "$IDX" apply -d "$WORK/nokey" --jsonl < "$WORK/changes.jsonl" 2>/dev/null; then
