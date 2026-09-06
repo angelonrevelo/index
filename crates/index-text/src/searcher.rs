@@ -66,8 +66,13 @@ fn cpu_count() -> usize {
     *N.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
 }
 
-/// A process-wide kill switch for the threaded fan-out: `INDEX_PARALLEL=0` forces every collection
-/// onto the serial path, `INDEX_PARALLEL=1` forces every multi-segment one onto threads.
+/// The process-wide opt-in for the threaded fan-out: `INDEX_PARALLEL=1` enables it for collections
+/// that also clear the size gate; anything else (including unset) leaves every collection serial.
+///
+/// It began life as a kill switch, defaulting ON. `p80` inverted it after measuring the shipped
+/// default 2.2-2.4x SLOWER than serial at 25 and 50 segments, on the same workstation running its
+/// owner's ordinary applications. Spawning a thread per core per query is a bet that the cores are
+/// free, and a library embedded in someone else's process is not entitled to assume that.
 ///
 /// It exists because **the win could not otherwise be measured on this machine.** `p38`'s own
 /// header says why -- its one-segment p50 swung 15 -> 30 us between runs while the quality columns
@@ -190,6 +195,22 @@ impl Searcher {
     #[cfg(test)]
     fn set_force_thread(&mut self, forced: Option<bool>) {
         self.force_thread = forced;
+    }
+
+    /// Opt this collection into (or out of) the threaded per-segment fan-out, overriding both the
+    /// `INDEX_PARALLEL` environment variable and the size gate.
+    ///
+    /// **Threading is off unless asked for.** It is worth asking for when this process owns the
+    /// machine and the collection is large and many-segmented; see [`PARALLEL_WORK_MIN`] and
+    /// `bench/roadmap/p80-parallel-default.md` for the measurement that decided the default. On a
+    /// shared or busy box, leaving it off is not a missed optimisation — it is the faster setting.
+    pub fn set_parallel(&mut self, on: bool) {
+        self.force_thread = Some(on);
+    }
+
+    /// Whether the threaded fan-out would run for this collection as currently configured.
+    pub fn parallel(&self) -> bool {
+        self.wants_thread()
     }
 
     /// Collection-wide statistics for `query`: the first half of a `dfs_query_then_fetch`.
@@ -702,8 +723,16 @@ impl Searcher {
         if self.segment.len() < 2 || cpu_count() < 2 {
             return false;
         }
-        if let Some(forced) = self.force_thread.or_else(env_override) {
+        if let Some(forced) = self.force_thread {
             return forced;
+        }
+        // **Threading is OPT-IN.** `p74` shipped it enabled by default on the strength of a
+        // measurement taken on a quiet box; `p80` re-measured it on the same machine running its
+        // owner's ordinary desktop applications and found the shipped default **2.2-2.4x SLOWER**
+        // at exactly the rungs this gate selects. Both measurements are real, and a library that
+        // does not own the machine has to default to the safe one.
+        if env_override() != Some(true) {
+            return false;
         }
         self.segment.len().saturating_mul(self.doc_count) >= PARALLEL_WORK_MIN
     }
