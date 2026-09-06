@@ -193,7 +193,7 @@ counts and **~2x on the typo tail** — a second dictionary expansion per segmen
 
 | | |
 |---|---|
-| first visit, over HTTP | 17.7 ms, 386,043 B |
+| first visit, over HTTP | 17.7 ms, 220,470 B (386,043 B before `p69`) |
 | **second visit, from OPFS** | **2.8 ms** |
 | network calls during `search()` | **0** |
 | **per query, in-tab** | **0.086 ms** |
@@ -202,7 +202,7 @@ counts and **~2x on the typo tail** — a second dictionary expansion per segmen
 | bytes to learn the file's layout | **296** (0.077 % of the file) |
 
 The index it replaces is profstopick's 2,505,813-byte JSON shard, which occupies **95.6 % of the
-5 MB localStorage quota**; this is **15.4 %** of it, in a quota measured in gigabytes.
+5 MB localStorage quota**; this is **8.8 %** of it, in a quota measured in gigabytes.
 
 The localhost comparison is deliberately the *friendliest possible* server: no TLS, no queue, no
 work, no distance. A deployed search service is strictly slower than that floor.

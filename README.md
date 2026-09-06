@@ -84,7 +84,7 @@ node js/opfs-check.mjs      # a real Chromium, the real artifact
 | bytes read to learn the file's layout | **296** (0.077 % of it) |
 
 It replaces profstopick's 2,505,813-byte JSON shard — **95.6 % of the 5 MB localStorage quota** —
-with **15.4 %** of that, in a quota measured in gigabytes, and fixes the failure that shard caused:
+with **8.8 %** of that, in a quota measured in gigabytes, and fixes the failure that shard caused:
 **109 of 267 real searches returned nothing** in production, mostly name-order misses that now
 resolve.
 
@@ -310,8 +310,13 @@ OVERALL: PASS
 
 `js/browser.html` drives the raw C ABI rather than the Node wrapper, so a failure cannot be hidden.
 This is the tier profstopick actually ships to, and the only place `instantiateStreaming` and its
-hard `application/wasm` MIME requirement are exercised. **Persistence is still unbuilt** — the index
-is fetched every load; OPFS caching is ROADMAP P8.
+hard `application/wasm` MIME requirement are exercised. **Persistence shipped in `p68`** — the index
+is stored in OPFS and survives a page navigation, and since `p72` a query can be answered from byte
+ranges without reading the whole file. See `js/opfs.mjs` and `js/opfs-check.mjs`.
+
+*The transcript above predates `p69`, which took the index file from 386,043 to 220,470 bytes; the
+figures in it are an upper bound. It is not re-run here because Playwright is deliberately not a
+dependency of this repo — link a sibling `node_modules` to reproduce it.*
 
 ### It runs outside Rust — measured in Node, through WASM
 
@@ -320,17 +325,43 @@ $ cargo build -p index-wasm --release --target wasm32-unknown-unknown
 $ cargo run -p index-bench --release --bin emit-artifact
 $ node js/demo.mjs
 
-  wasm module   173,700 bytes
-  index file    380,564 bytes
-  documents     1,322
-  open + parse  23.6 ms
+  index-text in Node, through WASM — no wasm-bindgen, no native build
 
-  exact name     "ABACAN, RAPHAEL"   -> "ABACAN, RAPHAEL" (bucket 0, 1.60 ms)
-  surname only   "ABACAN"            -> "ABACAN, RAPHAEL" (bucket 0, 0.03 ms)
-  one deletion   "ABAAN, RAPHAEL"    -> "ABACAN, RAPHAEL" (bucket 1, 0.94 ms)
-  transposition  "ABCAAN, RAPHAEL"   -> "ABACAN, RAPHAEL" (bucket 1, 0.15 ms)
+    wasm module   604,184 bytes
+    index file    220,470 bytes
+    documents     1,322
+    terms         4,564
+    open + parse  23.1 ms
 
-  500 real name queries: 20 us each, called from JS
+  querying for: "ABACAN, RAPHAEL"
+
+    exact name     "ABACAN, RAPHAEL"
+                   -> "ABACAN, RAPHAEL" (bucket 0, 4.07 ms)
+    PASS  exact name finds the right professor
+
+    surname only   "ABACAN"
+                   -> "ABACAN, RAPHAEL" (bucket 0, 0.07 ms)
+    PASS  surname only finds the right professor
+
+    lowercase      "abacan, raphael"
+                   -> "ABACAN, RAPHAEL" (bucket 0, 0.07 ms)
+    PASS  lowercase finds the right professor
+
+    one deletion   "ABAAN, RAPHAEL"
+                   -> "ABACAN, RAPHAEL" (bucket 1, 2.11 ms)
+    PASS  one deletion finds the right professor
+
+    transposition  "ABCAAN, RAPHAEL"
+                   -> "ABACAN, RAPHAEL" (bucket 1, 0.28 ms)
+    PASS  transposition finds the right professor
+
+    typeahead      "ABACA" -> 5 hit(s)
+    PASS  typeahead reaches the professor from a 5-char prefix
+    PASS  a nonsense query returns nothing
+
+    500 real name queries: 27 us each, called from JS
+    PASS  mean query under 5 ms from JavaScript
+
   OVERALL: PASS
 ```
 
