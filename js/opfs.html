@@ -42,6 +42,17 @@
 <h2>5 — range reads: opening an index without reading it</h2>
 <div id="range"></div>
 
+<h2>6 — and QUERYING it without reading it</h2>
+<p class="dim">
+  Section 5 proves a section is reachable. This one wires that to the engine:
+  <code>idx_range_open</code> takes 296 bytes, <code>idx_range_plan_query</code> names the posting
+  lists one query needs, and <code>idx_range_search</code> answers from exactly those — the same
+  hits, byte for byte, that a whole-file <code>idx_open</code> returns. At ~910 MB for ten million
+  documents (<code>p56</code>) that is the difference between a file a tab can open and one it can
+  use.
+</p>
+<div id="tier"></div>
+
 <div id="verdict">running…</div>
 
 <script type="module">
@@ -170,6 +181,49 @@ try {
   h += row(head.headBytes < head.size, 'so an index larger than memory is openable', `read ${(head.headBytes / head.size * 100).toFixed(3)} % of the file to learn its shape`);
   h += '</table>';
   $('range').innerHTML = h;
+  await call({ op: 'close', file: 'profstopick.idx' });
+
+  // ---- 6. The range tier: open AND query, without the file ------------------------------------
+  // Every byte the module asks for goes through this reader, which tallies them. That tally
+  // against the file's own size is the claim; timing it would not be, because a fast answer can
+  // still have read everything.
+  const reader = opfs.opfsRangeReader(worker, 'profstopick.idx');
+  const ranged = await opfs.RangeIndex.open(wasmBytes.bytes, reader.read, { label });
+  const openByte = reader.state.byteRead;
+
+  const beforeFetch = fetches;
+  const rangedQuery = ['rigor', 'adrian', 'ricardo', first];
+  let sameCount = 0;
+  const t6 = performance.now();
+  for (const q of rangedQuery) {
+    const want = idx.search(q, { k: 10 });
+    const got = await ranged.search(q, { k: 10 });
+    const same =
+      want.length === got.length &&
+      want.every((w, i) => w.doc === got[i].doc && Math.abs(w.score - got[i].score) < 1e-6);
+    if (same) sameCount++;
+  }
+  const rangedMs = (performance.now() - t6) / rangedQuery.length;
+  const size = reader.state.size;
+  const read = reader.state.byteRead;
+
+  h = '<table><tr><th></th><th>what</th><th>detail</th></tr>';
+  h += row(ranged.docCount > 0 && ranged.termCount > 0,
+    'opened from 296 bytes, then the non-posting sections only',
+    `${ranged.docCount.toLocaleString()} documents, ${ranged.termCount.toLocaleString()} terms, from ${openByte.toLocaleString()} B`);
+  h += row(sameCount === rangedQuery.length,
+    'every query answers IDENTICALLY to a whole-file open',
+    `${sameCount}/${rangedQuery.length} queries match doc-for-doc and score-for-score`);
+  h += row(read < size,
+    'the whole file was never read',
+    `${read.toLocaleString()} B read of ${size.toLocaleString()} B — ${(read / size * 100).toFixed(1)} %`);
+  h += row(fetches === beforeFetch, 'and still zero network calls', `${fetches - beforeFetch} during ${rangedQuery.length} ranged queries`);
+  h += `<tr><td class="pass">—</td><td>per ranged query, including the OPFS round trip</td><td class="dim">${rangedMs.toFixed(3)} ms</td></tr>`;
+  // What this buys at p56's scale, stated as the ratio it actually measured rather than as a hope.
+  h += `<tr><td class="pass">—</td><td>the same ratio against p56's 910 MB index</td><td class="dim">~${(read / size * 910).toFixed(0)} MB resident instead of 910 MB</td></tr>`;
+  h += '</table>';
+  $('tier').innerHTML = h;
+  ranged.close();
   await call({ op: 'close', file: 'profstopick.idx' });
 
   $('verdict').innerHTML = failed === 0

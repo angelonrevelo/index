@@ -44,7 +44,7 @@ const want = [
   'idx_searcher_has_key',
 ];
 check(want.every((k) => k in e), `all ${want.length} ABI symbols are exported`);
-check(e.idx_abi_version() === 13, 'ABI version is 13');
+check(e.idx_abi_version() === 14, 'ABI version is 14');
 
 // Allocation round-trips through linear memory.
 const u32 = (n) => n >>> 0;

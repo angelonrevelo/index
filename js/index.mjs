@@ -13,7 +13,7 @@
 // which made every `build()` and `open()` throw `ABI mismatch` -- the check worked, the constant
 // did not. `js/smoke.mjs` asserts the module's version but instantiates the module directly, so it
 // never touched this file. Nothing here is gate-covered until it is, which is `p44`'s open note.
-const ABI_VERSION = 13;
+const ABI_VERSION = 14;
 const HIT_BYTE = 12; // u32 doc, f32 score, u32 typo_bucket
 
 // WASM has no unsigned 32-bit return type: every `u32` arrives in JS as a **signed** i32, so

@@ -82,11 +82,24 @@ const table = async (id) =>
   page.$$eval(`#${id} tr`, (tr) =>
     tr.map((r) => [...r.children].map((c) => c.textContent.trim()).filter(Boolean).join('  ')));
 
-for (const id of ['load', 'net', 'lat', 'typo', 'range']) {
+for (const id of ['load', 'net', 'lat', 'typo', 'range', 'tier']) {
   for (const line of await table(id)) {
     if (line) console.log(`  ${line}`);
   }
 }
+
+// The p68 open note, closed: the module used to take the whole buffer, so a 910 MB index was
+// openable in a tab and not queryable in one. Section 6 must therefore show a query answered from
+// materially less than the file -- and show the same hits, or a cheaper answer is just a different
+// answer. Read out of the page's own table so the number in CI is the number a human sees.
+const tier = await table('tier');
+const ranged = tier.find((r) => r.includes('the whole file was never read')) ?? '';
+const percent = Number(ranged.match(/([\d.]+) %/)?.[1] ?? 101);
+const identical = tier.some((r) => r.startsWith('PASS') && r.includes('answers IDENTICALLY'));
+console.log(
+  `\n  ${percent < 100 && identical ? 'PASS' : 'FAIL'}  a real query answered from ` +
+    `${percent} % of the file, with hits identical to a whole-file open`,
+);
 
 const verdict = await text('verdict');
 console.log(`\n${verdict}`);
@@ -115,6 +128,6 @@ if (consoleError.length) {
   console.error('\nconsole errors:');
   for (const e of consoleError.slice(0, 5)) console.error(`  ${e}`);
 }
-const ok = verdict?.includes('PASS') && survived > 0;
+const ok = verdict?.includes('PASS') && survived > 0 && percent < 100 && identical;
 console.log(ok ? 'OVERALL: PASS' : 'OVERALL: FAIL');
 process.exit(ok ? 0 : 1);

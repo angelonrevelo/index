@@ -68,8 +68,39 @@ function sections(head) {
   return out;
 }
 
+/**
+ * Read several disjoint slices and return them concatenated, in the order asked.
+ *
+ * This is the primitive the range tier in `index-wasm` is shaped around: the module hands back a
+ * list of `(offset, len)` and expects those bytes back nose to tail. Concatenating HERE rather than
+ * in the caller keeps the whole read inside the worker that owns the sync access handle, so the
+ * main thread never sees a slice it did not ask for, and the transfer is one buffer rather than N.
+ *
+ * `size` is returned alongside, because "we read 84 kB of a 386 kB file" is the claim, and a claim
+ * whose denominator came from somewhere else is not a measurement.
+ */
+function readSpan(h, span) {
+  let total = 0;
+  for (const s of span) {
+    total += s[1];
+  }
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const [offset, len] of span) {
+    if (len === 0) continue;
+    // A short read means the file is not the file the section table described. Fail loudly:
+    // silently returning fewer bytes would leave the module splitting sections at wrong offsets.
+    const n = h.read(out.subarray(at, at + len), { at: offset });
+    if (n !== len) {
+      throw new Error(`short read: wanted ${len} at ${offset}, got ${n}`);
+    }
+    at += len;
+  }
+  return out;
+}
+
 self.onmessage = async (e) => {
-  const { id, op, file, at, len } = e.data;
+  const { id, op, file, at, len, span } = e.data;
   try {
     const h = await openHandle(file);
     let result;
@@ -84,6 +115,12 @@ self.onmessage = async (e) => {
         const buf = readAt(h, at, len);
         result = { read: buf.length, checksum: buf.reduce((a, b) => (a + b) & 0xffffffff, 0) };
         break;
+      }
+      case 'span': {
+        // The op the wasm range tier runs on: N slices in, one buffer out, nothing else touched.
+        const buf = readSpan(h, span);
+        self.postMessage({ id, ok: true, bytes: buf, size: h.getSize() }, [buf.buffer]);
+        return;
       }
       case 'all': {
         const buf = readAt(h, 0, h.getSize());

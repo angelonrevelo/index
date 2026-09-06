@@ -110,7 +110,7 @@ const cross = (ok, msg) => {
   if (!ok) crossFailed++;
 };
 console.log('\n  CROSS-TIER (this harness, not the page):');
-cross(report?.abi === 13, `the module the browser fetched reports ABI 13 (got ${report?.abi ?? 'nothing'})`);
+cross(report?.abi === 14, `the module the browser fetched reports ABI 14 (got ${report?.abi ?? 'nothing'})`);
 cross(report?.vector === NODE_IMAGE.vector,
   `browser vector order === Node/Rust ${NODE_IMAGE.vector} (got ${report?.vector ?? 'nothing'})`);
 cross(report?.fused === NODE_IMAGE.fused,

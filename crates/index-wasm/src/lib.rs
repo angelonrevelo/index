@@ -39,12 +39,14 @@
 //! results live in the image handle's own buffer, read with [`idx_image_result_ptr`] /
 //! [`idx_image_result_len`].
 
-use index_text::{AliasTable, Doc, FacetClause, Field, Index, IndexBuilder, Schema, Searcher};
+use index_text::{
+    AliasTable, Doc, FacetClause, Field, Index, IndexBuilder, Schema, SectionTable, Searcher, Span,
+};
 use std::alloc::{alloc, dealloc, Layout};
 
 /// Bump this on any incompatible change to the exported signatures or the result encoding.
 /// The host is expected to check it before doing anything else.
-pub const ABI_VERSION: u32 = 13;
+pub const ABI_VERSION: u32 = 14;
 
 /// Bytes per hit record in the result buffer.
 const HIT_BYTE: usize = 12;
@@ -1888,6 +1890,500 @@ pub unsafe extern "C" fn idx_image_free(h: *mut ImageHandle) {
     }
 }
 
+// ---- The range tier: querying an index without materialising it ---------------------------------
+//
+// `bench/roadmap/p56-ten-million.md` measures a 10 M-document index at ~910 MB, and
+// `p68-opfs-tier.md` closed with the honest complaint that a browser could only *open* such a file,
+// never query it: the worker proved a section is range-readable, but `idx_open` still took the
+// whole buffer, so the tab still had to hold all 910 MB.
+//
+// # Why a PREFETCH PLAN and not a lazy handle
+//
+// The other credible shape is a lazy handle -- the module keeps the section table plus a host
+// callback for "give me bytes [at, len)" and pulls spans as the searcher walks. It was rejected on
+// three counts, and the first is fatal on its own:
+//
+// 1. **The bytes are not reachable from inside a WASM call.** `createSyncAccessHandle().read()` is
+//    worker-only, and a Rust -> JS callback that must await an OPFS handle cannot return
+//    synchronously. A lazy handle therefore needs either JSPI/Asyncify (a build-mode dependency and
+//    a whole-module rewrite) or a SharedArrayBuffer and `Atomics.wait` (cross-origin isolation,
+//    which most consumers of this engine cannot turn on). Neither is a property this ABI should
+//    require of every host.
+// 2. **Reentrancy into JS from Rust is the one thing this ABI has never done.** A host that throws
+//    inside the callback unwinds through the module, which is the failure this crate spends its
+//    entire error model avoiding.
+// 3. A plan is inspectable. The host can *count the bytes it read*, which is the claim being made;
+//    a callback hides that count inside the module.
+//
+// The plan costs one extra round trip per query -- plan, fetch, search -- and buys a boundary that
+// is still a pure `(ptr, len)` in and `(ptr, len)` out.
+//
+// # What is resident and what is not
+//
+// The plan splits the eighteen sections in two. **Resident**: everything whose size is bounded by
+// the document count or the term count -- meta, schema, alias, dictionary, posting-offset array,
+// document lengths, priors, anchors, deletions, expansions, facets, numeric columns, keys.
+// **Not resident**: `posting`, and the two position sections. Postings are the bulk (78.6 % of the
+// shipped profstopick artifact, and that fraction only grows with the corpus) and they are the one
+// section addressable per term, which is exactly what `format::posting_span` exists to compute.
+//
+// Positions are dropped rather than fetched, so `search_phrase` is not available on a range handle.
+// That is stated rather than faked: a phrase query answered from a bag of words is a wrong answer
+// that looks right, and this file already refuses that trade in [`idx_search_phrase`].
+//
+// # How a partial file is made openable at all
+//
+// `Index::from_bytes` validates every posting list against the offset array, so it cannot be handed
+// a file with holes. Instead the module ASSEMBLES a smaller, entirely valid index image: the
+// resident sections verbatim, a posting section holding only the fetched lists, and a rewritten
+// posting-offset array in which every unfetched term is a zero-length span. Nothing in the reader
+// has to learn about partial files, and the assembled index is genuinely well-formed -- it simply
+// knows about fewer posting lists than the file it came from.
+//
+// # Why the answer is EXACT and not an approximation
+//
+// The planner asks the resident index -- whose postings are all empty -- for `term_stat`, the same
+// dictionary expansion `plan_stat` performs for a real search and deliberately without the
+// expansion cap. Dictionary expansion depends only on the FST, so the planned term set is a
+// superset of what the search will scan. Every fetched list then carries its true length, so the
+// `df` that orders and caps the expansions, and the `df` that scores them, are the file's own.
+//
+// The single place the two could disagree is `split_compound`, which breaks ties by document
+// frequency -- and the planner sees zeroes there. So the search VERIFIES: it re-runs `term_stat` on
+// the assembled index and returns `u32::MAX` if any term it would scan was not fetched. A host that
+// sees that sentinel falls back to a full open. Answering from a term set that is silently missing
+// a list is the failure this refuses to have.
+
+/// Bytes a reader needs from the head of a file to learn where all eighteen sections live:
+/// `MAGIC.len()` plus eighteen spans of two little-endian `u64`.
+///
+/// Pinned against `read_section_table` by `the_layout_of_any_index_costs_296_bytes` rather than
+/// trusted, because `format.rs` owns the real constant and this one must not drift from it.
+const RANGE_HEAD_BYTE: usize = 8 + 18 * 16;
+
+/// Sections in a section table.
+const SECTION_COUNT: usize = 18;
+
+/// Bytes per span record in a plan: `u64` offset, `u64` length, little-endian.
+const SPAN_BYTE: usize = 16;
+
+/// Table slot of `posting_offset` -- the array `posting_span` addresses lists through.
+const SLOT_POSTING_OFFSET: usize = 4;
+/// Table slot of `posting`: the one section fetched per query rather than at open.
+const SLOT_POSTING: usize = 5;
+/// Table slot of `position_at`, dropped entirely on a range handle.
+const SLOT_POSITION_AT: usize = 15;
+/// Table slot of `position`, dropped for the same reason.
+const SLOT_POSITION: usize = 16;
+
+/// An index opened from its 296-byte head, plus whichever sections a host has since fetched for it.
+///
+/// Opaque, like [`Handle`]; its layout is not part of the ABI.
+pub struct RangeHandle {
+    /// Where every section lives **in the original file**, which is what the host reads from.
+    table: SectionTable,
+    /// Resident section bytes by table slot. `posting` and the two position slots stay empty.
+    part: Vec<Vec<u8>>,
+    /// The file's own posting-offset array, kept verbatim: the assembled image gets a rewritten
+    /// one, but `posting_span` must keep addressing the FILE.
+    posting_offset: Vec<u8>,
+    term_count: usize,
+    /// The index over the resident sections alone. It answers no query -- every posting list is
+    /// empty -- but it holds the dictionary, the aliases and the expansion table, which is what
+    /// planning needs.
+    resident: Option<Index>,
+    /// `(term id, span in the file)` for the last planned query, sorted by term id, deduplicated.
+    plan: Vec<(u32, Span)>,
+    result: Vec<u8>,
+}
+
+/// The `i`th span of a section table, in table order.
+fn section_span(t: &SectionTable, i: usize) -> Span {
+    match i {
+        0 => t.meta,
+        1 => t.schema,
+        2 => t.alias,
+        3 => t.dict,
+        4 => t.posting_offset,
+        5 => t.posting,
+        6 => t.doc_len,
+        7 => t.prior,
+        8 => t.first_term,
+        9 => t.deleted,
+        10 => t.expansion,
+        11 => t.facet_label,
+        12 => t.facet_id,
+        13 => t.numeric_field,
+        14 => t.numeric_value,
+        15 => t.position_at,
+        16 => t.position,
+        _ => t.doc_key,
+    }
+}
+
+/// Whether slot `i` is fetched once at open rather than per query.
+fn is_resident(i: usize) -> bool {
+    !matches!(i, SLOT_POSTING | SLOT_POSITION_AT | SLOT_POSITION)
+}
+
+/// Lay eighteen sections out as a valid index file, backfilling the section table.
+///
+/// Order is table order, which is also the order `to_bytes` writes -- but nothing depends on that:
+/// `from_bytes` reads every section through its span, so this could pack them in any order at all.
+fn assemble(part: &[Vec<u8>]) -> Vec<u8> {
+    let total: usize = part.iter().map(|p| p.len()).sum();
+    let mut out = Vec::with_capacity(RANGE_HEAD_BYTE + total);
+    out.extend_from_slice(&index_text::MAGIC);
+    out.resize(RANGE_HEAD_BYTE, 0);
+    let mut table = Vec::with_capacity(SECTION_COUNT * SPAN_BYTE);
+    for p in part {
+        let at = out.len() as u64;
+        out.extend_from_slice(p);
+        table.extend_from_slice(&at.to_le_bytes());
+        table.extend_from_slice(&(p.len() as u64).to_le_bytes());
+    }
+    out[index_text::MAGIC.len()..RANGE_HEAD_BYTE].copy_from_slice(&table);
+    out
+}
+
+impl RangeHandle {
+    /// Write `span` into the result buffer as the plan the host is to fetch.
+    fn write_plan(&mut self, span: &[Span]) {
+        self.result.clear();
+        self.result.reserve(span.len() * SPAN_BYTE);
+        for s in span {
+            self.result.extend_from_slice(&s.offset.to_le_bytes());
+            self.result.extend_from_slice(&s.len.to_le_bytes());
+        }
+    }
+
+    /// The posting section and its offset array for an image holding only the planned lists.
+    ///
+    /// `fetched` is the concatenation of the planned spans, in plan order — which is term-id order,
+    /// so it is consumed by a single forward cursor as the terms are walked.
+    ///
+    /// **An unfetched term gets a ONE-BYTE list, not a zero-length span.** Since `IDXTXT10` every
+    /// posting list is self-describing and opens with a varint count, so "this term has no
+    /// postings" is the byte `0x00` — and a zero-length span is not an empty list but an unreadable
+    /// one, which `from_bytes` correctly refuses. That distinction did not exist under the
+    /// fixed-width format this was first written against, where an empty list genuinely was zero
+    /// bytes; it is the one place the encoding change reaches into the range path.
+    fn narrow(&self, fetched: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let mut posting = Vec::with_capacity(fetched.len() + self.term_count);
+        let mut out = Vec::with_capacity((self.term_count + 1) * 8);
+        let mut acc = 0u64;
+        let mut next = 0usize;
+        let mut at = 0usize;
+        for i in 0..self.term_count {
+            out.extend_from_slice(&acc.to_le_bytes());
+            match self.plan.get(next) {
+                Some((id, span)) if *id as usize == i => {
+                    let n = span.len as usize;
+                    // The caller has already checked that `fetched` is exactly the planned length;
+                    // this guard keeps a short buffer from panicking rather than trusting that.
+                    let Some(bytes) = fetched.get(at..at + n) else { break };
+                    posting.extend_from_slice(bytes);
+                    at += n;
+                    acc += n as u64;
+                    next += 1;
+                }
+                _ => {
+                    posting.push(0);
+                    acc += 1;
+                }
+            }
+        }
+        out.extend_from_slice(&acc.to_le_bytes());
+        (posting, out)
+    }
+
+    /// Assemble an image from the resident sections plus `posting`, and open it.
+    fn open_image(&self, posting: Vec<u8>, offset_array: Vec<u8>) -> Option<Index> {
+        let mut part = self.part.clone();
+        part[SLOT_POSTING_OFFSET] = offset_array;
+        part[SLOT_POSTING] = posting;
+        Index::from_bytes(&assemble(&part)).ok()
+    }
+}
+
+/// Bytes of a file's head that [`idx_range_open`] requires. Constant for every index this format
+/// has ever written and independent of the file's size -- that invariance is the whole point.
+#[no_mangle]
+pub extern "C" fn idx_range_head_byte() -> u32 {
+    RANGE_HEAD_BYTE as u32
+}
+
+/// Bytes per span record in a plan: `u64` offset then `u64` length, little-endian.
+#[no_mangle]
+pub extern "C" fn idx_range_span_byte() -> u32 {
+    SPAN_BYTE as u32
+}
+
+/// Open an index from the first [`idx_range_head_byte`] bytes of its file -- and **nothing else**.
+///
+/// Returns an opaque handle, or null if those bytes are not the head of an index this build reads.
+/// The handle cannot answer anything yet: the host must run [`idx_range_plan`], fetch the spans it
+/// names, and hand them back to [`idx_range_load`].
+///
+/// # Safety
+/// `ptr` must be readable for `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn idx_range_open(ptr: *const u8, len: usize) -> *mut RangeHandle {
+    if ptr.is_null() || len < RANGE_HEAD_BYTE {
+        return std::ptr::null_mut();
+    }
+    let head = std::slice::from_raw_parts(ptr, len);
+    let Ok(table) = index_text::read_section_table(head) else { return std::ptr::null_mut() };
+    Box::into_raw(Box::new(RangeHandle {
+        table,
+        part: vec![Vec::new(); SECTION_COUNT],
+        posting_offset: Vec::new(),
+        term_count: 0,
+        resident: None,
+        plan: Vec::new(),
+        result: Vec::new(),
+    }))
+}
+
+/// The spans a host must read to make `rh` queryable: everything except the postings and the
+/// positions. Writes [`idx_range_span_byte`] records into the handle's result buffer and returns
+/// how many, or `u32::MAX` on a null handle.
+///
+/// Fifteen records, always, including any that are zero-length -- a fixed count is a shape the host
+/// can concatenate against without branching, and a zero-length read costs nothing.
+///
+/// # Safety
+/// `rh` must be a live handle from [`idx_range_open`].
+#[no_mangle]
+pub unsafe extern "C" fn idx_range_plan(rh: *mut RangeHandle) -> u32 {
+    let Some(h) = rh.as_mut() else { return u32::MAX };
+    let span: Vec<Span> =
+        (0..SECTION_COUNT).filter(|i| is_resident(*i)).map(|i| section_span(&h.table, i)).collect();
+    h.write_plan(&span);
+    span.len() as u32
+}
+
+/// Hand back the bytes [`idx_range_plan`] asked for, concatenated **in plan order**.
+///
+/// Returns 1 once the handle can plan queries, and 0 if the buffer is the wrong length, if the
+/// posting-offset array is malformed, or if the resident sections do not form an index. A wrong
+/// length is refused rather than split on a best guess: the sections are positional, so a short
+/// buffer would silently reinterpret a dictionary as a length column.
+///
+/// # Safety
+/// `rh` must be a live handle; `ptr` readable for `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn idx_range_load(rh: *mut RangeHandle, ptr: *const u8, len: usize) -> u32 {
+    let Some(h) = rh.as_mut() else { return 0 };
+    if ptr.is_null() {
+        return 0;
+    }
+    let slot: Vec<usize> = (0..SECTION_COUNT).filter(|i| is_resident(*i)).collect();
+    let want: u64 = slot.iter().map(|i| section_span(&h.table, *i).len).sum();
+    if want != len as u64 {
+        return 0;
+    }
+    let bytes = std::slice::from_raw_parts(ptr, len);
+    let mut at = 0usize;
+    let mut part = vec![Vec::new(); SECTION_COUNT];
+    for i in slot {
+        let n = section_span(&h.table, i).len as usize;
+        part[i] = bytes[at..at + n].to_vec();
+        at += n;
+    }
+
+    let off = std::mem::take(&mut part[SLOT_POSTING_OFFSET]);
+    if off.len() % 8 != 0 || off.len() < 16 {
+        return 0;
+    }
+    h.term_count = off.len() / 8 - 1;
+    h.posting_offset = off;
+    h.part = part;
+    // The resident image: every posting list present, every posting list empty. It answers no
+    // query and is never asked one -- it holds the dictionary the planner expands against.
+    h.plan.clear();
+    let (empty_posting, empty_offset) = h.narrow(&[]);
+    match h.open_image(empty_posting, empty_offset) {
+        Some(index) => {
+            h.resident = Some(index);
+            1
+        }
+        None => 0,
+    }
+}
+
+/// The posting spans `query` needs, in the file's own coordinates.
+///
+/// Writes [`idx_range_span_byte`] records into the result buffer and returns how many, or
+/// `u32::MAX` on a null handle, a non-UTF-8 query, or a handle that has not been loaded. Zero is a
+/// legitimate answer -- a query whose every token is absent from the dictionary reads nothing at
+/// all and then matches nothing, which is the correct amount of I/O for it.
+///
+/// `prefix` non-zero plans for typeahead semantics on the final token, and must match the `prefix`
+/// later passed to [`idx_range_search`]; planning one and searching the other is caught there
+/// rather than answered.
+///
+/// # Safety
+/// `rh` must be a live handle; `q` readable for `q_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn idx_range_plan_query(
+    rh: *mut RangeHandle,
+    q: *const u8,
+    q_len: usize,
+    prefix: u32,
+) -> u32 {
+    let Some(h) = rh.as_mut() else { return u32::MAX };
+    if q.is_null() {
+        return u32::MAX;
+    }
+    let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
+        return u32::MAX;
+    };
+    let Some(index) = h.resident.as_ref() else { return u32::MAX };
+
+    // Two sources, and both are decided by structures that are already resident, which is why a
+    // plan can be exact: the dictionary FST decides the expansions, and the learned-expansion table
+    // decides the rest. Neither consults a posting list.
+    let mut term: Vec<u32> = index
+        .term_stat(query, prefix != 0)
+        .into_iter()
+        .filter_map(|(text, _)| index.term_id_of(&text))
+        .collect();
+    term.extend_from_slice(index.expansion_of(query));
+    term.sort_unstable();
+    term.dedup();
+
+    let mut plan = Vec::with_capacity(term.len());
+    for id in term {
+        match index_text::posting_span(&h.table, &h.posting_offset, id) {
+            // A zero-length list is a term no document carries: nothing to read, nothing to score.
+            Ok(span) if span.len > 0 => plan.push((id, span)),
+            Ok(_) => {}
+            Err(_) => return u32::MAX,
+        }
+    }
+    let span: Vec<Span> = plan.iter().map(|(_, s)| *s).collect();
+    h.plan = plan;
+    h.write_plan(&span);
+    span.len() as u32
+}
+
+/// Answer `query` from the posting bytes the last [`idx_range_plan_query`] asked for, concatenated
+/// in plan order.
+///
+/// Writes 12-byte hit records into the result buffer -- **replacing the plan** -- and returns the
+/// hit count, or `u32::MAX` on a null handle, a non-UTF-8 query, a buffer whose length does not
+/// match the plan, an image that fails to assemble, or a plan this query has outrun.
+///
+/// The hits are the hits a full [`idx_open`] of the same file would return, and that is checked
+/// rather than assumed: the assembled index is asked which terms it would scan, and any term the
+/// host did not fetch aborts with the sentinel instead of scoring against a term set missing a
+/// list. See this section's header for the one case that can arise.
+///
+/// # Safety
+/// `rh` must be a live handle; `q` readable for `q_len` bytes; `ptr` readable for `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn idx_range_search(
+    rh: *mut RangeHandle,
+    q: *const u8,
+    q_len: usize,
+    k: u32,
+    prefix: u32,
+    ptr: *const u8,
+    len: usize,
+) -> u32 {
+    let Some(h) = rh.as_mut() else { return u32::MAX };
+    if q.is_null() || (ptr.is_null() && len != 0) {
+        return u32::MAX;
+    }
+    let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
+        return u32::MAX;
+    };
+    if h.resident.is_none() {
+        return u32::MAX;
+    }
+    let want: u64 = h.plan.iter().map(|(_, s)| s.len).sum();
+    if want != len as u64 {
+        return u32::MAX;
+    }
+    let posting = if len == 0 { Vec::new() } else { std::slice::from_raw_parts(ptr, len).to_vec() };
+    let (narrow_posting, offset_array) = h.narrow(&posting);
+    let Some(index) = h.open_image(narrow_posting, offset_array) else { return u32::MAX };
+
+    // The verification. `term_stat` is the expansion `plan_stat` runs for the real search, so a
+    // term it names that nothing fetched is a plan that no longer describes this query.
+    for (text, _) in index.term_stat(query, prefix != 0) {
+        let Some(id) = index.term_id_of(&text) else { return u32::MAX };
+        // A term with no postings in the FILE either: nothing was owed for it.
+        if index_text::posting_span(&h.table, &h.posting_offset, id).is_ok_and(|s| s.len == 0) {
+            continue;
+        }
+        if h.plan.binary_search_by_key(&id, |(t, _)| *t).is_err() {
+            return u32::MAX;
+        }
+    }
+
+    let hit = if prefix != 0 {
+        index.search_prefix(query, k as usize)
+    } else {
+        index.search(query, k as usize)
+    };
+    write_hit(&mut h.result, &hit);
+    hit.len() as u32
+}
+
+/// Documents in the file `rh` was opened from, or 0 before [`idx_range_load`].
+///
+/// # Safety
+/// `rh` must be null or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn idx_range_doc_count(rh: *const RangeHandle) -> u32 {
+    rh.as_ref().and_then(|h| h.resident.as_ref()).map_or(0, |x| x.doc_count() as u32)
+}
+
+/// Distinct terms in the file `rh` was opened from, or 0 before [`idx_range_load`]. Known from the
+/// posting-offset array alone, without a single posting byte.
+///
+/// # Safety
+/// `rh` must be null or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn idx_range_term_count(rh: *const RangeHandle) -> u32 {
+    rh.as_ref().map_or(0, |h| h.term_count as u32)
+}
+
+/// The last plan or the last result, whichever was written most recently. Invalidated by the next
+/// call on this handle.
+///
+/// # Safety
+/// `rh` must be null or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn idx_range_result_ptr(rh: *const RangeHandle) -> *const u8 {
+    match rh.as_ref() {
+        Some(h) => h.result.as_ptr(),
+        None => std::ptr::null(),
+    }
+}
+
+/// Length in bytes of what [`idx_range_result_ptr`] points at, or 0 for a null handle.
+///
+/// # Safety
+/// `rh` must be null or a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn idx_range_result_len(rh: *const RangeHandle) -> usize {
+    rh.as_ref().map_or(0, |h| h.result.len())
+}
+
+/// Release a range handle. Nothing else frees it.
+///
+/// # Safety
+/// `rh` must have come from [`idx_range_open`] and must not be used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn idx_range_close(rh: *mut RangeHandle) {
+    if !rh.is_null() {
+        drop(Box::from_raw(rh));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1904,7 +2400,7 @@ mod tests {
     /// Exercise the ABI exactly as a host would: alloc, copy in, open, search, read, free.
     #[test]
     fn the_abi_round_trips_a_query() {
-        assert_eq!(idx_abi_version(), 13);
+        assert_eq!(idx_abi_version(), 14);
         let bytes = blob();
         unsafe {
             let p = idx_alloc(bytes.len());
@@ -2346,6 +2842,221 @@ mod tests {
                 }
                 idx_free(p, cut);
             }
+        }
+    }
+
+    // ---- The range tier ------------------------------------------------------------------------
+
+    /// A host that owns a FILE and can only read slices of it — the shape a sync access handle
+    /// gives an OPFS worker. It COUNTS what it hands over, because "materially less than the whole
+    /// file" is the claim being made and an uncounted claim is a vibe.
+    struct RangeHost {
+        file: Vec<u8>,
+        read_byte: usize,
+    }
+
+    impl RangeHost {
+        fn read(&mut self, at: u64, len: u64) -> Vec<u8> {
+            self.read_byte += len as usize;
+            self.file[at as usize..(at + len) as usize].to_vec()
+        }
+    }
+
+    /// Decode the `(offset, len)` records the module last wrote.
+    unsafe fn plan_of(rh: *mut RangeHandle, n: u32) -> Vec<(u64, u64)> {
+        assert_ne!(n, u32::MAX, "a plan must not fail");
+        let bytes = std::slice::from_raw_parts(idx_range_result_ptr(rh), idx_range_result_len(rh));
+        assert_eq!(bytes.len(), n as usize * SPAN_BYTE);
+        bytes
+            .chunks_exact(SPAN_BYTE)
+            .map(|c| {
+                (
+                    u64::from_le_bytes(c[..8].try_into().unwrap()),
+                    u64::from_le_bytes(c[8..].try_into().unwrap()),
+                )
+            })
+            .collect()
+    }
+
+    /// Open a range handle the way a host must: 296 bytes, then the resident plan, then nothing.
+    unsafe fn range_open(host: &mut RangeHost) -> *mut RangeHandle {
+        let head = host.read(0, idx_range_head_byte() as u64);
+        let rh = idx_range_open(head.as_ptr(), head.len());
+        assert!(!rh.is_null(), "296 bytes must be enough to open");
+        let n = idx_range_plan(rh);
+        let mut buf = Vec::new();
+        for (at, len) in plan_of(rh, n) {
+            buf.extend_from_slice(&host.read(at, len));
+        }
+        assert_eq!(idx_range_load(rh, buf.as_ptr(), buf.len()), 1, "resident sections must load");
+        rh
+    }
+
+    /// Plan a query, fetch exactly its spans, search. Returns the raw hit records.
+    unsafe fn range_search(host: &mut RangeHost, rh: *mut RangeHandle, q: &str, k: u32) -> Vec<u8> {
+        let n = idx_range_plan_query(rh, q.as_ptr(), q.len(), 0);
+        let mut buf = Vec::new();
+        for (at, len) in plan_of(rh, n) {
+            buf.extend_from_slice(&host.read(at, len));
+        }
+        let hit = idx_range_search(rh, q.as_ptr(), q.len(), k, 0, buf.as_ptr(), buf.len());
+        assert_ne!(hit, u32::MAX, "range search of {q:?} must not fail");
+        std::slice::from_raw_parts(idx_range_result_ptr(rh), idx_range_result_len(rh)).to_vec()
+    }
+
+    /// A corpus big enough that the posting section is the bulk of the file, which is the whole
+    /// premise: the sections a range open skips have to be worth skipping.
+    fn corpus_blob() -> Vec<u8> {
+        let brand = ["Colgate", "Nescafe", "Bear Brand", "Lucky Me", "Oral B", "Milo", "Argentina"];
+        let kind = ["Toothpaste", "Coffee", "Powdered Milk", "Instant Noodle", "Corned Beef"];
+        let note = ["Charcoal", "Classic", "Reseal", "Fortified", "Original", "Advanced", "Pro"];
+        let mut b = IndexBuilder::new(Schema::new(vec![
+            Field::new("name", 3.0, 0.4),
+            Field::new("detail", 1.0, 0.6),
+        ]));
+        for i in 0..600usize {
+            let name = format!(
+                "{} {} {} {}g",
+                brand[i % brand.len()],
+                kind[i % kind.len()],
+                note[i % note.len()],
+                50 + (i % 40) * 5
+            );
+            let detail = format!("sku {i} {} variant {}", note[(i + 3) % note.len()], i % 17);
+            b.add(&Doc::new([name, detail]));
+        }
+        b.build().unwrap().to_bytes()
+    }
+
+    /// The claim `p68` left open: answer a real query having read materially less than the file.
+    #[test]
+    fn a_range_query_answers_from_a_fraction_of_the_file() {
+        let file = corpus_blob();
+        let mut host = RangeHost { file: file.clone(), read_byte: 0 };
+        unsafe {
+            let rh = range_open(&mut host);
+            let after_open = host.read_byte;
+            assert_eq!(idx_range_doc_count(rh), 600);
+            assert!(idx_range_term_count(rh) > 0);
+
+            let hit = range_search(&mut host, rh, "colgate charcoal", 10);
+            assert!(!hit.is_empty(), "the range path must actually answer");
+
+            assert!(
+                host.read_byte < file.len(),
+                "read {} of {} bytes — the range path read the whole file",
+                host.read_byte,
+                file.len()
+            );
+            // The posting section is the bulk, so skipping it must be worth a clear majority.
+            assert!(
+                host.read_byte * 2 < file.len(),
+                "read {} of {} bytes, which is not materially less",
+                host.read_byte,
+                file.len()
+            );
+            assert!(after_open < host.read_byte, "the query must read something of its own");
+            idx_range_close(rh);
+        }
+    }
+
+    /// Same hits, same order, same scores as a full `idx_open` — byte for byte. A cheaper answer
+    /// that is a DIFFERENT answer is not a cheaper answer.
+    #[test]
+    fn a_range_query_matches_a_full_open_byte_for_byte() {
+        let file = corpus_blob();
+        unsafe {
+            let p = idx_alloc(file.len());
+            std::ptr::copy_nonoverlapping(file.as_ptr(), p, file.len());
+            let full = idx_open(p, file.len());
+            idx_free(p, file.len());
+            assert!(!full.is_null());
+
+            let mut host = RangeHost { file: file.clone(), read_byte: 0 };
+            let rh = range_open(&mut host);
+
+            for q in [
+                "colgate",
+                "colgaye",          // a typo, so the plan must cover the fuzzy expansion
+                "nescafe classic",  // two tokens
+                "bearbrand",        // a compound split
+                "powdered milk 200g",
+                "zzzznothing",      // nothing in the dictionary at all
+            ] {
+                let want = {
+                    let n = idx_search(full, q.as_ptr(), q.len(), 10, 0);
+                    assert_ne!(n, u32::MAX);
+                    std::slice::from_raw_parts(idx_result_ptr(full), idx_result_len(full)).to_vec()
+                };
+                let got = range_search(&mut host, rh, q, 10);
+                assert_eq!(got, want, "range and full answers disagree for {q:?}");
+            }
+            idx_range_close(rh);
+            idx_close(full);
+        }
+    }
+
+    /// The 296 bytes are the property the whole tier rests on, and `format.rs` owns the real
+    /// number — so it is asserted against `read_section_table`, not against itself.
+    #[test]
+    fn the_layout_of_any_index_costs_296_bytes() {
+        assert_eq!(idx_range_head_byte(), 296);
+        assert_eq!(idx_range_span_byte(), 16);
+        let file = corpus_blob();
+        let head = idx_range_head_byte() as usize;
+        assert!(index_text::read_section_table(&file[..head]).is_ok());
+        assert!(
+            index_text::read_section_table(&file[..head - 1]).is_err(),
+            "296 must be the MINIMUM, or this constant has drifted from format.rs"
+        );
+        unsafe {
+            let rh = idx_range_open(file.as_ptr(), head - 1);
+            assert!(rh.is_null(), "a short head must be refused, not guessed at");
+        }
+    }
+
+    /// Every range entry point, given every bad input a host can produce. Nothing may trap.
+    #[test]
+    fn range_bad_input_returns_sentinels_rather_than_trapping() {
+        let file = corpus_blob();
+        unsafe {
+            assert!(idx_range_open(std::ptr::null(), 296).is_null());
+            assert!(idx_range_open(file.as_ptr(), 8).is_null());
+            assert!(idx_range_open(b"garbage!garbage!".as_ptr(), 16).is_null());
+            assert_eq!(idx_range_plan(std::ptr::null_mut()), u32::MAX);
+            assert_eq!(idx_range_load(std::ptr::null_mut(), file.as_ptr(), 4), 0);
+            assert_eq!(idx_range_plan_query(std::ptr::null_mut(), b"x".as_ptr(), 1, 0), u32::MAX);
+            assert_eq!(
+                idx_range_search(std::ptr::null_mut(), b"x".as_ptr(), 1, 5, 0, file.as_ptr(), 1),
+                u32::MAX
+            );
+            assert_eq!(idx_range_doc_count(std::ptr::null()), 0);
+            assert_eq!(idx_range_term_count(std::ptr::null()), 0);
+            assert_eq!(idx_range_result_len(std::ptr::null()), 0);
+            assert!(idx_range_result_ptr(std::ptr::null()).is_null());
+            idx_range_close(std::ptr::null_mut());
+
+            // A live handle, then every way a host can get the second phase wrong.
+            let rh = idx_range_open(file.as_ptr(), file.len());
+            assert!(!rh.is_null());
+            assert_eq!(idx_range_doc_count(rh), 0, "nothing is loaded yet");
+            assert_eq!(idx_range_plan_query(rh, b"x".as_ptr(), 1, 0), u32::MAX, "not loaded");
+            assert_eq!(idx_range_load(rh, file.as_ptr(), 3), 0, "a short resident buffer");
+            assert_eq!(idx_range_load(rh, std::ptr::null(), 0), 0);
+
+            let mut host = RangeHost { file: file.clone(), read_byte: 0 };
+            let rh2 = range_open(&mut host);
+            let q = b"colgate";
+            assert_ne!(idx_range_plan_query(rh2, q.as_ptr(), q.len(), 0), u32::MAX);
+            // The plan said N bytes; hand over the wrong number and get a sentinel, not a guess.
+            assert_eq!(
+                idx_range_search(rh2, q.as_ptr(), q.len(), 10, 0, file.as_ptr(), 7),
+                u32::MAX
+            );
+            let bad = [0xffu8, 0xfe];
+            assert_eq!(idx_range_plan_query(rh2, bad.as_ptr(), 2, 0), u32::MAX);
+            idx_range_close(rh);
+            idx_range_close(rh2);
         }
     }
 }

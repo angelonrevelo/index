@@ -1115,7 +1115,7 @@ def main() -> int:
         if not ok:
             failed += 1
 
-    check(lib.idx_abi_version() == 13, "ABI version is 13")
+    check(lib.idx_abi_version() == 14, "ABI version is 14")
 
     with Index.build(lib, [("name", 3, 0.4), ("brand", 1, 0.6)], ROW) as idx:
         check(idx.doc_count == len(ROW), "doc_count matches what was added")
