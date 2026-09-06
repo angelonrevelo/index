@@ -1,0 +1,123 @@
+target	status	table	est_rows	indexed	terms	bytes	ms	probe	hits	typo	typo_hits
+bygelo/presyo	OK	raw_product	4524754	120000	135183	15295150	6540	Pringles	10	Pringlse
+bygelo/sisia	OK	tramigo_position	1807599	120000	120012	7520346	6381	261188200	1	261188200
+bygelo/profstopick	OK	schedule_slot	47069	47069	47077	4708635	2015	ONSITE	10	ONSIET
+bygelo/blead	SKIP	no text table over 30 rows				
+bygelo/blead_scraper	OK	school	4145	4145	38992	3562189	3139	Maximo	2	Maxiom
+bygelo/tripi	OK	place_ingest	1039691	120000	604232	28553528	10925	fbdbdaaf	1	fbdbdafa
+bygelo/wheresthefx	OK	source_post	5881	5881	37074	4329452	6329	instagram	10	instagrma
+bygelo/wheresthefx_v2	OK	source_post	6976	6976	14898	1066044	3288	DawtPcIkdTi	1	DawtPcIkdiT
+bygelo/joanna	SKIP	no text table over 30 rows				
+bygelo/kent	OK	message	218	251	4400	302787	2853	adjusts	10	adjusst
+bygelo/benchmark	OK	fetch_log	151971	120000	160678	27589188	14545	rappler	10	rapplre
+bygelo/aisis_proxy	SKIP	no text table over 30 rows				
+bygelo/profstopick_old	OK	section	12614	12614	13534	1070475	3350	2025	1	2052
+aipo/tna	OK	admin_audit	347828	120000	120026	6878657	2925	13462	1	13426
+aipo/tna_rescue_0825	OK	admin_audit	351499	120000	120025	6879540	2609	13708	1	13780
+advo/advo	OK	corpus_fact	839	825	4917	384777	1543	client	10	clietn
+advo/fourlinq	OK	analytics	12762	13628	16454	1327848	1902	xoewmn	0	xoewnm
+geldan-pc/life	OK	life_record	797536	120000	538451	115926470	37844	progress	10	progress
+geldan-pc/advo	OK	notification	4700	5102	5230	484282	711	Notification	10	Notificatino
+geldan-pc/blueos	OK	schema_migration	59	59	199	12999	417	kernel	8	kernle
+geldan-pc/mercial	OK	core_engine_version	34	34	804	38766	426	research	3	researhc
+geldan-pc/landas	OK	landas_candidate	577	577	846	75118	503	antler	2	antlre
+geldan-pc/sideout	OK	session	1793	1793	7661	476289	454	Sunday	1	Sundya
+geldan-pc/tna	OK	server_error	459	499	637	87203	573	persistence	10	persistenec
+geldan-pc/tripi	OK	member	210	233	806	45316	422	Juancho	7	Juancoh
+geldan-pc/presyo_full	OK	product_alias	295896	120000	146768	17914097	3392	Sisters	10	Sistesr
+geldan-pc/presyo_scrape	SKIP	no text table over 30 rows				
+geldan-pc/roundrobbin	OK	sales_order	1536	1566	8144	398025	507	oversell	10	oversell
+geldan-pc/wheresthefx_dev	OK	event	2228	2234	8847	769440	498	Textured	1	Texturde
+geldan-pc/core_smoke	OK	core_artifact	143	144	1205	110220	414	assessor	10	assessro
+mac:blueos-db:blueos/blueos	OK	audit_log	2808	3024	14843	986686	718	finance	10	finanec
+mac:biasd-postgres-1:biasd/biasd	OK	article	27605	27735	118535	10258191	2931	welcomes	10	welcomse
+mac:ptp-pg:ptp/profstopick	OK	comment	42822	42823	87894	23570512	5595	Bulaque	10	Bulaqeu
+mac:akonga:postgres/akonga	SKIP	no text table over 30 rows				
+mac:easyticket-postgres:postgres/easyticket	OK	showtime	3503	3503	11496	780876	813	Unknown	10	Unknonw
+mac:fourlinq:postgres/fourlinq	SKIP	no text table over 30 rows				
+mac:fourlinq:postgres/chinook	OK	track	3503	3503	8379	468765	677	Salute	1	Saluet
+mac:fourlinq:postgres/mirror_advo	SKIP	no text table over 30 rows				
+mac:fourlinq:postgres/school_test	SKIP	no text table over 30 rows				
+/c/Users/maran/Code/alec/aceit_dump/aceit.sqlite	OK	questions	12355	12355	29221	3162784	410	tamang	9	tamagn
+/c/Users/maran/Code/alec/anycase_dump/anycase.sqlite	SKIP								
+/c/Users/maran/Code/alec/biyahe_dump/biyahe.sqlite	OK	stop	1622	1622	3744	327778	176	Diamond	1	Diamodn
+/c/Users/maran/Code/alec/calculai_dump/calculai.sqlite	OK	questions	1274	1274	1282	93761	141	the	0	teh
+/c/Users/maran/Code/alec/expressway_dump/expressway.sqlite	OK	asset_candidate	271014	120000	123164	38408546	2777	qyjzqzqqjimittltttph	10	qyjzqzqqjimittlttthp
+/c/Users/maran/Code/alec/mrt_dump/mrt_lrt.sqlite	OK	fares	1757	1757	77	142477	162	the	0	teh
+/c/Users/maran/Code/alec/ooh_dump/ooh.sqlite	OK	billboards	1986	1986	4150	157525	175	Commonwealth	10	Commonwealht
+/c/Users/maran/Code/alec/orki_dump/orki.sqlite	OK	questions	1720	1720	163	156255	157	Detection	10	Detectino
+/c/Users/maran/Code/alec/orki_dump/orki_full.sqlite	OK	questions	1720	1720	7614	582554	214	Detection	10	Detectino
+/c/Users/maran/Code/alec/tarakape_dump/tarakape.sqlite	OK	api_cafe_photo	27711	27711	168726	9141810	903	the	0	teh
+/c/Users/maran/Code/alec/timekeep_dump/timekeep.sqlite	OK	qry_update	53611	53611	154020	16913888	1288	the	10	teh
+/c/Users/maran/Code/alec/tourguide_dump/tourguide.sqlite	OK	tbl_spot_category	692	692	692	30663	153	the	0	teh
+/c/Users/maran/Code/alec/ukay_dump/ukay.sqlite	OK	tbl_address_barangay	1577	1577	2020	111794	197	Alegria	1	Alegrai
+/c/Users/maran/Code/alexi/audit/dumps/alexi.life.sqlite	OK	link	366	366	536	44816	163	canteen	10	cantene
+/c/Users/maran/Code/alexi/audit/dumps/axie.alexi.life.sqlite	OK	link	2966	2966	3084	311538	216	components	10	componenst
+/c/Users/maran/Code/alexi/audit/dumps/budget.alexi.life.sqlite	SKIP								
+/c/Users/maran/Code/alexi/audit/dumps/coa.alexi.life.sqlite	SKIP								
+/c/Users/maran/Code/alexi/audit/dumps/cv.alexi.life.sqlite	SKIP								
+/c/Users/maran/Code/alexi/audit/dumps/discord.alexi.life.sqlite	SKIP								
+/c/Users/maran/Code/alexi/audit/dumps/draw.alexi.life.sqlite	SKIP								
+/c/Users/maran/Code/alexi/audit/dumps/flow.alexi.life.sqlite	SKIP								
+/c/Users/maran/Code/alexi/audit/dumps/old.alexi.life.sqlite	SKIP								
+/c/Users/maran/Code/alexi/audit/dumps/qpi.alexi.life.sqlite	OK	program	461	461	327	97272	188	PanFil	5	PanFli
+/c/Users/maran/Code/alexi/audit/dumps/sasis.alexi.life.sqlite	SKIP								
+/c/Users/maran/Code/alexi/audit/dumps/schedule.alexi.life.sqlite	OK	curriculum_course	17048	17048	18259	2630378	313	APPRECIATION	10	APPRECIATINO
+/c/Users/maran/Code/alexi/audit/dumps/sharespace.alexi.life.sqlite	SKIP								
+/c/Users/maran/Code/alexi/audit/dumps/tuition.alexi.life.sqlite	OK	program_option	448	448	771	98811	170	BACHELOR	10	BACHELRO
+/c/Users/maran/Code/blead/data/fb-group-sisia-shard1.db	OK	batch_progress	2556	2556	7028	676556	221	ABACAN	2	ABACNA
+/c/Users/maran/Code/blead/data/fb-group-sisia-shard2.db	OK	comment_pool	906	906	3869	423564	199	TINNAH	10	TINNHA
+/c/Users/maran/Code/blead/data/fb-group-sisia-shard3.db	OK	comment_pool	758	758	4515	555112	209	Ericka	10	Ericak
+/c/Users/maran/Code/blead/data/fb-group-sisia.db	OK	batch_progress	1917	1917	6390	530135	204	ABACAN	1	ABACNA
+/c/Users/maran/Code/blead/data/lead-store.db	OK	lead	30687	30687	94767	14168984	1290	BAGUIO	10	BAGUOI
+/c/Users/maran/Code/blead/data/persistent-cache.db	SKIP								
+/c/Users/maran/Code/blead/output/debug-run/backup-2026-09-03T20-56-17-prof50.db	OK	comment_pool	841	841	3633	399345	187	TINNAH	10	TINNHA
+/c/Users/maran/Code/blead/output/debug-run/backup-2026-09-03T21-41-36-prof50.db	OK	comment_pool	711	711	4336	422548	189	Ericka	10	Ericak
+/c/Users/maran/Code/blead/output/debug-run/backup-2026-09-03T21-42-10-prof50.db	OK	batch_progress	2556	2556	7028	676568	214	ABACAN	2	ABACNA
+/c/Users/maran/Code/blead/output/debug-run/backup-2026-09-03T23-41-26-prof100.db	OK	batch_progress	2556	2556	7028	676568	199	ABACAN	2	ABACNA
+/c/Users/maran/Code/claucky/claucky.db	SKIP								
+/c/Users/maran/Code/hobbycat/db/hobbycat.db	SKIP								
+/c/Users/maran/Code/hobbycat/db/verify.db	SKIP								
+/c/Users/maran/Code/notask/data/cdp-profile/first_party_sets.db	OK	public_sets	313	313	319	35110	137	the	0	teh
+/c/Users/maran/Code/orsem-tara/apps/api/db.sqlite3	OK	audit_auditevent	143	143	323	18360	158	the	2	teh
+/c/Users/maran/Code/ratebot/data/ratebot.db	OK	evidence	2011	2011	15016	1790535	278	Cyberpunk	10	Cyberpukn
+/c/Users/maran/Code/trin/data/test-storage-legacy.sqlite	SKIP								
+/c/Users/maran/Code/trin/data/trin-ateneo-sample.sqlite	OK	candidates	50	50	504	42796	145	course	10	coures
+/c/Users/maran/Code/trin/data/trin.sqlite	OK	candidates	2652	2652	17642	3788191	443	ventures	10	venturse
+/c/Users/maran/Code/wheresthefx/data/ig-events.db	OK	ig_post	5652	5652	35971	3887679	451	Textured	1	Texturde
+/c/Users/maran/Code/_data/phone-photos/database/Photos.sqlite	OK	ZSCENECLASSIFICATION	4986566	120000	120000	5832880	496	the	0	teh
+mac:agos/agos.db	OK	results	14624	14624	14657	1521907	481	the	0	teh
+mac:alec/aceit_dump/aceit.sqlite	OK	questions	12355	12355	29221	3162784	788	tamang	9	tamagn
+mac:alec/anycase_dump/anycase.sqlite	SKIP								
+mac:alec/biyahe_dump/biyahe.sqlite	OK	stop	1622	1622	3744	327778	401	Diamond	1	Diamodn
+mac:alec/calculai_dump/calculai.sqlite	OK	questions	1274	1274	1282	93761	435	the	0	teh
+mac:alec/expressway_dump/expressway.sqlite	OK	asset_candidate	271014	120000	123164	38408546	5232	qyjzqzqqjimittltttph	10	qyjzqzqqjimittlttthp
+mac:alec/mrt_dump/mrt_lrt.sqlite	OK	fares	1757	1757	77	142477	360	single	10	singel
+mac:alec/ooh_dump/ooh.sqlite	OK	billboards	1986	1986	4150	157525	369	Commonwealth	10	Commonwealht
+mac:alec/orki_dump/orki.sqlite	OK	questions	1720	1720	163	156255	377	Detection	10	Detectino
+mac:alec/orki_dump/orki_full.sqlite	OK	questions	1720	1720	7614	582554	547	Detection	10	Detectino
+mac:alec/tarakape_dump/tarakape.sqlite	SKIP								
+mac:alec/timekeep_dump/timekeep.sqlite	OK	qry_update	82258	82258	235606	26075991	3694	xoqztgtktddoqyqtlcms	10	xoqztgtktddoqyqtlcsm
+mac:alec/tourguide_dump/tourguide.sqlite	OK	tbl_spot_category	692	692	692	30663	369	the	0	teh
+mac:alec/ukay_dump/ukay.sqlite	OK	tbl_address_barangay	1577	1577	2020	111794	569	Alegria	1	Alegrai
+mac:blead/data/lead-store.db	SKIP								
+mac:blead/data/persistent-cache.db	SKIP								
+mac:blead/data/school-crm.db	OK	school	60922	60922	258004	13599468	4037	Apaleng	1	Apalegn
+mac:class/data/class.db	SKIP								
+mac:claude-workspace/untitled folder/data/fb-group-sisia.db	OK	batch_progress	19068	19068	23559	5045346	1578	ABACAN	10	ABACNA
+mac:crs/data/crs.db	SKIP								
+mac:delisted/app/api/delisted.db	SKIP								
+mac:freedomwall/data/fw.db	OK	miss	1221	1221	1285	148213	496	the	0	teh
+mac:gcash/data/roundrobin.sqlite	SKIP								
+mac:orsem-tara/apps/api/db.sqlite3	OK	audit_auditevent	143	143	323	18360	356	campus	10	campsu
+mac:pingfree/data/pingfree.db	SKIP								
+mac:praud/data/praud.db	SKIP								
+mac:ruppscraper/ruppscraper.db	SKIP								
+mac:sis-scraper/data/curriculum.db	OK	curriculum_course	3685	3685	3687	341831	365	the	0	teh
+mac:sisia-app/data/feedback.db	SKIP								
+mac:sisia-app/data/sisia.db	SKIP								
+mac:sisia-app/sisia.db	OK	class_section_snapshot	2367106	120000	120092	11329902	1361	the	0	teh
+mac:timekeep.tech/server/data/timekeep.db	OK	qry_update	82258	82258	235606	26075991	3545	xoqztgtktddoqyqtlcms	10	xoqztgtktddoqyqtlcsm
+mac:uncover/data/prod/sisia-prod.sqlite	OK	class_section_snapshot	1118863	120000	120071	11175381	1278	the	0	teh
+mac:watchme/watchme.db	OK	media	4045	4045	9809	436013	392	Galaxy	3	Galayx
+mac:worldpool/worldpool.db	OK	proxy	7273	7273	8976	958506	672	MsHvFV	0	MsHvVF

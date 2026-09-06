@@ -1,0 +1,16 @@
+[package]
+name = "index-cli"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Build and maintain a search index from any database, over a pipe."
+
+[[bin]]
+name = "index"
+path = "src/main.rs"
+
+[dependencies]
+# Deliberately the only one. The CSV, TSV and JSON readers are hand-written so that the tool a
+# server runs has no supply chain of its own -- see the module docs in src/json.rs.
+index-text = { path = "../index-text" }
