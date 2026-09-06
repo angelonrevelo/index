@@ -29,7 +29,7 @@ arms are timed **interleaved in one process** rather than compared across runs, 
 
 ## 1. The scaling grid — real documents, real vocabulary
 
-> ### ⚠ This grid was measured before `p69` and `p73`, and both moved it
+> ### ⚠ This grid predates `p69`, `p73`, `p75` and `p79`, all of which moved it
 >
 > The engine has changed underneath these numbers, in the two columns they are read for. Stating it
 > here rather than quietly leaving the table wrong:
@@ -42,9 +42,15 @@ arms are timed **interleaved in one process** rather than compared across runs, 
 >   5,183 → 3,286 us**, at 500 K 5,601 → 5,392 us. The 5 ms bar's crossing point therefore moved
 >   **up** from ~250 K, and the "holds to ~250 K" verdict below is now **conservative** rather than
 >   current.
-> - **`p73` (parallel build) roughly halved the `build` column** — a million recombined documents
->   went 18,436 → 9,732 ms on the `scale` bin, bytes identical. The `build` figures below are
->   single-threaded and are now an upper bound.
+> - **`p73`, `p75` and `p79` together cut the `build` column by ~3.6x.** On the `scale` bin's
+>   million recombined documents, measured on this tree: **18,436 → 5,166 ms**, with the serialized
+>   bytes identical at every rung throughout. `p73` threaded the build, `p75` rewrote the tokenizer
+>   byte-wise, `p79` deleted the per-token allocation. The `build` figures below are single-threaded
+>   pre-`p73` numbers and are now an upper bound by roughly that factor.
+>
+>   *Both figures are a minimum over repeated runs on a workstation running its owner's normal
+>   desktop applications — this machine never presents a genuinely quiet box, and a minimum is the
+>   right estimator when the only available noise adds time.*
 >
 > **Why it is not simply re-run here.** The corpus is a live pull from presyo's `raw_product`;
 > `bench/fixture/presyo-1m.tsv` is not committed. Re-timing it also requires an otherwise-idle box,

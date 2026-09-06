@@ -815,7 +815,10 @@ It measures **0.086 ms per query with zero network calls, ~27x faster than an em
 trip**, and opens a file of any size by reading **296 bytes**. `p56` used `p51`'s 8.29 M real rows to
 settle the scaling question: capacity was never the ceiling — 8 M builds in 84 s at 91 B/doc — but
 **the 5 ms typo bar holds only to ~250 K documents**, so `p7` set it 4x too high rather than the
-engine being 1.7x too slow. [`docs/benchmarks.md`](docs/benchmarks.md) publishes both grids plus the
+engine being 1.7x too slow. **Both halves of that sentence have since improved**: `p69` took bytes
+per document to ~51 and *lowered* the typo tail with them, and `p73`/`p75`/`p79` cut a
+million-document build ~3.6x, so the ~250 K crossing point is now a conservative floor rather than a
+current measurement. [`docs/benchmarks.md`](docs/benchmarks.md) publishes both grids plus the
 staleness contract, which the survey found **no search product publishes at all**. `p67` priced the
 Postgres work: §7.2 turns out two thirds done — all 255 real tables are `REPLICA IDENTITY DEFAULT`
 and `p50`'s state-based design never needs a before-image — but it found **a real bug in `p50`**,
