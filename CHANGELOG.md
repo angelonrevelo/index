@@ -159,6 +159,107 @@ document wants seven columns and `index_text::MAX_FIELD` allows four.
 
 
 
+## p74-p77 — concurrency on both sides, the tokenizer, and a geo bug that answered confidently (2026-09-06)
+
+The second half of the fan-out, after the free-model tier's quota ran out and the remaining lanes
+were relaunched on a different worker. **Every lane was gated here on the real tree**, and in three
+cases that gate caught something the lane could not: two lanes numbered their roadmap doc `p74`
+(already taken, and colliding with each other), and one lane's `pool-audit` had silently run **three
+of six query sets**, because a temp worktree's relative corpus path misses presyo.
+
+### p74 — the query fans across segments
+
+`Searcher` spreads its per-segment pass across OS threads. **Tail-led, and the doc says so**: at 25
+segments the p50 is a wash (1.22x) while the p99 comes down **2.9x**; at 50 segments 2.5x and 2.9x.
+Rungs below the gate run identical code in both arms, which makes them a control rather than a
+result.
+
+The gate is a **work estimate** — `segment_count * doc_count >= 4_500_000` — not a segment count: 50
+segments of 200 documents is fifty times nothing and fifty spawns, and one huge segment cannot be
+split at all. Forcing threads at 10 segments measured 883 → 1,473 us, a **loss**, and the gate
+excludes exactly that rung.
+
+`INDEX_PARALLEL=0` is a kill switch, and it is earned: **under machine contention the threaded path
+is pathological** — a 50-segment p50 of 36,271 us, 4x worse than serial. It is also what a WASM
+build or a server that already owns its core budget wants.
+
+### p75 — the tokenizer, and two suspects the measurement killed
+
+`p73` named this as the next lane. It profiled first, and **the profile killed both mechanisms the
+brief proposed**: "skip re-lowercasing already-lowercase text" is worth **0.004 %** (the corpus is
+97.7 % ASCII but only 3,270 bytes of 86 MB are already lowercase), and "avoid the per-token heap
+allocation" — the obvious suspect — is **170 ms of 6,757, i.e. 2.5 %**.
+
+The cost was two *whole-field* allocations and char-at-a-time scanning. The `Vec<char>` is deleted:
+token text is a contiguous **byte range** of the folded string, which is structural rather than
+incidental, because the only rewrite the split makes is a separator becoming `.` (all one byte, so
+length-preserving) and both lookarounds are `is_ascii_digit`, which no multi-byte character can
+satisfy.
+
+**Analyzer 6,757 → 3,642 ms. With `p73`, a million-document build has gone 18,436 → ~5,478 ms — 3.4x
+— with the serialized bytes unchanged throughout.**
+
+The token stream is *proven* unmoved rather than assumed: the pre-change functions are copied
+**verbatim** into a `mod legacy` and asserted equal over 54 cases — combining and precomposed
+accents, six non-Latin scripts, emoji with regional indicators, a 100,000-character mixed-script
+field, and **every ASCII byte 0..127**.
+
+### p76 — `index-core` primitives, and a main hypothesis that failed
+
+First, a fact the crate had never stated: **`index-core` is an unused research crate.** Nothing in
+`index-text`, `index-geo`, `index-image`, `index-cli` or `index-wasm` links it; only `index-bench`
+does. That makes its numbers the only thing it produces, so every structural choice in it has to be
+measured rather than plausible. Four were not.
+
+- **The wavelet documented `n·H₀` and delivered `n·log σ`.** Huffman-shaped over the present
+  alphabet: FM bits/char on Zipf text **12.350 → 8.417** and **12.165 → 6.631**, −32 % to −46 %. The
+  before column barely moves with entropy; the after column tracks H₀.
+- Suffix array O(n log²n) → O(n log n): **2.0–3.6x** build.
+- Rank directory packed to `{u32, u32}` per 256 bits: speed-neutral, **1.25 bits stored per payload
+  bit instead of 1.50**.
+- **The lane's own main hypothesis failed**: interleaving the rank directory into a 64-byte cache
+  line is **2x slower at every size** (32 KiB 5.82 → 15.23 ns/rank), because `i / 448` sits on the
+  dependency chain of every rank and the side directory was never actually missing. Reverted, and
+  recorded.
+
+### p77 — the geo tier: a correctness bug, a 24x build, and a conclusion overturned
+
+**The bug is worth more than the speedups.** `segment_cell` casts with `(v.floor() as i64)`, and
+**Rust saturates a NaN cast to 0**. A segment meeting a NaN vertex rasterizes into column 0, the
+cells it really crosses are never marked boundary, the interior fill claims them, and they then
+answer with a stored polygon id **having run no geometry at all** — no error, no signal. Measured:
+NaN and `NEG_INFINITY` each produced **300 disagreements over 40,401 probes**; `INFINITY` produced 0
+purely by luck, saturating the other way. `geo_build` is documented as parsing network data.
+
+**A published conclusion is overturned.** `p9` concluded over-fetch was *"dominated by point
+clustering rather than by cover coarseness"*. Wrong — the cover kept pending cells on a **stack** and
+emitted whatever was on it when the budget ran out. Best-first splitting gives **16.46x → 1.14x
+over-fetch at the same budget, with fewer ranges, at identical 100 % recall.** It also corrects the
+Hilbert story: over-fetch is now equal between curves, so Hilbert's entire advantage is 1.8x fewer
+ranges — fewer HTTP range requests, not a locality claim. `p9` and `p10` carry supersede notes.
+
+Build **7,002 → 285 ms (24.6x)** with every cell count and interior/boundary split byte-identical.
+Memory 323 KB and 8,077 allocations → **143 KB and zero**. New: `polygon_in_view`, and
+`to_bytes`/`from_bytes` in the same section-table shape as `index-text`, which is what `p68`/`p72`
+need to reach this tier.
+
+### Honest gaps
+
+- **Every speedup in `p73`–`p77` is the lane's own, taken uncontended before merge.** Correctness was
+  verified here in every case — tests, `pool-audit` 6/6, byte-identity — but the *timings* could not
+  be, because three to four build-heavy agents held cores throughout. **One re-run on an idle box is
+  owed**, covering these and the `docs/benchmarks.md` grid together.
+- **The repo asserts two spawn costs that differ ~6x** — `p73` measured `thread::scope` at ~87 us per
+  thread, `p74` at ~550 us for a one-thread scope, on the same machine. Both thresholds stay safe
+  under either reading, but one measurement should settle it.
+- **`p74` and `p73` were measured separately and now compose.** A process that builds and queries
+  concurrently can oversubscribe in a way neither lane measured alone.
+- **`index-geo` and `geo_join.rs` are now two implementations of one row-sweep algorithm**, and only
+  the library half has unit tests.
+- **The query at geo's actual operating point did not get faster.** Everything at L=6–8 landed inside
+  the noise; the narrower key pays only at L=10–12, which is not where it runs. Reported as a
+  non-result rather than quietly omitted.
+
 ## p69-p73 — the fan-out: half the bytes, a parser, a range tier, and a build that was mispriced (2026-09-06)
 
 A parallel fan-out across isolated worktrees, part of it on a free non-Anthropic model until that
