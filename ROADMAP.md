@@ -1328,7 +1328,7 @@ caught only by comparing against the independent Rust implementation.
 - **The P5 spike runs on a synthetic corpus.** profstopick's real shard is not committed (only
   `search-index-manifest.json`); generating it needs `DATABASE_URL`. Until then the headline number
   is *representative*, not *actual*.
-- **Still no CI** (open since 2026-06-19), so "green gate" means "green on one Windows box".
+- **CI written, first push pending** — `.github/workflows/ci.yml` now exists (open since 2026-06-19, closed as a file 2026-09-08): clippy `-D warnings`, workspace tests, the wasm32 `index-accel` build, every artifact via `build-wasm.sh`, both JS smokes, the Python ctypes host and the CLI smoke. The browser checks stay out on purpose (they borrow a Playwright checkout a runner cannot assume). Until the first push runs it, "green gate" still means "green on one Windows box" — the file is verified step-by-step locally, which is evidence, not the same thing.
 - **Real SOSD 200M datasets still not downloaded**, so P13 cannot start.
 - **The cross-encoder latency figure is an extrapolation** (267 pairs/s on passages → titles ~10×
   faster). No published CPU-INT8 reranker benchmark exists anywhere — filling that gap is cheap and

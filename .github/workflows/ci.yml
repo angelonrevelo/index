@@ -1,0 +1,68 @@
+# CI — the gate, on a machine that is not this one.
+#
+# Open since 2026-06-19; the ROADMAP's P3 row and this file's own comments (`scripts/build-wasm.sh`
+# says "js/smoke.mjs and CI both read target/wasm32-unknown-unknown/release/"; `scripts/cli-smoke.sh`
+# says "this is the end-to-end version that runs in CI") have been describing this file since before
+# it existed. Until it runs, "green gate" means "green on one Windows box" — the honest gap the
+# ROADMAP carries.
+#
+# What is deliberately NOT here:
+#   - `cargo fmt --check`: the tree is not rustfmt-clean (index-accel), and formatting was never a
+#     gate of this repo. clippy with `-D warnings` is.
+#   - `js/opfs-check.mjs` and `js/browser-check.mjs`: they need a real Chromium via a Playwright
+#     checkout borrowed from a sibling repo, which CI cannot assume. Everything they assert that a
+#     Node host can assert is asserted by smoke.mjs / image-smoke.mjs instead.
+#   - The consumer benches: they read sibling repos (`C:\Users\maran\Code\...`) and corpora that do
+#     not exist on a runner, and the benches skip a missing corpus rather than fail — running them
+#     here would prove nothing.
+#
+# `index-accel` is absent from `default-members` (no_std, wasm32-only), so it is built explicitly
+# for its only target, exactly as the workspace manifest instructs.
+
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: clippy (0 warnings is the gate)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: tests (default-members; index-accel cannot build for the host)
+        run: cargo test --workspace
+
+      - name: analytics kernel builds for its only target
+        run: cargo build --release -p index-accel --target wasm32-unknown-unknown
+
+      - name: build every wasm artifact
+        run: bash scripts/build-wasm.sh
+
+      - name: js host smoke (text engine, shipped artifact)
+        run: node js/smoke.mjs
+
+      - name: js image smoke (image tier, shipped artifact)
+        run: node js/image-smoke.mjs
+
+      - name: native shared library + python host (stdlib ctypes only)
+        run: |
+          cargo build --release -p index-wasm
+          python3 host/python/index_ffi.py
+
+      - name: cli smoke (pipe of rows in, search out)
+        run: bash scripts/cli-smoke.sh

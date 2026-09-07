@@ -22,6 +22,14 @@ for what was deliberately ruled out.
 
 Also noted: `crack::tests::correct_across_limit_settings` alone accounts for ~171 s of the
 `index-core` suite — pre-existing, worth a look some day, unchanged here.
+### Added — CI (2026-09-08)
+
+`.github/workflows/ci.yml` — the P3 row open since 2026-06-19. clippy with `-D warnings` (this
+repo's gate), workspace tests, the explicit wasm32 build `index-accel` needs, every shippable
+artifact through `scripts/build-wasm.sh`, both Node smokes, the Python ctypes host and the CLI
+smoke. Every step was run locally before the file was committed; the browser checks are excluded on
+purpose, with the reason written in the file. Green means nothing until the first push runs it, and
+the ROADMAP's honest-gaps line now says exactly that.
 ### Changed — p82: one expansion per segment, not two (2026-09-08)
 
 `p52` named the recovery and left it: "the first pass could hand its expansion to the second
