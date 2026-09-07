@@ -8,6 +8,20 @@ for what was deliberately ruled out.
 
 ## [Unreleased]
 
+### Added — the two test gaps the honest-gaps list named (2026-09-08)
+
+- **`FmIndex::locate` for an absent pattern.** The contract half `count` had and `locate` did not:
+  a pattern that occurs nowhere returns an EMPTY list, not garbage positions. Asserted for absent
+  single bytes, long patterns, a pattern longer than any text run, and a near-miss whose absence is
+  verified against brute force first — the test asserts locate's honesty, not the corpus's (the
+  first draft got that backwards and its "absent" near-miss genuinely occurred elsewhere).
+- **`PgmIndex` ≡ `PlaIndex` result equivalence.** The recursive PGM is a wrapper around the same
+  leaf PLA, so any key one finds and the other misses is a recursion bug. Compared on every present
+  key across four distributions and three epsilons, and on absent keys probed inside, below and
+  above the range — both must refuse, and refuse the same way.
+
+Also noted: `crack::tests::correct_across_limit_settings` alone accounts for ~171 s of the
+`index-core` suite — pre-existing, worth a look some day, unchanged here.
 ### Changed — p82: one expansion per segment, not two (2026-09-08)
 
 `p52` named the recovery and left it: "the first pass could hand its expansion to the second

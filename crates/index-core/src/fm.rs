@@ -318,6 +318,32 @@ mod tests {
                 (0..=text.len() - len).filter(|&i| &text[i..i + len] == pat).collect();
             assert_eq!(got, want, "locate for len {len}");
         }
+        // The absent-pattern half of the contract, which `count` had and `locate` did not:
+        // a pattern that occurs nowhere returns an EMPTY list, not garbage positions. A
+        // near-miss (one byte substituted) is the case an off-by-one in the backward walk
+        // would most plausibly answer wrongly, and a pattern longer than the text must be
+        // refused without panicking.
+        let absent_probe = |pat: &[u8]| {
+            assert!(
+                fm.locate(pat).is_empty(),
+                "locate answered for an absent pattern {pat:?}"
+            );
+        };
+        absent_probe(&[0xff, 0xfe]);
+        absent_probe(&[9u8]);
+        absent_probe(b"zzzzzz");
+        absent_probe(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); // longer than any gen_text run
+        let mut near_miss = text[1000..1006].to_vec();
+        near_miss[3] = near_miss[3].wrapping_add(1).max(1);
+        // A near-miss may legitimately occur elsewhere in the text, so absence is verified
+        // against brute force before it is asserted — the test asserts locate's honesty, not
+        // the corpus's.
+        let occurs: Vec<usize> = (0..=text.len() - 6)
+            .filter(|&i| &text[i..i + 6] == near_miss.as_slice())
+            .collect();
+        if occurs.is_empty() {
+            absent_probe(&near_miss);
+        }
     }
 
     #[test]

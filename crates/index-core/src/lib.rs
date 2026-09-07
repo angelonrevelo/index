@@ -399,6 +399,50 @@ mod tests {
         assert!(idx.height() >= 2, "expected recursion (height>=2), got {}", idx.height());
     }
 
+    /// The two index structures must agree on every answer, not merely both be self-consistent:
+    /// `PgmIndex` is a recursive wrapper around the same leaf PLA `PlaIndex` builds, so any key one
+    /// finds and the other misses is a recursion bug, and a disagreement on an absent key means one
+    /// structure's last-mile search escaped its error bound. Compared on every present key and on
+    /// absent keys probed inside, below and above the range — the shapes where a bounded window can
+    /// silently clamp to the wrong side.
+    #[test]
+    fn pgm_and_pla_agree_on_every_key_and_on_absent_ones() {
+        for &eps in &[8usize, 32, 64] {
+            for keys in [
+                gen_sequential(20_000),
+                gen_uniform(20_000, 11),
+                gen_lognormal(20_000, 12),
+                gen_hard(20_000, 13),
+            ] {
+                let pla = PlaIndex::build(&keys, eps);
+                let pgm = PgmIndex::build(&keys, eps);
+                for (true_pos, &key) in keys.iter().enumerate() {
+                    let a = pla.search(key);
+                    let b = pgm.search(key);
+                    assert_eq!(a.pos, Some(true_pos), "pla missed key {key}");
+                    assert_eq!(b.pos, Some(true_pos), "pgm missed key {key}");
+                    assert_eq!(a.pos, b.pos, "pgm/pla disagree on key {key}");
+                }
+                // Absent keys: midpoints between consecutive sampled keys, below the minimum and
+                // above the maximum. Both structures must refuse, and refuse the same way.
+                let mut absent = Vec::new();
+                for w in keys.windows(2) {
+                    let mid = w[0] / 2 + w[1] / 2 + ((w[0] % 2) & (w[1] % 2));
+                    if mid > w[0] && mid < w[1] {
+                        absent.push(mid);
+                    }
+                }
+                absent.push(keys[0].wrapping_sub(1));
+                absent.push(keys[keys.len() - 1].wrapping_add(1));
+                assert!(!absent.is_empty());
+                for key in absent {
+                    assert_eq!(pla.search(key).pos, None, "pla answered for absent {key}");
+                    assert_eq!(pgm.search(key).pos, None, "pgm answered for absent {key}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn missing_keys_return_none_within_bounded_window() {
         let keys = gen_uniform(10_000, 7);
