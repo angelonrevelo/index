@@ -159,6 +159,70 @@ document wants seven columns and `index_text::MAX_FIELD` allows four.
 
 
 
+## p81 — reading the incumbent's source, and finding it had already fixed half of what we claimed (2026-09-07)
+
+A side-by-side comparison page against profstopick's search. Building it required reading their
+**current** matcher rather than the production measurement this repo keeps quoting, and the two no
+longer agree.
+
+### Fixed — a claim this repo had been making that is no longer true
+
+`bench/roadmap/p68-opfs-tier.md` published `name order reversed | miss | hit`, and `README.md`
+attributed profstopick's zero-result rate to *"mostly name-order misses that now resolve."*
+
+**profstopick fixed the name-order half themselves.** `src/lib/search-match.ts` carries a
+backtracking distinct-token assignment — and their own comment cites the 2026-08-17 measurement as
+the reason they added it. Verified against their code, ported line for line into
+`js/profstopick-match.mjs`: `raphael abacan` reaches `ABACAN, RAPHAEL` in *their* matcher, with no
+help from us.
+
+Their matcher also folds diacritics (`pena` → `PEÑA-REYES`) and strips punctuation. It is a good
+typeahead. **What survives as a genuine gap is the misspelling half**, which a prefix/substring
+matcher cannot reach by construction.
+
+### Verified — the headline benchmark table is unaffected
+
+Checked before touching it. `PrefixBaseline` in `real_corpus.rs` requires every query token to match
+somewhere in any order, so it already handles reversed names, and it has no edit distance anywhere.
+The published comparison is a *typo* set, so **engine 99.9 % vs baseline 14.9 % typo hit@10 stands
+unchanged.**
+
+### Two findings about our own side
+
+- **`prefix: true` is not optional.** The first version of the page omitted it, which matches the
+  last token as a complete term and so finds nothing for any half-typed query: `pen` 0 instead of 6,
+  `gar` 0 instead of 10, `cru` 0 instead of 10. That was a demo bug that badly understated the
+  engine.
+- **`index` alone is a downgrade for this typeahead.** Even with prefix on, its fuzzy expansion
+  outranks the obvious prefix hits on short fragments: `pen` leads with `TEH`, `gar` with `GARDON`,
+  `mar` with `BANARIA`, `joh` with `CO, SR. MA. ANICIA`. Their matcher leads correctly on all four.
+
+### Added
+
+- **`js/compare.html`** — profstopick's matcher, `index`, and both merged, running live in one tab
+  on the same 1,322-professor snapshot.
+- **`js/profstopick-match.mjs`** — a line-for-line port of their matcher. A port, not a paraphrase:
+  if it and theirs disagree, this file is wrong.
+- **`js/hybrid.mjs`** — the merge. Literal matches rank above fuzzy ones, because a character the
+  user typed is evidence and an edit the engine guessed is inference. Neither source is re-scored.
+  **Over 16 queries its top result is the better of the two on every one** — the only configuration
+  strictly better than what profstopick ships today.
+
+The two are complementary structurally, not incidentally: **theirs does infix and `index` cannot**
+(`gracia` → `DIVINAGRACIA`; a term dictionary holds that as one token, so no FST walk reaches it,
+and `index` offers `GARCIA` at distance 1 — the wrong professor), while **`index` does typos and
+theirs cannot**.
+
+### Honest gaps
+
+- **The merge is a demo.** Not in CI, no test, only a 16-query check run by hand.
+- **The 40.8 % figure should stop being quoted as a current number.** It measures a matcher that has
+  since changed. Nobody has re-measured profstopick's zero-result rate against their current code,
+  and this repo should not imply otherwise. The measurement remains valid as history and as the
+  reason their fix exists.
+- **`index` cannot do infix.** Not a bug to file but a property to state; reaching `DIVINAGRACIA`
+  from `gracia` needs a suffix automaton or n-gram terms, both of which cost bytes.
+
 ## p78-p80 — the browser payload, the last allocation, and a default that had to be inverted (2026-09-07)
 
 The close of the fan-out, and the point at which the box finally went quiet enough to measure

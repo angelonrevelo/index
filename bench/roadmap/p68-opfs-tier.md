@@ -85,6 +85,13 @@ zero-result**, mostly name-shaped queries whose professor was already in the cor
 | name order reversed | miss | **hit** |
 | one transposition | miss | **hit** |
 
+> **CORRECTED, 2026-09-07.** The `name order reversed` row is **no longer true of profstopick's
+> matcher**, and the `bytes` row predates `p69`. Their `search-match.ts` now carries a backtracking
+> distinct-token assignment that resolves reversed names on its own — read and ported in
+> `js/profstopick-match.mjs`, and verified: `raphael abacan` reaches `ABACAN, RAPHAEL` in *their*
+> code. Only the transposition row still separates the two. The artifact is now 220,470 bytes
+> (8.8 % of the quota). See the `p81` entry in `CHANGELOG.md`.
+
 The page asserts those last two against the real artifact: `RAPHAEL ABACAN,` and `ABACNA, RAPHAEL`
 both resolve to `ABACAN, RAPHAEL`.
 

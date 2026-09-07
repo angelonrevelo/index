@@ -84,9 +84,12 @@ node js/opfs-check.mjs      # a real Chromium, the real artifact
 | bytes read to learn the file's layout | **296** (0.077 % of it) |
 
 It replaces profstopick's 2,505,813-byte JSON shard — **95.6 % of the 5 MB localStorage quota** —
-with **8.8 %** of that, in a quota measured in gigabytes, and fixes the failure that shard caused:
-**109 of 267 real searches returned nothing** in production, mostly name-order misses that now
-resolve.
+with **8.8 %** of that, in a quota measured in gigabytes. Their production instrumentation measured
+**109 of 267 real searches returning nothing** on 2026-08-17, 60 of them name-shaped. **profstopick
+has since fixed the name-order half themselves**, with a backtracking token assignment in their own
+matcher; what an engine with edit distance adds on top is the *misspelling* half, which a
+prefix/substring matcher cannot reach by construction. `js/compare.html` runs both side by side and
+shows each winning where it should.
 
 The 296-byte figure is the point of the section table: a browser can open an index far larger than
 the tab's memory, which is what an object-store cold tier looks like from the client side.
@@ -420,6 +423,9 @@ which the library itself consults. They are documented in [`bench/README.md`](be
 cargo test --workspace              # engine + learned-index invariants + image tier + CLI
 bash scripts/cli-smoke.sh           # the `index` CLI end to end: build, apply, search, over a pipe
 node js/opfs-check.mjs              # the OPFS tier: persists in a real browser, answers offline
+
+python -m http.server 8080          # then open /js/compare.html -- profstopick's real matcher,
+                                    # this engine, and both merged, side by side on one corpus
 
 cargo run -p index-bench --release --bin real-corpus       # THE ENGINE vs production corpora
 
