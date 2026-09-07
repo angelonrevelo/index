@@ -1,0 +1,239 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>profstopick vs index vs both — same corpus, same queries</title>
+<style>
+  :root {
+    --ink: #16181d; --dim: #6b7280; --line: #e3e6ea; --bg: #fbfcfd;
+    --them: #b45309; --them-bg: #fffbeb; --us: #0f766e; --us-bg: #f0fdfa;
+    --mix: #4338ca; --mix-bg: #eef2ff; --miss: #b91c1c; --miss-bg: #fef2f2;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 2rem 1.5rem 4rem; background: var(--bg); color: var(--ink);
+         font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 1240px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin: 0 0 .35rem; letter-spacing: -.02em; }
+  .sub { color: var(--dim); margin: 0 0 1.5rem; }
+  .note { background: #fff; border: 1px solid var(--line); border-left: 3px solid var(--mix);
+          border-radius: 6px; padding: .85rem 1rem; margin: 0 0 1.5rem; font-size: .875rem; }
+  .note p { margin: .5rem 0 0; }
+  .note p:first-child { margin-top: 0; }
+  .bar { display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: .75rem; }
+  .bar button { font: inherit; font-size: .8rem; padding: .35rem .7rem; border: 1px solid var(--line);
+                background: #fff; border-radius: 999px; cursor: pointer; color: var(--ink); }
+  .bar button:hover { border-color: #b9bec6; }
+  .bar button.on { background: var(--ink); color: #fff; border-color: var(--ink); }
+  #q { width: 100%; font: inherit; font-size: 1.05rem; padding: .7rem .9rem; border: 1px solid var(--line);
+       border-radius: 8px; background: #fff; }
+  #q:focus { outline: 2px solid #93c5fd; outline-offset: 1px; }
+  .why { font-size: .85rem; color: var(--dim); margin: .6rem 0 1.25rem; min-height: 1.2em; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
+  @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+  .pane { background: #fff; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .pane header { padding: .7rem .9rem; border-bottom: 1px solid var(--line); }
+  .pane.them header { background: var(--them-bg); }
+  .pane.us header { background: var(--us-bg); }
+  .pane.mix header { background: var(--mix-bg); }
+  .pane.mix { border-color: #c7d2fe; box-shadow: 0 1px 6px rgba(67,56,202,.08); }
+  .pane h2 { margin: 0; font-size: .95rem; }
+  .pane.them h2 { color: var(--them); }
+  .pane.us h2 { color: var(--us); }
+  .pane.mix h2 { color: var(--mix); }
+  .meta { font-size: .75rem; color: var(--dim); margin-top: .15rem; font-variant-numeric: tabular-nums; }
+  ol { margin: 0; padding: .5rem .9rem .9rem 2.1rem; }
+  li { padding: .2rem 0; font-size: .92rem; }
+  .tag { font-size: .66rem; margin-left: .35rem; padding: .05em .35em; border-radius: 3px;
+         background: #f1f3f5; color: var(--dim); }
+  .tag.lit { background: var(--them-bg); color: var(--them); }
+  .tag.fuz { background: var(--us-bg); color: var(--us); }
+  .empty { padding: 1.1rem .9rem; color: var(--miss); background: var(--miss-bg); font-weight: 600; }
+  .verdict { margin: 1rem 0 0; padding: .75rem .9rem; border-radius: 8px; font-size: .9rem;
+             border: 1px solid var(--line); background: #fff; }
+  footer { margin-top: 2.5rem; font-size: .82rem; color: var(--dim); border-top: 1px solid var(--line);
+           padding-top: 1rem; }
+  code { background: #f1f3f5; padding: .08em .35em; border-radius: 3px; font-size: .9em; }
+  .boot { padding: 2rem; text-align: center; color: var(--dim); }
+</style>
+
+<main>
+  <h1>profstopick&rsquo;s search &middot; <code>index</code> &middot; both</h1>
+  <p class="sub">Same 1,322-professor Ateneo registrar snapshot. Same queries. All three running in this tab.</p>
+
+  <div class="note">
+    <p><b>The two are complementary in a way neither can fix by tuning.</b></p>
+    <p><b>Their matcher does infix; <code>index</code> cannot.</b> <code>gracia</code> has to reach
+    <code>DIVINAGRACIA, GERALD G.</code> A term dictionary stores <code>divinagracia</code> as one
+    token, so <code>gracia</code> is neither a prefix of it nor within edit distance — an FST walk
+    can never arrive there. It offers <code>GARCIA</code> at distance 1 instead: a reasonable guess,
+    and the wrong professor.</p>
+    <p><b><code>index</code> does typos; their matcher cannot.</b> <code>ABACNA</code> and
+    <code>ABAAN</code> require the typed characters <i>not</i> to appear in order, which is exactly
+    what all four of their routes require.</p>
+    <p><b>So the third pane runs both</b> and ranks literal matches above fuzzy ones — a character
+    the user typed is evidence, an edit the engine guessed is inference, and inference must not
+    displace evidence. That is <code>index</code>&rsquo;s own internal rule (<code>typo_bucket</code>
+    outranks BM25) applied one level up.</p>
+  </div>
+
+  <div class="bar" id="preset"></div>
+  <input id="q" placeholder="Type a professor's name — or misspell one" autocomplete="off" spellcheck="false">
+  <div class="why" id="why"></div>
+
+  <div class="grid">
+    <section class="pane them">
+      <header><h2>profstopick today</h2><div class="meta" id="them-meta">—</div></header>
+      <div id="them-body"><div class="boot">…</div></div>
+    </section>
+    <section class="pane us">
+      <header><h2>index alone</h2><div class="meta" id="us-meta">—</div></header>
+      <div id="us-body"><div class="boot">loading WASM…</div></div>
+    </section>
+    <section class="pane mix">
+      <header><h2>both, merged</h2><div class="meta" id="mix-meta">—</div></header>
+      <div id="mix-body"><div class="boot">…</div></div>
+    </section>
+  </div>
+
+  <div class="verdict" id="verdict"></div>
+
+  <footer>
+    <p><b>Badges.</b> <span class="tag lit">literal</span> matched characters the user actually
+    typed — their matcher&rsquo;s route. <span class="tag fuz">b<i>N</i></span> is
+    <code>index</code>&rsquo;s typo bucket: <code>b0</code> exact term, <code>b1</code> one edit
+    away, <code>b3</code> matched a different token. Bucket is the primary sort key, so an exact
+    match is never displaced by a fuzzy one.</p>
+    <p><b><code>prefix: true</code> is not optional.</b> Without it <code>index</code> matches the
+    last token as a complete term, so a half-typed query — which is every query until the user stops
+    typing — finds nothing: <code>pen</code> returns 0 instead of 6, <code>gar</code> 0 instead of
+    10. The first version of this page omitted the flag and badly understated the engine.</p>
+    <p><b>Not compared.</b> Their shipped shard also carries 7,911 courses, department sublabels and
+    comment counts, and ranks courses below professors. This corpus is the 1,322-professor snapshot
+    both sides can read, so their sublabel tiers and <code>comment_count</code> tiebreak never fire —
+    with one kind and a constant count they are no-ops, so the order here is exactly theirs.</p>
+    <p><b>Sizes.</b> Their production shard is 2,505,813 bytes of JSON over 11,949 entries, 95.6 % of
+    a 5 MB localStorage quota. This <code>index</code> artifact is 220,470 bytes over 1,322, reached
+    through a 560 KB dependency-free WASM module.</p>
+  </footer>
+</main>
+
+<script type="module">
+import { SearchIndex } from './index.mjs';
+import { fold, matchFolded, TIER_NAME } from './profstopick-match.mjs';
+import { makeHybrid } from './hybrid.mjs';
+
+const PRESET = [
+  { q: 'ABACAN, RAPHAEL', why: 'Exact name. All three nail it — the baseline.' },
+  { q: 'raphael abacan',  why: 'Reversed order. THEIR matcher handles this too, by backtracking token assignment. Not a win for index.' },
+  { q: 'gracia',          why: 'Infix. Only their matcher reaches DIVINAGRACIA; index offers GARCIA at edit distance 1 — the wrong professor. The merge fixes it.' },
+  { q: 'ABACNA, RAPHAEL', why: 'One transposition. A prefix/substring matcher cannot recover from this.' },
+  { q: 'ABAAN',           why: 'One deleted character. The same structural wall.' },
+  { q: 'pen',             why: 'Half-typed. Both handle it — index only because prefix mode is on.' },
+  { q: 'pena',            why: 'Accent folding. Both reach PEÑA-REYES.' },
+];
+
+const el = (id) => document.getElementById(id);
+let folded = null, engine = null, hybrid = null;
+
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+
+function render(side, rows, ms, badge) {
+  el(side + '-meta').textContent =
+    rows.length + ' result' + (rows.length === 1 ? '' : 's') + ' · ' + ms.toFixed(2) + ' ms';
+  const body = el(side + '-body');
+  if (rows.length === 0) { body.innerHTML = '<div class="empty">No results</div>'; return; }
+  body.innerHTML = '<ol>' + rows.map((r) => {
+    const b = badge(r);
+    return '<li>' + esc(r.label) + '<span class="tag ' + b.cls + '">' + esc(b.text) + '</span></li>';
+  }).join('') + '</ol>';
+}
+
+function run(query) {
+  if (!folded || !engine) return;
+  const v = el('verdict');
+  if (query.trim() === '') {
+    for (const s of ['them', 'us', 'mix']) render(s, [], 0, () => ({ cls: '', text: '' }));
+    v.textContent = 'Type a query, or pick one above.';
+    return;
+  }
+
+  const t0 = performance.now();
+  const theirs = matchFolded(folded, query, 10);
+  const t1 = performance.now();
+  const ours = engine.search(query, { k: 10, prefix: true });
+  const t2 = performance.now();
+  const both = hybrid(query, 10);
+  const t3 = performance.now();
+
+  render('them', theirs, t1 - t0, (r) => ({ cls: 'lit', text: TIER_NAME[r.tier] || ('tier ' + r.tier) }));
+  render('us', ours, t2 - t1, (r) => ({ cls: 'fuz', text: 'b' + r.typoBucket }));
+  render('mix', both, t3 - t2, (r) => r.from === 'literal'
+    ? { cls: 'lit', text: 'literal' }
+    : { cls: 'fuz', text: 'b' + r.bucket });
+
+  const onlyThem = theirs.filter((t) => !ours.some((o) => o.label === t.label)).length;
+  const onlyUs = ours.filter((o) => !theirs.some((t) => t.label === o.label)).length;
+
+  if (theirs.length === 0 && ours.length > 0) {
+    v.innerHTML = '<b style="color:var(--us)">Only <code>index</code> answers.</b> None of their '
+      + 'routes can fire — the typed characters never appear in order in any name. This is the '
+      + 'failure class behind their measured 40.8 % zero-result rate on 267 real searches.';
+  } else if (ours.length === 0 && theirs.length > 0) {
+    v.innerHTML = '<b style="color:var(--them)">Only their matcher answers.</b> '
+      + 'The term dictionary has no path to this name.';
+  } else if (theirs.length === 0 && ours.length === 0) {
+    v.innerHTML = '<b>Neither answers.</b> Nothing in the corpus is close enough.';
+  } else if (onlyThem > 0 && onlyUs > 0) {
+    v.innerHTML = '<b style="color:var(--mix)">Each finds something the other misses.</b> '
+      + onlyThem + ' only theirs, ' + onlyUs + ' only <code>index</code> — which is the whole '
+      + 'argument for the third pane.';
+  } else if (onlyThem > 0) {
+    v.innerHTML = '<b style="color:var(--them)">Their matcher finds ' + onlyThem
+      + ' that <code>index</code> misses.</b> Infix and substring are theirs to win.';
+  } else if (onlyUs > 0) {
+    v.innerHTML = '<b style="color:var(--us)"><code>index</code> finds ' + onlyUs
+      + ' that theirs misses.</b> Typo tolerance is the axis it was built for.';
+  } else {
+    v.innerHTML = '<b>All three agree.</b> On queries a prefix matcher serves well, there is no '
+      + 'gap to sell.';
+  }
+}
+
+el('q').addEventListener('input', (e) => {
+  el('why').textContent = '';
+  document.querySelectorAll('#preset button').forEach((b) => b.classList.remove('on'));
+  run(e.target.value);
+});
+
+const bar = el('preset');
+for (const p of PRESET) {
+  const b = document.createElement('button');
+  b.textContent = p.q;
+  b.onclick = () => {
+    document.querySelectorAll('#preset button').forEach((x) => x.classList.remove('on'));
+    b.classList.add('on');
+    el('q').value = p.q;
+    el('why').textContent = p.why;
+    run(p.q);
+  };
+  bar.appendChild(b);
+}
+
+(async () => {
+  const [wasm, idx, label] = await Promise.all([
+    fetch('../target/wasm32-unknown-unknown/release/index_wasm.wasm').then((r) => r.arrayBuffer()),
+    fetch('../artifact/profstopick.idx').then((r) => r.arrayBuffer()),
+    fetch('../artifact/profstopick.label.json').then((r) => r.json()),
+  ]);
+  folded = fold(label);
+  engine = await SearchIndex.open(new Uint8Array(wasm), new Uint8Array(idx), { label });
+  hybrid = makeHybrid((q, k) => matchFolded(folded, q, k), engine);
+  el('q').value = PRESET[0].q;
+  el('why').textContent = PRESET[0].why;
+  bar.firstChild.classList.add('on');
+  run(PRESET[0].q);
+})().catch((e) => {
+  el('us-body').innerHTML = '<div class="empty">' + esc(e.message) + '</div>';
+  el('verdict').innerHTML = '<b>Load failed.</b> Serve from the repo root — '
+    + '<code>python -m http.server 8080</code> — then open <code>/js/compare.html</code>.';
+});
+</script>
