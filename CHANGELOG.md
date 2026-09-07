@@ -51,6 +51,16 @@ machine), the published envelope beyond it is **5.3 ms at 1.2 M real products** 
 that need sub-5 ms get `search_capped` with its agreement table now measured on REAL 1 M vocabulary
 (cap 8: 4.73 ms at 98.80 % top-10 agreement). The bar is not raised; its failing row is labelled as
 the stress shape it is.
+### Added — `index apply --reselect`: the producer re-reads the row (2026-09-08)
+
+The fix `p67` §7.2 said a first-party connector would exist for. On every upsert, `apply` runs the
+`--reselect` command with the key substituted (safely quoted for the platform shell), reads ONE
+record back in the stream's own format, and uses it as the row. The stream names the key; the
+re-read owns the content — so a TOAST placeholder is healed instead of refused, an upsert whose row
+no longer exists at re-read time applies as a delete, a failing client stops the stream loudly, and
+a re-read row carrying a different key is refused rather than guessed. Works with any database's
+own client (`psql`, `sqlite3`, `mysql`...), keeping the crate dependency-free. Three new end-to-end
+gates in `scripts/cli-smoke.sh`.
 ### Changed — p82: one expansion per segment, not two (2026-09-08)
 
 `p52` named the recovery and left it: "the first pass could hand its expansion to the second

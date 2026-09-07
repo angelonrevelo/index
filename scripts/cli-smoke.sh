@@ -109,6 +109,30 @@ else
   fail=$((fail + 1))
 fi
 
+# ---- the producer-side fix: --reselect re-reads the row by key ---------------------------------
+# The stream says a key changed; the stream does NOT get to say what the row now contains. The
+# "database" here is a plain CSV file, and the reselect command is what psql would be: print the
+# one row for the key. A TOAST placeholder in the stream never reaches the index, an upsert for a
+# row deleted before the re-read becomes a delete, and a client that fails stops the stream.
+cat > "$WORK/truth.csv" <<'CSV'
+sku,name,brand,price
+A-2,Colgate Fresh Gel Toothpaste 100g,Colgate,99.0
+CSV
+cat > "$WORK/reread.csv" <<'CSV'
+op,sku,name,brand,price
+u,A-2,__debezium_unavailable_value,Colgate,99.0
+u,A-5,X-5,X,1.0
+CSV
+"$IDX" apply -d "$WORK/data" --csv --key sku --numeric price   --reselect "awk -F, -v k=%K 'NR==1 || \$1==k' \"$WORK/truth.csv\""   < "$WORK/reread.csv" 2>/dev/null
+check "a placeholder is healed by the re-read"  "$(keys "$WORK/data" gel)"          "A-2 "
+check "an upsert for a row gone at re-read is a delete" "$(keys "$WORK/data" bear)" ""
+if echo '{"op":"u","after":{"sku":"A-1"}}' | "$IDX" apply -d "$WORK/data" --jsonl --key after.sku     --reselect "exit 3" >/dev/null 2>&1; then
+  echo "  FAIL  a failing reselect must stop the stream"
+  fail=$((fail + 1))
+else
+  echo "  PASS  a failing reselect is a loud stop rather than a skipped row"
+fi
+
 # ---- refusals: a tool that silently does the wrong thing is worse than one that stops ------------
 if "$IDX" build -d "$WORK/nokey" --schema "$SCHEMA" < "$WORK/rows.csv" 2>/dev/null; then
   if "$IDX" apply -d "$WORK/nokey" --jsonl < "$WORK/changes.jsonl" 2>/dev/null; then

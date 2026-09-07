@@ -92,6 +92,24 @@ APPLY  reads change records and updates the collection in place.
                     only correct answer here; the fix is to configure the
                     producer to re-read the row by key on update. Composes with
                     --require: either one is enough to refuse the record.
+  --reselect CMD    THE FIX the two guards above only guard. For every upsert,
+                    run CMD with %K replaced by the (safely quoted) key, read
+                    ONE record back in the input format, and use it as the
+                    row -- the stream supplies only the fact that the key
+                    changed, never the content. This is what makes a TOASTed
+                    column safe without refusing anything: the placeholder
+                    never reaches the index because the re-read replaces it.
+                    Works with any database's own client, keeping this crate
+                    dependency-free:
+                      --reselect 'psql -At -d presyo -F$\'\\t\' -c \"SELECT * FROM product WHERE sku=%K\"'
+                    The command must print the columns the schema maps to (a
+                    header line for --csv/--tsv, or self-named JSON). Zero
+                    rows means the row no longer exists at re-read time -- the
+                    stale upsert is applied as a DELETE, because the re-read,
+                    not the stream, is the truth. A non-zero exit is a loud
+                    error. A re-read row whose key differs from the stream's
+                    is refused: the key was deleted and another key inserted,
+                    and guessing would corrupt the collection.
 
 INPUT FORMAT (both verbs)
   --csv             comma-separated, RFC-4180 quoting. Default.
@@ -160,6 +178,8 @@ struct Opt {
     op: Option<String>,
     /// Schema fields an upsert must carry a non-empty value for. See `cmd_apply`.
     require: Vec<String>,
+    /// Command run per upsert to re-read the row by key. See `cmd_apply`.
+    reselect: Option<String>,
     k: usize,
     prefix: bool,
     rest: Vec<String>,
@@ -182,6 +202,7 @@ impl Opt {
                 "--numeric" => o.numeric.push(take(&mut i, "--numeric")?),
                 "--op" => o.op = Some(take(&mut i, "--op")?),
                 "--require" => o.require.push(take(&mut i, "--require")?),
+                "--reselect" => o.reselect = Some(take(&mut i, "--reselect")?),
                 "--position" => o.position = true,
                 "--prefix" => o.prefix = true,
                 "--csv" => o.format = Some(Format::Csv),
@@ -401,6 +422,8 @@ fn cmd_apply(o: &Opt) -> Result<(), String> {
 
     let mut r = o.reader();
     let mut change: Vec<Change> = Vec::new();
+    let mut reselected = 0usize;
+    let mut reread_deleted = 0usize;
     while let Some(rec) = r.next()? {
         // A record with no op field is an upsert. That is what a plain row stream is, so the same
         // command works for "here are some new rows" without inventing an envelope for them.
@@ -421,6 +444,48 @@ fn cmd_apply(o: &Opt) -> Result<(), String> {
             })?
             .trim()
             .to_string();
+
+        // ---- the producer-side fix `p67` §7.2 named ------------------------------------------
+        // The stream says a key changed; the stream does not get to say what the row now contains.
+        // A TOASTed column the update did not touch arrives as a PLACEHOLDER, and `apply` replaces
+        // whole documents — so the re-read replaces the record ENTIRELY, before any of it can be
+        // trusted. The stream keeps exactly one job: naming the key.
+        let rec = if upsert {
+            match &o.reselect {
+                Some(cmd) => match reselect_row(cmd, &key, o)? {
+                    Some(fresh) => {
+                        // The re-read row must still carry the same key. A mismatch means the row
+                        // was deleted and another key inserted between the event and the re-read;
+                        // guessing would upsert a row the stream never mentioned.
+                        let fresh_key = key_path
+                            .iter()
+                            .find_map(|p| fresh.get(p))
+                            .map(|k| k.trim().to_string());
+                        if fresh_key.as_deref() != Some(key.as_str()) {
+                            return Err(format!(
+                                "--reselect: row for key {key:?} came back without its own key. \
+                                 The key was likely deleted and another inserted since the event; \
+                                 re-snapshot the collection instead of applying a guessed row"
+                            ));
+                        }
+                        reselected += 1;
+                        fresh
+                    }
+                    // Zero rows and a clean exit: the row no longer exists at re-read time, so
+                    // the stale upsert is applied as a delete. The re-read, not the stream, is
+                    // the truth.
+                    None => {
+                        change.push(Change::Delete(key));
+                        reread_deleted += 1;
+                        continue;
+                    }
+                },
+                None => rec,
+            }
+        } else {
+            rec
+        };
+
         change.push(match upsert {
             true => Change::Upsert(rec, key),
             false => Change::Delete(key),
@@ -517,6 +582,15 @@ fn cmd_apply(o: &Opt) -> Result<(), String> {
     if collapsed > 0 {
         eprintln!("note: {collapsed} superseded records collapsed (only the last per key applies)");
     }
+    if reselected > 0 {
+        eprintln!("note: {reselected} upserts re-read from the source of truth (--reselect)");
+    }
+    if reread_deleted > 0 {
+        eprintln!(
+            "note: {reread_deleted} upserts arrived for rows that no longer exist at re-read time \
+             and were applied as deletes"
+        );
+    }
     if missing > 0 {
         eprintln!("note: {missing} deletes named rows that were already absent (replay is safe)");
     }
@@ -537,6 +611,50 @@ fn cmd_apply(o: &Opt) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Re-read one row by key from the source of truth, via the command template `--reselect` gave.
+///
+/// `%K` in the template becomes the key, quoted for the platform shell (`'…'` with the usual
+/// escaping under `sh`, doubled `"` under `cmd`), so a key containing metacharacters arrives as
+/// data and never as program. The command prints one row in the SAME format the stream uses —
+/// the same flag decisions, the same reader, so a database nobody here has heard of still works.
+///
+/// Returns `Ok(None)` only for a clean exit with no rows: the row the stream talked about no
+/// longer exists, and the caller applies a delete. A non-zero exit is a loud error — a client
+/// that cannot answer must stop the stream, not skip a row.
+fn reselect_row(cmd: &str, key: &str, o: &Opt) -> Result<Option<Record>, String> {
+    let quoted = if cfg!(windows) {
+        format!("\"{}\"", key.replace('"', "\"\""))
+    } else {
+        format!("'{}'", key.replace('\'', "'\\''"))
+    };
+    let expanded = cmd.replace("%K", &quoted);
+    // `sh -c` everywhere it exists (this repo develops under Git Bash and CI is ubuntu), because
+    // the template's own quoting — awk's `$1`, SQL's `'…'` — is shell quoting and `cmd` would pass
+    // it through literally. `cmd /C` is the fallback for a Windows box with no sh at all.
+    let spawned = std::process::Command::new("sh").args(["-c", &expanded]).output();
+    let out = match spawned {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && cfg!(windows) => {
+            std::process::Command::new("cmd")
+                .args(["/C", &expanded])
+                .output()
+                .map_err(|e| format!("--reselect: could not run the command: {e}"))?
+        }
+        Err(e) => return Err(format!("--reselect: could not run the command: {e}")),
+    };
+    if !out.status.success() {
+        return Err(format!(
+            "--reselect failed for key {key:?} (exit {}): {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let format = o.format.unwrap_or(Format::Csv);
+    let header = o.header.unwrap_or(format != Format::Jsonl);
+    let mut r = RowReader::new(std::io::Cursor::new(out.stdout), format, header);
+    r.next()
 }
 
 /// Keep only the LAST record for each key, preserving stream order among the survivors.

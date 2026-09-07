@@ -845,9 +845,15 @@ open):
    `idx_range_open/plan/load/search`, ABI 13→14, 37.5 % of the artifact read for four queries with
    4/4 hits identical to a whole-file open. What remains open there is measuring the fraction on a
    huge artifact, which is a T2 row on the 8 M file, not an unstarted feature.
-3. **A producer that re-reads the row on update.** `p67`'s `--require` turns silent TOAST blanking
-   into a loud stop, which is a guard, not a fix. The fix is a connector that re-SELECTs by key —
-   the actual content of "correctness-first" in §7.2.
+3. ~~**A producer that re-reads the row on update.**~~ **DONE 2026-09-08.** `index apply
+   --reselect CMD` is that connector, without a driver: on every upsert the tool runs `CMD` with
+   the key substituted (safely quoted), reads one record back in the stream's own format, and uses
+   it as the row — the stream names the key, the re-read owns the content. A TOAST placeholder is
+   healed instead of refused; a row deleted before the re-read applies as a delete (the re-read is
+   the truth); a client failure stops the stream loudly; a re-read row carrying a different key is
+   refused rather than guessed. Any database's own client works, so the crate stays dependency-free.
+   Gated end-to-end in `scripts/cli-smoke.sh` (placeholder healed, stale upsert → delete, loud
+   failure).
 4. ~~**Recover `p52`'s second dictionary expansion.**~~ **DONE as `p82`** — `plan` split into an
    expand phase and a weigh phase; each segment's stat-pass expansion is handed back to its own
    weigh phase, so collection-wide statistics cost ~1.0x on the typo tail instead of 1.8–2.2x,
