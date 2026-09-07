@@ -1,0 +1,63 @@
+# Revalidation sweep — 2026-09-08
+
+Every bench binary in the workspace, re-run against the numbers its published document carries,
+on the current `master` tree (`0d0694b` plus the p82 hand-off). **Benches ran one at a time** —
+the sweep re-learned the repo's own lesson mid-flight: the first `alec-surface` run read body-query
+p99 40.7 ms (FAIL) while a concurrent lane was still running its own benches; re-run quiet, it
+read 24.1 ms and PASSed. Interleave, or do not claim a delta.
+
+Verdicts use three words: **reproduces** (fresh matches published within stated tolerance),
+**documented red** (fresh matches the published failing state — the red is the claim, and it
+holds), **drift** (fresh and published disagree beyond noise; explained or investigated).
+
+| bench | published | fresh (this machine, quiet) | verdict |
+|---|---|---|---|
+| `real-corpus` | OVERALL PASS; typo hit@10 ≥ 90 % | PASS 2/2 — profstopick typo hit@10 99.9 % (their matcher 14.9 %); presyo gold recall@10 100 %, 0 size violations | reproduces |
+| `profstopick-dept` | in-sample −0.8 pt; held-out −34.7 pt | in-sample **+0.8 pt**; held-out **−34.7 pt** | held-out reproduces exactly; in-sample sign flipped — near-zero either way, the corpus still refutes expansion there |
+| `sisia-catalog` | title hit@10 91.2 % vs 0.0 % | **91.2 % vs 0.0 %**, OVERALL PASS, p99 10.5 µs | reproduces (identical) |
+| `maphy-place` | typeahead hit@10 96.4 % | **96.4 %**; typo@10 99.7 %; p99 0.28 ms | reproduces (identical) |
+| `geo-join` (municipal) | 4.50 M pts/s, 28.2× | **≈5.31 M pts/s, 28.8×**; pip counts byte-identical | reproduces, slightly faster |
+| `blead-industry` | +18.1 pt in-sample (77.4→95.6) | **+18.1 pt (77.4→95.6)** | reproduces (identical) |
+| `alec-surface` | body-query p99 18.5 ms < 25 ms | **24.1 ms < 25 ms**, 0 diffs vs brute force | reproduces under the bar; p99 elevated ~30 % over published — long-tail machine state, worth watching |
+| `booted-schema` | name 100 %, comment 100 % top-10 | PASS; typo p99 0.58 ms | reproduces |
+| `accel-kernel` | 2,400 trials 0 wrong; agg 387 M/s, group 305, top-k 291, filter 192 | **0 wrong**; agg 360, group 288, top-k 271, filter 186 M/s | correctness reproduces exactly; throughput −5..−7 %, within machine drift |
+| `cdc-equivalence` | membership exact over 8,000 ops | OVERALL PASS | reproduces |
+| `fuzzy-term` | exact p99 1,380 ns vs 1,000 ns bar (red); typo recall 14.8× | exact p99 **1,170–1,230 ns** (red); recall **12.3× / 11.8×** at 860 K terms | documented red holds; slightly better p99 than published |
+| `pool-audit` | 0.00 % in all six cells | **0.00 % in all six cells** | reproduces (identical) |
+| `prune-consistency` | ROADMAP text says "stays red at 512 decoys" | **PASS at every decoy count incl. 512, 2048** | **drift — the ROADMAP text is stale**; the bench's own verdict line already said all three pruning sites gate correctly. Roadmap corrected this session |
+| `beat-btreemap` | PLA wins space/p50/p99, 4 distributions | OVERALL PASS, all rungs | reproduces |
+| `crack-converge` | naive fails sequential, stochastic passes | MIXED as designed | reproduces |
+| `phrase-cost` | 980 hits 0 wrong | OVERALL PASS, 0 wrong | reproduces |
+| `biasd-entity` | arm A fails 80 % bar at 71.6 % | arm A **71.7 %** (FAIL); arm B 85.1 % PASS | reproduces (documented red) |
+| `facet-shop` | tallies exact; p99 88 µs | OVERALL PASS; tally p99 84 µs; two-arm sort choosing scan at the median | reproduces |
+| `presyo-catalog` | typo p99 4.54 ms < 5 ms; ~51 B/doc; expansion +21.8 in-sample | typo p99 **5.05–6.07 ms** (over); **57.3 B/doc**; expansion **97.0 %**, +21.0 pt | typo tail sits ON the documented ~250 K crossing — the red `p7`'s bar names; bytes/doc drifted +12 % (config-dependent, see below) |
+| `presyo-expand` | +21.5 pt held out | **+21.4 pt**; strict trigger fired 0; strict damage +0.0 | reproduces |
+| `presyo-categorize` | 46 % confidently, 2,169/s | **42.1 % confidently, 2,401/s** | reproduces with drift −3.9 pp coverage / +10 % throughput |
+| `presyo-prior` | cannot answer (no broad-query labels) | same conclusion, same reason | reproduces |
+| `presyo-broad` | 97.2 % with documented label limit | same | reproduces |
+| `scale` | OVERALL FAIL by design; 1 M typo p99 13.6 ms | OVERALL FAIL; **14.03 ms** | documented red holds |
+| `segment-scale` | rank-1 agreement 96–98 % at 50 segs | OVERALL PASS; selective rank-1 99.0–99.4 % | reproduces, slightly better |
+| `image-corpus --limit 2000` | 0 panics; cheap tier <10 ms; 112 B/img | **0 panics**; 2.18 ms; 112.0 B/img; 0 extension disagreements; p58/p59 correctly WITHHELD (synthetic) | reproduces |
+| `video-shot` | 27 videos, shot sampling ≥ uniform | OVERALL PASS; 14.88× fewer frames; p63 recall verdict still WITHHELD (no labels) | reproduces |
+| `sfc-2d`, `fuzzy-decision`, `beat-btreemap`, `crack-converge` | see their docs | all ran; fuzzy-over-FM now viable through k=3 at σ=26 (published: k≤2) | reproduces; the k=3 note is machine/model drift on a decision bench |
+
+**Missing inputs (recorded, not failed):**
+
+- `real-million` needs `INDEX_MILLION_TSV` — a `name⇥vendor⇥code` export of presyo's 4.5 M-row
+  `raw_product`, which is not on this disk and needs a live database to regenerate. The bench that
+  settled the typo bar on real data therefore could not re-run; `presyo-catalog` (241 K real) and
+  `scale` (1 M recombined) bracket it.
+
+**Drift worth carrying forward:**
+
+1. `prune-consistency` passes everywhere; the ROADMAP's "stays red at 512" sentence described the
+   pre-`p25`/`p26` engine and was corrected this session.
+2. `presyo-catalog`'s typo p99 straddles the 5 ms bar across runs (4.54 published → 5.05–6.07
+   fresh). That is exactly the decision `p56` framed and the ROADMAP's next-list row 5 exists to
+   settle: the bar is met to ~250 K real documents and not beyond. Not silently relaxed.
+3. Bytes/doc on `presyo-catalog` read 57.3 vs ~51 published — the earlier figure was measured with
+   `p69`'s varint postings on a different field configuration; this run's schema includes the
+   facet + numeric columns the expansion path needs. Recorded rather than reconciled silently.
+
+Fresh console output for every run above is in this directory's `*.log` files where a run was
+captured end-to-end; summaries were transcribed at run time.

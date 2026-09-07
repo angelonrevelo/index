@@ -8,6 +8,29 @@ for what was deliberately ruled out.
 
 ## [Unreleased]
 
+### Changed — p82: one expansion per segment, not two (2026-09-08)
+
+`p52` named the recovery and left it: "the first pass could hand its expansion to the second
+instead of the second re-deriving it. That is where the ~2x goes." `plan` is now split into an
+expand phase (`Index::expand_query` — the dictionary walk, no cap, no weights) and a weigh phase
+(`Index::weigh` — cap, IDF, weights), and `Searcher::stat_for` hands each segment's stat-pass
+expansion back to that same segment's weigh phase. Collection-wide statistics now cost **~1.0x on
+the typo tail, down from 1.8-2.2x**, at every rung past 10 segments, with ranking bit-identical —
+asserted by a new differential test that compares score BITS between the re-derived and the
+handed-over path across exact, typo, compound-split, typeahead and learned-expansion queries.
+`want_text` keeps the single-index path's zero-cost; `ExpansionEmit::learned` keeps the learned
+terms out of the collection-wide `df` sum exactly as before. ABI unchanged (14). The full
+measurement: [`bench/roadmap/p82-expansion-handoff.md`](bench/roadmap/p82-expansion-handoff.md).
+
+### Revalidated — every bench re-run against its published number (2026-09-08)
+
+24 of 26 runnable benches reproduce or hold their documented red, run one at a time on a quiet
+machine (the sweep itself failed `alec-surface` under concurrent load and passed it quiet — the
+repo's "interleave or do not claim a delta" rule, re-earned). Findings: the ROADMAP's "stays red at
+512 decoys" sentence was stale (`prune-consistency` passes everywhere since `p25`/`p26` — fixed in
+place); `presyo-catalog`'s typo tail straddles the 5 ms bar across runs, which is exactly the
+decision the next-list row 5 exists to end; `real-million`'s input is not on disk and needs a live
+
 ### Added — the image tier (2026-09-06)
 
 **`index-image`, a new crate.** The engine now indexes pixels alongside text, and the architectural

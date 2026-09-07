@@ -213,29 +213,37 @@ impl Searcher {
         self.wants_thread()
     }
 
-    /// Collection-wide statistics for `query`: the first half of a `dfs_query_then_fetch`.
+    /// Collection-wide statistics for `query`, plus the per-segment expansions they came from.
     ///
-    /// Every segment reports the `(term text, df)` pairs it would plan; they are summed by TEXT,
-    /// because a term id means something different in each dictionary. The result is handed back to
-    /// every segment so all of them score a term by how rare it is in the CORPUS.
+    /// The first half of a `dfs_query_then_fetch`. Every segment expands the query ONCE
+    /// ([`Index::expand_query`]); the `(term text, df)` pairs are summed by TEXT into a
+    /// [`CollectionStat`], and each segment's expansion is handed BACK to that segment's weigh
+    /// phase, so a segmented query walks the fuzzy automaton once, not twice — the recovery
+    /// `p52` measured at ~2x on the typo tail and left undone.
     ///
     /// Skipped entirely for a single-segment collection, where the segment already is the corpus —
     /// so the common case pays nothing.
-    fn stat_for(&self, query: &str, prefix_last: bool) -> Option<crate::index::CollectionStat> {
+    fn stat_for(
+        &self,
+        query: &str,
+        prefix_last: bool,
+    ) -> Option<(crate::index::CollectionStat, Vec<crate::index::QueryExpansion>)> {
         if !self.collection_stat || self.segment.len() < 2 {
             return None;
         }
-        // Fanned out, but still a COMPLETE pass: every segment's `term_stat` is joined and summed
+        // Fanned out, but still a COMPLETE pass: every segment's expansion is joined and summed
         // before a single scoring call is made. The two passes cannot interleave -- a segment that
         // began scoring against a partial `df` would rank against a corpus that does not exist.
-        let per = self.fan(|_, s| s.term_stat(query, prefix_last));
+        let per = self.fan(|_, s| s.expand_query(query, prefix_last, true));
         let mut df: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for stat in per {
-            for (text, d) in stat {
+        // `fan` returns results in segment order, so `zip` pairs each expansion with the segment
+        // whose dictionary and postings produced it.
+        for (ex, seg) in per.iter().zip(&self.segment) {
+            for (text, d) in seg.expansion_stat(ex) {
                 *df.entry(text).or_insert(0) += d;
             }
         }
-        Some(crate::index::CollectionStat { doc_count: self.doc_count, df })
+        Some((crate::index::CollectionStat { doc_count: self.doc_count, df }, per))
     }
 
     /// Point every segment at the collection's document count, so IDF means the same thing in all
@@ -428,9 +436,13 @@ impl Searcher {
     pub fn search(&self, query: &str, k: usize) -> Vec<Hit> {
         // Collection-wide IDF, so a term is rare or common according to the corpus rather than to
         // whichever segment holds the row. See `CollectionStat` for the measurement that forced it.
+        // The expansions the stat pass produced are handed back to the segment that built them, so
+        // the weigh phase re-derives nothing (`p52`'s recovered second expansion).
         match self.stat_for(query, false) {
-            Some(stat) => self.merge(k, |ix| ix.search_with_stat(query, k, &stat)),
-            None => self.merge(k, |ix| ix.search(query, k)),
+            Some((stat, ex)) => {
+                self.merge(k, |i, ix| ix.search_expanded(query, &ex[i], k, &stat))
+            }
+            None => self.merge(k, |_i, ix| ix.search(query, k)),
         }
     }
 
@@ -454,7 +466,7 @@ impl Searcher {
     /// has never seen the value simply contributes nothing — which is the right answer, not an
     /// error: a value can legitimately exist only in the newest delta.
     pub fn search_facet_all(&self, query: &str, k: usize, want: &[(usize, &str)]) -> Vec<Hit> {
-        self.merge(k, |ix| ix.search_facet_all(query, k, want))
+        self.merge(k, |_i, ix| ix.search_facet_all(query, k, want))
     }
 
     /// **The full filter bar across every segment**: OR within a clause, AND across clauses, NOT.
@@ -473,7 +485,7 @@ impl Searcher {
         // Each segment must yield everything up to the end of the page, because the global page
         // boundary is only known after the merge -- a segment's 3rd-best can be the page's 1st.
         let want = k.saturating_add(offset);
-        let mut all = self.merge(want, |ix| ix.search_clause(query, want, 0, clause, range));
+        let mut all = self.merge(want, |_i, ix| ix.search_clause(query, want, 0, clause, range));
         if offset > 0 {
             all.drain(..offset.min(all.len()));
         }
@@ -490,14 +502,14 @@ impl Searcher {
     /// A segment built without positions contributes nothing rather than falling back to a
     /// bag-of-words match, which would quietly mix phrase and non-phrase results in one list.
     pub fn search_phrase(&self, query: &str, k: usize) -> Vec<Hit> {
-        self.merge(k, |ix| ix.search_phrase(query, k))
+        self.merge(k, |_i, ix| ix.search_phrase(query, k))
     }
 
     /// [`Searcher::search_phrase`] with an offset, over-fetching per segment the way
     /// [`Searcher::search_page`] does.
     pub fn search_phrase_page(&self, query: &str, offset: usize, k: usize) -> Vec<Hit> {
         let want = k.saturating_add(offset);
-        let mut all = self.merge(want, |ix| ix.search_phrase_page(query, 0, want));
+        let mut all = self.merge(want, |_i, ix| ix.search_phrase_page(query, 0, want));
         if offset > 0 {
             all.drain(..offset.min(all.len()));
         }
@@ -510,7 +522,7 @@ impl Searcher {
     /// `offset + k` before the merge can find the page.
     pub fn search_page(&self, query: &str, offset: usize, k: usize) -> Vec<Hit> {
         let want = k.saturating_add(offset);
-        let mut all = self.merge(want, |ix| ix.search_page(query, 0, want));
+        let mut all = self.merge(want, |_i, ix| ix.search_page(query, 0, want));
         if offset > 0 {
             all.drain(..offset.min(all.len()));
         }
@@ -529,7 +541,7 @@ impl Searcher {
 
     /// Search restricted to a half-open numeric range, across every segment.
     pub fn search_range(&self, query: &str, k: usize, slot: usize, lo: f64, hi: f64) -> Vec<Hit> {
-        self.merge(k, |ix| ix.search_range(query, k, slot, lo, hi))
+        self.merge(k, |_i, ix| ix.search_range(query, k, slot, lo, hi))
     }
 
     /// The whole filter bar — facets and numeric ranges — across every segment.
@@ -540,7 +552,7 @@ impl Searcher {
         want: &[(usize, &str)],
         range: &[(usize, f64, f64)],
     ) -> Vec<Hit> {
-        self.merge(k, |ix| ix.search_filtered(query, k, want, range))
+        self.merge(k, |_i, ix| ix.search_filtered(query, k, want, range))
     }
 
     /// **Facet tally across every segment**, merged by VALUE rather than by id.
@@ -684,8 +696,10 @@ impl Searcher {
 
     pub fn search_prefix(&self, query: &str, k: usize) -> Vec<Hit> {
         match self.stat_for(query, true) {
-            Some(stat) => self.merge(k, |ix| ix.search_prefix_with_stat(query, k, &stat)),
-            None => self.merge(k, |ix| ix.search_prefix(query, k)),
+            Some((stat, ex)) => {
+                self.merge(k, |i, ix| ix.search_prefix_expanded(query, &ex[i], k, &stat))
+            }
+            None => self.merge(k, |_i, ix| ix.search_prefix(query, k)),
         }
     }
 
@@ -796,7 +810,7 @@ impl Searcher {
         all.into_iter().map(|(_, t)| t).collect()
     }
 
-    fn merge(&self, k: usize, per_segment: impl Fn(&Index) -> Vec<Hit> + Sync) -> Vec<Hit> {
+    fn merge(&self, k: usize, per_segment: impl Fn(usize, &Index) -> Vec<Hit> + Sync) -> Vec<Hit> {
         if k == 0 {
             return Vec::new();
         }
@@ -804,7 +818,7 @@ impl Searcher {
         // segment-local ordinal never escapes the thread that produced it.
         let part = self.fan(|i, ix| {
             let base = self.base[i];
-            let mut hit = per_segment(ix);
+            let mut hit = per_segment(i, ix);
             for h in &mut hit {
                 h.doc += base;
             }
@@ -1548,6 +1562,130 @@ mod tests {
         for _ in 0..25 {
             cmp(serial.search(q, 10), threaded.search(q, 10), "search, repeated");
             cmp(serial.search_sorted(q, 6, 0, true), threaded.search_sorted(q, 6, 0, true), "sort");
+        }
+    }
+
+    /// **A handed-over expansion must weigh exactly like a re-derived one.**
+    ///
+    /// The recovered `p52` fix changes WHO builds the expansion, not what it contains: the stat
+    /// pass walks each segment's dictionary once and hands the result back to that same segment.
+    /// The one way to get that wrong is for the handed-over expansion to differ from what the
+    /// search pass would have derived — a different cap position, a learned term leaking into the
+    /// `df` sum, a compound split taken on one arm only. So every planning branch that exists is
+    /// compared bit-for-bit between [`Index::search_with_stat`] (re-derives) and
+    /// [`Index::search_expanded`] (weighs the hand-off): exact, typo'd, compound-split, typeahead
+    /// and learned-expansion queries alike.
+    #[test]
+    fn a_handed_over_expansion_weighs_exactly_like_a_rederived_one() {
+        let seg: [&[(&str, &str, &str)]; 4] = [
+            &[
+                ("Colgate Toothpaste Large", "Colgate", "150"),
+                ("Bear Brand Lacterose", "Bear Brand", "300"),
+            ],
+            &[("Colgate Toothpaste Mini", "Colgate", "45")],
+            &[("Aquafresh Toothpaste Twin", "Aquafresh", "100")],
+            &[
+                ("Colgate Mouthwash Herbal", "Colgate", "250"),
+                ("Bearbrand Coffee Mix", "Bearbrand", "100"),
+            ],
+        ];
+        // One collection that learns (so the strict learned-expansion branch is planned) and one
+        // that does not (so the plain path is compared without it).
+        let assemble = |learn: bool| {
+            let one = |row: &[(&str, &str, &str)]| {
+                let mut b = IndexBuilder::new(Schema::new(vec![
+                    Field::new("name", 3.0, 0.4),
+                    Field::new("brand", 1.0, 0.6),
+                    Field::new("size", 0.0, 0.6),
+                ]))
+                .with_facet(1)
+                .with_numeric(2);
+                if learn {
+                    b = b.learn_expansion(1, 8);
+                }
+                for (n, br, sz) in row {
+                    b.add(&Doc::new(vec![*n, *br, *sz]));
+                }
+                b.build().unwrap()
+            };
+            let mut s = Searcher::new(one(seg[0]));
+            for row in &seg[1..] {
+                s.push(one(row));
+            }
+            s
+        };
+
+        for learn in [false, true] {
+            let sr = assemble(learn);
+            assert!(
+                sr.collection_stat() && sr.segment_count() > 1,
+                "the two-pass hand-off is the path under test"
+            );
+
+            // Covers: two tokens; a typo the dictionary must fuzzy-correct; a compound that splits
+            // into two groups only when exact and fuzzy both miss; a single token that IS a facet
+            // value (fires the learned branch on the learning collection).
+            let queries = [
+                "Colgate Toothpaste",
+                "Colgtae Tuthpaste",
+                "colgatetoothpaste",
+                "Bearbrand",
+            ];
+            for q in queries {
+                let (stat, ex) = sr.stat_for(q, false).expect("multi-segment stat path");
+                for (i, exi) in ex.iter().enumerate() {
+                    let ix = sr.segment(i).unwrap();
+                    let re = ix.search_with_stat(q, 10, &stat);
+                    let handed = ix.search_expanded(q, exi, 10, &stat);
+                    assert_eq!(re.len(), handed.len(), "learn={learn} q={q:?} seg={i}: length");
+                    for (a, b) in re.iter().zip(handed.iter()) {
+                        assert_eq!(a.doc, b.doc, "learn={learn} q={q:?} seg={i}: doc");
+                        assert_eq!(
+                            a.score.to_bits(),
+                            b.score.to_bits(),
+                            "learn={learn} q={q:?} seg={i}: score bits"
+                        );
+                    }
+                }
+            }
+
+            // The typeahead call site: prefix semantics on the last token, same hand-off. A
+            // segment that never saw the prefix legitimately contributes nothing — segment 3 of
+            // this fixture has no "Toothp*" document — so emptiness is asserted for the
+            // collection, not per segment.
+            let (stat, ex) = sr.stat_for("Toothp", true).expect("prefix stat path");
+            let mut total = 0;
+            for (i, exi) in ex.iter().enumerate() {
+                let ix = sr.segment(i).unwrap();
+                let re = ix.search_prefix_with_stat("Toothp", 10, &stat);
+                let handed = ix.search_prefix_expanded("Toothp", exi, 10, &stat);
+                assert_eq!(re.len(), handed.len(), "learn={learn} prefix seg={i}: length");
+                for (a, b) in re.iter().zip(handed.iter()) {
+                    assert_eq!(a.doc, b.doc, "learn={learn} prefix seg={i}: doc");
+                    assert_eq!(a.score.to_bits(), b.score.to_bits(), "learn={learn} prefix seg={i}: bits");
+                }
+                total += re.len();
+            }
+            assert!(total > 0, "learn={learn}: an empty prefix result would prove nothing");
+
+            // And the stat itself: the hand-off must not change what the df sum sees.
+            let q = "colgatetoothpaste";
+            let (stat_re, _) = {
+                let per: Vec<_> =
+                    (0..sr.segment_count()).map(|i| sr.segment(i).unwrap().term_stat(q, false)).collect();
+                let mut df = std::collections::HashMap::new();
+                for pairs in per {
+                    for (text, d) in pairs {
+                        *df.entry(text).or_insert(0) += d;
+                    }
+                }
+                (crate::index::CollectionStat { doc_count: sr.doc_count(), df }, ())
+            };
+            let (stat_ex, _) = sr.stat_for(q, false).unwrap();
+            assert_eq!(
+                stat_re.df, stat_ex.df,
+                "learn={learn}: the expansion hand-off must not move the df sums"
+            );
         }
     }
 

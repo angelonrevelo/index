@@ -11,6 +11,13 @@
 consumer applications on their own contracts and their own data, and runs in Node and in a real
 browser.
 
+**Revalidated 2026-09-08:** every bench binary re-run against its published number on a quiet
+machine, one at a time — the sweep itself re-proved the rule by failing `alec-surface` under
+concurrent load and passing it quiet. 24 of 26 runnable benches reproduce or hold their documented
+red; the two drifts are a stale ROADMAP sentence (prune-consistency, corrected in place) and
+`presyo-catalog`'s typo tail straddling the 5 ms bar, which is the decision next-list row 5 exists
+to make. Full table: [`bench/runs/2026-09-08-revalidate/`](bench/runs/2026-09-08-revalidate/README.md).
+
 | App | Their harness | Result |
 |---|---|---|
 | **profstopick** | `search-name-order.test.mjs` (their file, one import line changed) | **9 / 9** |
@@ -827,25 +834,35 @@ and `p50`'s state-based design never needs a before-image — but it found **a r
 TOAST placeholders silently blanking fields, now guarded by `index apply --require`. §7.1 was
 rejected with reasons.
 
-**Next, in order:**
+**Next, in order** (re-derived 2026-09-08 after the revalidation sweep — two of the items this
+list carried were already closed by later work and are marked as such rather than re-listed as
+open):
 
 1. **Deploy an integration.** Still the only item nobody here can do, and now the cheapest it has
    ever been: `p68` makes profstopick's case a static file plus a `<script>`, against a shard that
    misses 40.8 % of real searches today.
-2. **Wire range reads to `idx_open`.** `p68` proves a section can be read in isolation and `p56`
-   shows a 10 M index is ~910 MB; the module still takes a whole buffer, so that size is *openable*
-   but not yet *queryable* in a tab. This is the difference between the demo and the claim.
+2. ~~**Wire range reads to `idx_open`.**~~ **DONE as `p72`** — `RangeHandle` +
+   `idx_range_open/plan/load/search`, ABI 13→14, 37.5 % of the artifact read for four queries with
+   4/4 hits identical to a whole-file open. What remains open there is measuring the fraction on a
+   huge artifact, which is a T2 row on the 8 M file, not an unstarted feature.
 3. **A producer that re-reads the row on update.** `p67`'s `--require` turns silent TOAST blanking
    into a loud stop, which is a guard, not a fix. The fix is a connector that re-SELECTs by key —
    the actual content of "correctness-first" in §7.2.
-4. **Recover `p52`'s second dictionary expansion**, worth ~2x on the typo tail. Needs `plan` split
-   into an expand phase and a weigh phase.
+4. ~~**Recover `p52`'s second dictionary expansion.**~~ **DONE as `p82`** — `plan` split into an
+   expand phase and a weigh phase; each segment's stat-pass expansion is handed back to its own
+   weigh phase, so collection-wide statistics cost ~1.0x on the typo tail instead of 1.8–2.2x,
+   bit-identically ranked. See [`bench/roadmap/p82-expansion-handoff.md`](bench/roadmap/p82-expansion-handoff.md).
 5. **Decide the typo bar now that it has a number.** `p56` reframes it: the engine is interactive to
    ~250 K documents and exact beyond that. Either publish that as the product statement, adopt
-   `search_capped` with its agreement figure, or build bucket-tiered enumeration. **Still red.**
-6. **Concurrency.** Every number in `docs/benchmarks.md` is one core. A 33 ms tail at 8 M is a
-   single-threaded tail, and nothing in the engine shards a query. `p73` has since threaded the
-   *build* — 1.89x at a million documents, bytes identical — but the query path is unchanged.
+   `search_capped` with its agreement figure, or build bucket-tiered enumeration. **Still red** —
+   and the 2026-09-08 revalidation measured presyo's real 241 K catalogue straddling the bar
+   (4.54 ms published → 5.05–6.07 ms fresh), which is exactly the ambiguity the decision exists to
+   end.
+6. ~~**Concurrency.**~~ **SHIPPED in two halves** — `p73`/`p75`/`p79` threaded the build (3.90x at
+   a million documents, bytes identical), `p74` threaded the query tail (~2.9x p99 at 25–50
+   segments, ranking bit-identical) and `p80` made it opt-in after the default measured 2.2–2.4x
+   slower under ordinary desktop load. What remains is a measured decision, not an unstarted
+   feature: onegrid's probe chooses the `simd128` variant the same way.
 
 ## Done — the pruning gate
 
@@ -1073,9 +1090,11 @@ simply went and looked — found out:
 
 **3× fewer degraded queries, 5–11× fewer lost documents, for a few percent.**
 
-`p22` stays red at 512 decoys: the residual is documents block-max skipping discards *before*
-scoring, which only the single-`eff`-pool design reaches — and that one genuinely does cost 10–30×.
-A bucket-aware **pruning bound** remains the real repair and remains unattempted.
+~~`p22` stays red at 512 decoys~~ — **stale as of `p25`/`p26`; re-verified 2026-09-08.** The
+residual `p22` named (documents block-max skipping discards *before* scoring) is closed by the
+third pruning gate on the bucket floor, and `prune-consistency` now reads PASS at every decoy
+count with `pool-audit` at 0.00 % in all six real cells. A bucket-aware **pruning bound** was the
+repair; `p26`'s single-`eff` bound turned out to be it.
 
 **The lesson worth carrying is methodological.** "No consumer bench detected it" was not evidence of
 absence when no consumer bench was built to detect it; and a warm-versus-cold latency comparison

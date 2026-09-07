@@ -1582,6 +1582,40 @@ impl<'a> FacetClause<'a> {
 /// invisible at the call site. A struct with a `Default` makes each entry point say only what it
 /// changes — `Scan { query, k, offset, ..Scan::default() }` reads as "a page", and nothing else
 /// has to be repeated.
+/// One `emit` call's worth of a planned query: the matches that will feed [`Index::emit`] for one
+/// group, and whether the call came from the learned-expansion branch.
+///
+/// `learned` matters only to [`Index::term_stat`], which must keep excluding those terms from the
+/// collection-wide `df` sum exactly as it always has — they score per segment by documented
+/// decision (`p52`).
+#[derive(Debug, Clone)]
+pub(crate) struct ExpansionEmit {
+    pub group: u16,
+    pub matches: Vec<(crate::dict::TermMatch, String)>,
+    pub learned: bool,
+}
+
+/// A fully expanded query, before the cap and the IDF weights are applied.
+///
+/// **This is the phase split `p52` named and left undone.** Both collection-stat passes traverse
+/// the same fuzzy automaton over the same dictionary: the stat pass to learn `(text, df)`, the
+/// search pass to plan postings. [`Index::expand_query`] runs that traversal ONCE per segment and
+/// its result is handed to the weigh phase, so a segmented query pays one expansion, not two. The
+/// per-segment granularity is deliberate — each dictionary is its own, so segment `i`'s expansion
+/// is handed back to segment `i` and the answer stays bit-identical to a re-derivation.
+#[derive(Debug, Clone)]
+pub(crate) struct QueryExpansion {
+    /// Emit calls in the order `plan_stat` would have made them: one per token (two for a compound
+    /// split), then the learned-expansion extras. The order is load-bearing — `emit` mutates no
+    /// shared state, but the cap sorts each call's list independently, so regrouping them could
+    /// change which terms survive.
+    pub emits: Vec<ExpansionEmit>,
+    /// One entry per query group: whether the group is a physical quantity.
+    pub group_is_quantity: Vec<bool>,
+    /// Whether the learned-expansion branch fired, which widens the scoring pool.
+    pub expanded: bool,
+}
+
 struct Scan<'a> {
     query: &'a str,
     k: usize,
@@ -1599,6 +1633,9 @@ struct Scan<'a> {
     phrase: &'a [u32],
     /// Collection-wide statistics, when this segment is one of several. See [`CollectionStat`].
     stat: Option<&'a CollectionStat>,
+    /// A pre-computed expansion from [`Index::expand_query`], handed over by [`crate::Searcher`]
+    /// so the weigh phase below need not walk the fuzzy automaton a second time.
+    pre: Option<&'a QueryExpansion>,
 }
 
 impl<'a> Scan<'a> {
@@ -1613,6 +1650,7 @@ impl<'a> Scan<'a> {
             range: &[],
             phrase: &[],
             stat: None,
+            pre: None,
         }
     }
 }
@@ -2204,20 +2242,25 @@ impl Index {
         token: &str,
         numeric: bool,
         prefix: bool,
-        stat: Option<&CollectionStat>,
+        want_text: bool,
     ) -> Vec<(crate::dict::TermMatch, String)> {
-        match stat {
-            Some(_) => self.dict.expand_lazy_text(token, numeric, prefix),
-            None => self
-                .dict
+        if want_text {
+            self.dict.expand_lazy_text(token, numeric, prefix)
+        } else {
+            self.dict
                 .expand_lazy(token, numeric, prefix)
                 .into_iter()
                 .map(|m| (m, String::new()))
-                .collect(),
+                .collect()
         }
     }
 
     /// [`Index::plan`], scoring IDF against `stat` when this segment belongs to a collection.
+    ///
+    /// Two phases, in the shape `p52` named: [`Index::expand_query`] walks the dictionary once and
+    /// [`Index::weigh`] applies the cap and the IDF. A caller that already holds an expansion —
+    /// [`crate::Searcher`], which produces one per segment to build a [`CollectionStat`] — skips the
+    /// walk entirely via `Scan::pre`.
     fn plan_stat(
         &self,
         query: &str,
@@ -2225,6 +2268,37 @@ impl Index {
         cap: usize,
         stat: Option<&CollectionStat>,
     ) -> (Vec<QueryTerm>, Vec<bool>, bool) {
+        let ex = self.expand_query(query, prefix_last, stat.is_some());
+        self.weigh(&ex, cap, stat)
+    }
+
+    /// The weigh phase of planning: cap, IDF and weights over an expansion someone already built.
+    ///
+    /// Pure: it reads the segment's postings and `stat` and nothing else, so the same expansion
+    /// weighs identically whether it arrived fresh from [`Index::expand_query`] or was handed over —
+    /// which is the property that makes the hand-off unobservable in the results.
+    fn weigh(
+        &self,
+        ex: &QueryExpansion,
+        cap: usize,
+        stat: Option<&CollectionStat>,
+    ) -> (Vec<QueryTerm>, Vec<bool>, bool) {
+        let mut out: Vec<QueryTerm> = Vec::new();
+        for e in &ex.emits {
+            self.emit(&mut out, e.matches.clone(), e.group, cap, stat);
+        }
+        (out, ex.group_is_quantity.clone(), ex.expanded)
+    }
+
+    /// The expand phase of planning: everything up to per-group match lists, with **no cap and no
+    /// weights**.
+    ///
+    /// `want_text` decides whether matches carry their term text — the stat pass needs it to sum
+    /// document frequency across segments by string; the single-index path passes `false` and pays
+    /// nothing for the pair. The learned-expansion branch is part of this phase and is flagged
+    /// `learned` on its emit entries, because [`Index::term_stat`] has always excluded those terms
+    /// from the collection-wide sum while [`Index::weigh`] treats them like any other.
+    pub(crate) fn expand_query(&self, query: &str, prefix_last: bool, want_text: bool) -> QueryExpansion {
         let mut tok = tokenize(query);
         apply_alias(&mut tok, &self.alias);
         // A group is a "quantity" group when its token parses as a real physical size. A bare
@@ -2246,11 +2320,11 @@ impl Index {
         // traversals on exactly the tokens that are most expensive to traverse.
         let n = tok.len();
         let mut group_is_quantity: Vec<bool> = Vec::with_capacity(n);
-        let mut out: Vec<QueryTerm> = Vec::new();
+        let mut emits: Vec<ExpansionEmit> = Vec::new();
 
         for (ti, t) in tok.iter().enumerate() {
             let is_last = ti + 1 == n;
-            let matches = self.expand_pair(&t.text, t.is_numeric, prefix_last && is_last, stat);
+            let matches = self.expand_pair(&t.text, t.is_numeric, prefix_last && is_last, want_text);
 
             if matches.is_empty() && t.text.chars().count() >= 4 {
                 if let Some((a, b)) = self.split_compound(&t.text) {
@@ -2259,8 +2333,8 @@ impl Index {
                         let gi = group_is_quantity.len() as u16;
                         group_is_quantity
                             .push(numeric && crate::analyze::parse_quantity(&part).is_some());
-                        let m = self.expand_pair(&part, numeric, false, stat);
-                        self.emit(&mut out, m, gi, cap, stat);
+                        let m = self.expand_pair(&part, numeric, false, want_text);
+                        emits.push(ExpansionEmit { group: gi, matches: m, learned: false });
                     }
                     continue;
                 }
@@ -2269,7 +2343,7 @@ impl Index {
             let gi = group_is_quantity.len() as u16;
             group_is_quantity
                 .push(t.is_numeric && crate::analyze::parse_quantity(&t.text).is_some());
-            self.emit(&mut out, matches, gi, cap, stat);
+            emits.push(ExpansionEmit { group: gi, matches, learned: false });
         }
 
         // --- learned expansion, fired STRICTLY.
@@ -2302,13 +2376,17 @@ impl Index {
                     })
                     .collect();
                 for gi in 0..group_is_quantity.len() as u16 {
-                    self.emit(&mut out, extra.clone(), gi, cap, stat);
+                    emits.push(ExpansionEmit {
+                        group: gi,
+                        matches: extra.clone(),
+                        learned: true,
+                    });
                 }
                 expanded = true;
             }
         }
 
-        (out, group_is_quantity, expanded)
+        QueryExpansion { emits, group_is_quantity, expanded }
     }
 
     /// Number of learned facet values, or 0 when expansion was not learned.
@@ -3233,26 +3311,23 @@ impl Index {
     /// collecting costs a few map entries; under-collecting would silently fall back to local `df`
     /// for exactly the terms the cap disagrees about.
     pub fn term_stat(&self, query: &str, prefix_last: bool) -> Vec<(String, usize)> {
-        let mut tok = tokenize(query);
-        crate::analyze::apply_alias(&mut tok, &self.alias);
-        let n = tok.len();
+        let ex = self.expand_query(query, prefix_last, true);
+        self.expansion_stat(&ex)
+    }
+
+    /// The `(text, df)` pairs an already-built expansion contributes to a [`CollectionStat`].
+    ///
+    /// This is [`Index::term_stat`]'s body over a [`QueryExpansion`], so the stat pass and the
+    /// search pass read ONE traversal rather than two. Learned-expansion emits are skipped, exactly
+    /// as they always have been: they carry no text and score per segment by documented decision.
+    pub(crate) fn expansion_stat(&self, ex: &QueryExpansion) -> Vec<(String, usize)> {
         let mut out = Vec::new();
-        for (ti, t) in tok.iter().enumerate() {
-            let is_last = ti + 1 == n;
-            let m = self.dict.expand_lazy_text(&t.text, t.is_numeric, prefix_last && is_last);
-            if m.is_empty() && t.text.chars().count() >= 4 {
-                if let Some((a, b)) = self.split_compound(&t.text) {
-                    for part in [a, b] {
-                        let numeric = part.chars().any(|c| c.is_ascii_digit());
-                        for (tm, text) in self.dict.expand_lazy_text(&part, numeric, false) {
-                            out.push((text, self.posting[tm.term_id as usize].len()));
-                        }
-                    }
-                    continue;
-                }
+        for e in &ex.emits {
+            if e.learned {
+                continue;
             }
-            for (tm, text) in m {
-                out.push((text, self.posting[tm.term_id as usize].len()));
+            for (tm, text) in &e.matches {
+                out.push((text.clone(), self.posting[tm.term_id as usize].len()));
             }
         }
         out
@@ -3263,9 +3338,43 @@ impl Index {
         self.search_opt(Scan { stat: Some(stat), ..Scan::new(query, k) })
     }
 
+    /// [`Index::search_with_stat`], weighed from an expansion the caller already built.
+    ///
+    /// The hand-off half of the `dfs_query_then_fetch`: the caller (the [`crate::Searcher`]) ran
+    /// [`Index::expand_query`] per segment to collect `(text, df)`, and passes segment `i`'s
+    /// expansion back to segment `i` so the weigh phase re-derives nothing. Results are
+    /// bit-identical to [`Index::search_with_stat`], which re-walks the automaton — a property the
+    /// searcher's own differential tests assert.
+    pub(crate) fn search_expanded(
+        &self,
+        query: &str,
+        ex: &QueryExpansion,
+        k: usize,
+        stat: &CollectionStat,
+    ) -> Vec<Hit> {
+        self.search_opt(Scan { pre: Some(ex), stat: Some(stat), ..Scan::new(query, k) })
+    }
+
     /// [`Index::search_prefix`], scored against collection-wide statistics.
     pub fn search_prefix_with_stat(&self, query: &str, k: usize, stat: &CollectionStat) -> Vec<Hit> {
         self.search_opt(Scan { prefix_last: true, stat: Some(stat), ..Scan::new(query, k) })
+    }
+
+    /// [`Index::search_prefix_with_stat`] from a handed-over expansion, for the same reason as
+    /// [`Index::search_expanded`].
+    pub(crate) fn search_prefix_expanded(
+        &self,
+        query: &str,
+        ex: &QueryExpansion,
+        k: usize,
+        stat: &CollectionStat,
+    ) -> Vec<Hit> {
+        self.search_opt(Scan {
+            pre: Some(ex),
+            prefix_last: true,
+            stat: Some(stat),
+            ..Scan::new(query, k)
+        })
     }
 
     /// [`Index::search`] with typeahead semantics on the last token.
@@ -3274,7 +3383,7 @@ impl Index {
     }
 
     fn search_opt(&self, scan: Scan) -> Vec<Hit> {
-        let Scan { query, k, offset, prefix_last, cap, facet, range, phrase, stat } = scan;
+        let Scan { query, k, offset, prefix_last, cap, facet, range, phrase, stat, pre } = scan;
         // Deep paging is served by over-fetching and dropping: rank order is only known once
         // everything above the page has been scored, so the pool must hold `offset + k`. Cost
         // therefore grows with `offset`, which is true of every engine without a stored cursor and
@@ -3283,7 +3392,10 @@ impl Index {
         if k == 0 {
             return Vec::new();
         }
-        let (mut term, group_is_quantity, expanded) = self.plan_stat(query, prefix_last, cap, stat);
+        let (mut term, group_is_quantity, expanded) = match pre {
+            Some(ex) => self.weigh(ex, cap, stat),
+            None => self.plan_stat(query, prefix_last, cap, stat),
+        };
         if term.is_empty() {
             return Vec::new();
         }
