@@ -852,12 +852,21 @@ open):
    expand phase and a weigh phase; each segment's stat-pass expansion is handed back to its own
    weigh phase, so collection-wide statistics cost ~1.0x on the typo tail instead of 1.8–2.2x,
    bit-identically ranked. See [`bench/roadmap/p82-expansion-handoff.md`](bench/roadmap/p82-expansion-handoff.md).
-5. **Decide the typo bar now that it has a number.** `p56` reframes it: the engine is interactive to
-   ~250 K documents and exact beyond that. Either publish that as the product statement, adopt
-   `search_capped` with its agreement figure, or build bucket-tiered enumeration. **Still red** —
-   and the 2026-09-08 revalidation measured presyo's real 241 K catalogue straddling the bar
-   (4.54 ms published → 5.05–6.07 ms fresh), which is exactly the ambiguity the decision exists to
-   end.
+5. ~~**Decide the typo bar.**~~ **DECIDED 2026-09-08.** The lever `p47` named as the alternative to
+   a decision — bucket-tiered candidate generation — is now built, measured, and reverted
+   ([`p83`](bench/roadmap/p83-bucket-tiers.md)): exact everywhere, slower everywhere it mattered,
+   because the abort that bounds a tier walk forfeits the exhaustiveness its early exit needs, and
+   because an unpruned intersection walk loses to the scan's own block-max pruning on every fat
+   shape. Four independent attacks (`p27` seeding ×2, `p29` cap, `p47` bounds, `p83` tiers) now
+   agree the tail is the cost of the ranking rule itself. The decision, on fresh real-1 M numbers
+   (5.32 ms, down from `p55`'s 8.26 via `p69`/`p82`): **the 5 ms bar stays, as the interactive
+   guarantee at the sizes consumers actually run — every real corpus ≤ 241 K documents passes it on
+   a quiet machine — and the published envelope beyond it is: 5.3 ms at 1.2 M real products,
+   `OVERALL: FAIL` on the recombined stress ladder by design.** Hosts above ~250 K documents that
+   need sub-5 ms tails get `search_capped`, whose agreement table is now measured on REAL 1 M
+   vocabulary (cap 8 → 4.73 ms at 98.80 % top-10 agreement; cap 2 → 3.35 ms at 92.95 %). The bar is
+   not raised, not quietly and not loudly: its failing row is labelled as the stress shape it is,
+   and the real number beside it is the product statement.
 6. ~~**Concurrency.**~~ **SHIPPED in two halves** — `p73`/`p75`/`p79` threaded the build (3.90x at
    a million documents, bytes identical), `p74` threaded the query tail (~2.9x p99 at 25–50
    segments, ranking bit-identical) and `p80` made it opt-in after the default measured 2.2–2.4x

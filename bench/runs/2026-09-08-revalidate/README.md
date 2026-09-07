@@ -43,10 +43,13 @@ holds), **drift** (fresh and published disagree beyond noise; explained or inves
 
 **Missing inputs (recorded, not failed):**
 
-- `real-million` needs `INDEX_MILLION_TSV` — a `name⇥vendor⇥code` export of presyo's 4.5 M-row
-  `raw_product`, which is not on this disk and needs a live database to regenerate. The bench that
-  settled the typo bar on real data therefore could not re-run; `presyo-catalog` (241 K real) and
-  `scale` (1 M recombined) bracket it.
+- `real-million` was MISSING at sweep start and was then **recovered the same day**: the export is
+  one SSH pipe to the house Postgres (the recipe printed in the bench header), and 1,199,988 real
+  rows came back in under a minute. Fresh, on the committed tree: **typo p99 5.32 ms at 1 M real**
+  (bar 5 ms: FAIL by 6 %) and **5.34 ms with the p83 tier prototype** — versus 8.26 ms published in
+  `p55`, an improvement owed to `p69`'s varint postings and `p82`'s hand-off, not to the (reverted)
+  tiers. The cap table on REAL vocabulary: cap 8 → 4.73 ms at 98.80 % top-10 agreement; cap 2 →
+  3.35 ms at 92.95 %.
 
 **Drift worth carrying forward:**
 

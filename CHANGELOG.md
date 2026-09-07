@@ -30,6 +30,27 @@ artifact through `scripts/build-wasm.sh`, both Node smokes, the Python ctypes ho
 smoke. Every step was run locally before the file was committed; the browser checks are excluded on
 purpose, with the reason written in the file. Green means nothing until the first push runs it, and
 the ROADMAP's honest-gaps line now says exactly that.
+### Tried and reverted — p83: bucket-tiered enumeration (2026-09-08)
+
+The one lever `p47` named for the 5 ms typo bar, built (250 lines over `search_opt`: per-shape
+intersection arms covering buckets 0-2, block-skipping drives, early exit on a completed sweep),
+exact everywhere it ran (the exhaustive oracle caught a duplicate-admission defect mid-build, worth
+reading the doc for), and **slower everywhere it mattered**: +8-14 % across `scale`'s ladder at 1 M,
+neutral on `real-million`'s real 1.2 M. The abort that bounds a tier walk forfeits the
+exhaustiveness its early exit needs, and an unpruned intersection loses to the scan's own block-max
+pruning on every fat shape. Reverted; the measurement closes the lever. Four attacks (`p27` x2,
+`p29`, `p47`, `p83`) now agree: the tail is the cost of the ranking rule, and the remaining work is
+pricing, not search.
+
+### Decided — the typo bar (2026-09-08)
+
+With the last lever measured closed, the bar resolves the way `p55` priced: **the 5 ms guarantee
+stands at the sizes consumers run** (every real corpus <= 241 K documents passes on a quiet
+machine), the published envelope beyond it is **5.3 ms at 1.2 M real products** (down from 8.26 via
+`p69`/`p82`; the recombined stress ladder stays `OVERALL: FAIL` by design), and hosts above ~250 K
+that need sub-5 ms get `search_capped` with its agreement table now measured on REAL 1 M vocabulary
+(cap 8: 4.73 ms at 98.80 % top-10 agreement). The bar is not raised; its failing row is labelled as
+the stress shape it is.
 ### Changed — p82: one expansion per segment, not two (2026-09-08)
 
 `p52` named the recovery and left it: "the first pass could hand its expansion to the second
