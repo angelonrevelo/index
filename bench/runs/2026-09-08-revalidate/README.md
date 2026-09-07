@@ -64,3 +64,47 @@ holds), **drift** (fresh and published disagree beyond noise; explained or inves
 
 Fresh console output for every run above is in this directory's `*.log` files where a run was
 captured end-to-end; summaries were transcribed at run time.
+
+
+## Estate coverage — every repo checked (2026-09-08)
+
+All 74 git repositories under `C:/Users/maran/Code/` were surveyed for a search-shaped workload
+(the pattern classes: SQL `LIKE`/`ILIKE`, `toLowerCase().includes()` filtering, `tsvector`/GIN
+columns, dedicated search routes). **19 have one.** Cross-referenced against this project's bench
+coverage:
+
+**Measured against `index` this sweep or before (10):** `presyo` (241 K catalogue + gold clusters),
+`profstopick` (registrar snapshot), `blead` (25,979 business names), `sisia-app` (catalog),
+`maphy` (places + geometry), `onegrid` (kernels), `booted` (2,600 tables), `alec` (119 K long
+documents + the image corpus), `biasd` (entity aliases), and the video/geo tiers on their data.
+
+**Declined, recorded, and re-checked (2):** `polkadoc` — declined Tantivy in writing with a
+measured 0.10 s linear scan and "measured need is absent"; its search is now a Rust `search` module
+over the user's own corpus, still a linear scan, still local. `advo` — declined a vector index; its
+`tsvector` corpus search is unchanged. The declines stand on their own measurements, not on
+politeness.
+
+**Search-shaped, never measured, real data on disk — the p84 candidate list (7):**
+
+| repo | workload | data on disk | their matcher today |
+|---|---|---|---|
+| `yclap` | species gallery name/scientific-name filter | ~7.4 MB iNat pipeline JSONs | `toLowerCase().includes()` |
+| `hobbycat` | listing search | 233 KB SQLite listings | SQL `LIKE %…%` |
+| `orsem-website` | course search | courses.json 369 KB + curriculum 306 KB | dedicated Search page |
+| `nookr2` | category + member combobox | Supabase seed 40 KB | `toLowerCase().includes()` |
+| `wheresthefx` | event search | 1.5 MB OSM venue fixture | drizzle `ilike` |
+| `openbid` | bid search | GIN `to_tsvector`, no static seed | Postgres FTS |
+| `trin` | candidate filter | 109 KB seed catalog | `toLowerCase().includes()` |
+
+**Search-shaped, no static corpus to measure against (6):** `medicapp` (Supabase `ilike`, prod data
+in DB), `mesro`, `paracelis-civic-door`, `aisis+` (live-scraped schedules), `polkadoc`'s user
+corpus, `advo`'s DB corpus. These need an export from their owners before a bench can be honest —
+a bench against fabricated rows would be the sampling error `p60` documented.
+
+**No search-shaped workload (the rest, ~40):** tooling, harnesses, agents, games, scaffolds —
+including the "grouped NO" list where every match was argv/route `.includes()`. `life` remains
+solved by a Postgres partial index at 2.9 ms, as the demand survey recorded.
+
+The governing rule stands: a repo joins this table's top section only with a measurement it
+already takes. The seven p84 candidates all have one (their own matcher is the baseline), and five
+of the seven have the corpus on disk today.
