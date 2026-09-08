@@ -147,6 +147,10 @@ name = "hobbycat-listings"
 path = "src/hobbycat_listings.rs"
 
 [[bin]]
+name = "trin-catalog"
+path = "src/trin_catalog.rs"
+
+[[bin]]
 name = "yclap-species"
 path = "src/yclap_species.rs"
 

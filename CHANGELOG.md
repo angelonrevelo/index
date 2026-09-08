@@ -30,6 +30,17 @@ artifact through `scripts/build-wasm.sh`, both Node smokes, the Python ctypes ho
 smoke. Every step was run locally before the file was committed; the browser checks are excluded on
 purpose, with the reason written in the file. Green means nothing until the first push runs it, and
 the ROADMAP's honest-gaps line now says exactly that.
+### Measured — p86: trin's opportunity catalog (2026-09-08)
+
+Third p84 candidate run for real, and the small-corpus lane produced a finding the big ones
+hadn't: **the consumer's own filter misses entries whose name the user typed correctly.** Their
+predicate is a case-folded substring on name/description; a name like "Master's Programme" does
+not contain the typed "masters", so the entry drops out silently — the engine's tokenizer matches
+it at 97.5 % top-10 vs their 87.9 %, on clean queries. Corrupted terms: 88 % of the filter's
+results are empty lists. The domain dropdown composes with text in one engine query at no recall
+cost. orsem-website was checked and honestly skipped: its Search page is a static form with no
+matcher to reproduce. [`bench/roadmap/p86-trin-catalog.md`](bench/roadmap/p86-trin-catalog.md).
+
 ### Measured — p84/p85: the first two p84 candidates run for real (2026-09-08)
 
 - **`yclap-species`** — the campus forest gallery (1,098 modeled species + the 3,928-taxa iNat
