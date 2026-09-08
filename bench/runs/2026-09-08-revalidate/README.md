@@ -84,17 +84,18 @@ over the user's own corpus, still a linear scan, still local. `advo` — decline
 `tsvector` corpus search is unchanged. The declines stand on their own measurements, not on
 politeness.
 
-**Search-shaped, never measured, real data on disk — the p84 candidate list (7):**
+**Search-shaped, never measured, real data on disk — the p84 candidate list, 2 of 7 now measured
+(same day):**
 
-| repo | workload | data on disk | their matcher today |
-|---|---|---|---|
-| `yclap` | species gallery name/scientific-name filter | ~7.4 MB iNat pipeline JSONs | `toLowerCase().includes()` |
-| `hobbycat` | listing search | 233 KB SQLite listings | SQL `LIKE %…%` |
-| `orsem-website` | course search | courses.json 369 KB + curriculum 306 KB | dedicated Search page |
-| `nookr2` | category + member combobox | Supabase seed 40 KB | `toLowerCase().includes()` |
-| `wheresthefx` | event search | 1.5 MB OSM venue fixture | drizzle `ilike` |
-| `openbid` | bid search | GIN `to_tsvector`, no static seed | Postgres FTS |
-| `trin` | candidate filter | 109 KB seed catalog | `toLowerCase().includes()` |
+| repo | workload | data on disk | their matcher today | p84 verdict |
+|---|---|---|---|---|
+| `yclap` | species gallery filter | ~7.4 MB iNat pipeline JSONs | `toLowerCase().includes()` | **MEASURED** — [`p84`](../../bench/roadmap/p84-yclap-species.md): 93 % of typo'd species queries return nothing today; engine 99.4 % hit@10 at 24 KB index. Clean typeahead belongs to their uncapped filter (recorded straight) |
+| `hobbycat` | listing search | 233 KB SQLite / **8 active listings** | SQL `LIKE %…%` | **MEASURED** — [`p85`](../../bench/roadmap/p85-hobbycat-listings.md): engine wins corrupted terms 65.6 % vs 15.6 %, but 8 rows = measured need absent (polkadoc class); bench re-runs against growth |
+| `orsem-website` | course search | courses.json 369 KB + curriculum 306 KB | dedicated Search page | candidate — data on disk |
+| `nookr2` | category + member combobox | Supabase seed 40 KB | `toLowerCase().includes()` | candidate — data on disk |
+| `wheresthefx` | event search | 1.5 MB OSM venue fixture | drizzle `ilike` | candidate — data on disk |
+| `openbid` | bid search | GIN `to_tsvector`, no static seed | Postgres FTS | candidate — needs an export |
+| `trin` | candidate filter | 109 KB seed catalog | `toLowerCase().includes()` | candidate — data on disk |
 
 **Search-shaped, no static corpus to measure against (6):** `medicapp` (Supabase `ilike`, prod data
 in DB), `mesro`, `paracelis-civic-door`, `aisis+` (live-scraped schedules), `polkadoc`'s user

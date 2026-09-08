@@ -143,5 +143,13 @@ name = "video-shot"
 path = "src/video_shot.rs"
 
 [[bin]]
+name = "hobbycat-listings"
+path = "src/hobbycat_listings.rs"
+
+[[bin]]
+name = "yclap-species"
+path = "src/yclap_species.rs"
+
+[[bin]]
 name = "real-million"
 path = "src/real_million.rs"

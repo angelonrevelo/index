@@ -30,6 +30,22 @@ artifact through `scripts/build-wasm.sh`, both Node smokes, the Python ctypes ho
 smoke. Every step was run locally before the file was committed; the browser checks are excluded on
 purpose, with the reason written in the file. Green means nothing until the first push runs it, and
 the ROADMAP's honest-gaps line now says exactly that.
+### Measured — p84/p85: the first two p84 candidates run for real (2026-09-08)
+
+- **`yclap-species`** — the campus forest gallery (1,098 modeled species + the 3,928-taxa iNat
+  pipeline corpus). The gallery's substring matcher returns **zero results for 823 of 885 (93 %)
+  one-letter-typo'd species queries**; the engine answers 99.4 % of them from a 24 KB index built
+  in 8 ms. Recorded straight: on clean prefixes their uncapped filter list wins (100 % vs the
+  engine's ranked 87.1 % top-10) — for yclap's UX the engine is the right FILTER, not a ranked
+  top-10 — and the baseline's 99.1 % on reversed word order is an accident of the `species_code`
+  slug repeating the binomial. [`bench/roadmap/p84-yclap-species.md`](bench/roadmap/p84-yclap-species.md).
+- **`hobbycat-listings`** — 8 active listings. The engine beats `LIKE` on corrupted terms
+  (65.6 % vs 15.6 %, LIKE returning nothing on 27 of 32) and matches it on clean ones, but the
+  size is the verdict: measured need absent, the polkadoc class, re-runnable the day the catalogue
+  grows. [`bench/roadmap/p85-hobbycat-listings.md`](bench/roadmap/p85-hobbycat-listings.md).
+
+Both benches read the sibling repos' own data and reproduce their matchers exactly as the
+baseline. Five p84 candidates remain (orsem-website, nookr2, wheresthefx, openbid, trin).
 ### Tried and reverted — p83: bucket-tiered enumeration (2026-09-08)
 
 The one lever `p47` named for the 5 ms typo bar, built (250 lines over `search_opt`: per-shape
