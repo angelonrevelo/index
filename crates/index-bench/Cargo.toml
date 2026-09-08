@@ -151,6 +151,10 @@ name = "trin-catalog"
 path = "src/trin_catalog.rs"
 
 [[bin]]
+name = "wheresthefx-venues"
+path = "src/wheresthefx_venues.rs"
+
+[[bin]]
 name = "yclap-species"
 path = "src/yclap_species.rs"
 

@@ -41,6 +41,16 @@ results are empty lists. The domain dropdown composes with text in one engine qu
 cost. orsem-website was checked and honestly skipped: its Search page is a static form with no
 matcher to reproduce. [`bench/roadmap/p86-trin-catalog.md`](bench/roadmap/p86-trin-catalog.md).
 
+### Measured — p87: wheresthefx's OSM venues at five-figure scale (2026-09-08)
+
+13,487 real Metro-Manila venues, 4 B/venue index, 38 ms build. On token-class recall — the honest
+metric on a branch-heavy corpus, with the two wrong metric drafts documented — the engine reads
+**99.3 % clean / 89.7 % corrupted** against the drizzle `ilike` predicate's **90.4 % / 12.1 %**, and
+the predicate returns NOTHING for 1,178 clean queries (the punctuation trap: a user types
+"7eleven", the OSM name is "7-Eleven") and 10,185 corrupted ones. Typeahead: 98.9 % class recall at
+45 µs p99, a property a 13,487-row per-keystroke SQL scan cannot have.
+[`bench/roadmap/p87-wheresthefx-venues.md`](bench/roadmap/p87-wheresthefx-venues.md).
+
 ### Measured — p84/p85: the first two p84 candidates run for real (2026-09-08)
 
 - **`yclap-species`** — the campus forest gallery (1,098 modeled species + the 3,928-taxa iNat
