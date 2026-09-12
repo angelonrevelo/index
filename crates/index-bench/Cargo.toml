@@ -7,6 +7,10 @@ rust-version.workspace = true
 description = "Benchmark harness: PLA learned index vs BTreeMap on bytes/key + p50/p99 lookup."
 
 [[bin]]
+name = "presyo-search"
+path = "src/presyo_search.rs"
+
+[[bin]]
 name = "beat-btreemap"
 path = "src/beat_btreemap.rs"
 
