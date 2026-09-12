@@ -88,21 +88,60 @@ faster** — `bench.test.ts` exists but no head-to-head JS-vs-WASM timing at 1 M
 **Why.** At 260,000 rows the engine matched their shipped SQL on recall (100 %) and beat it on hit@1
 (100 % vs 99.4 % clean; 99.0 % vs 97.6 % on typos), at sub-millisecond query latency against ~55 ms.
 
-**The decision that comes first.** presyo's architecture question is not "is the engine good" but
+**DECIDED and BUILT (2026-09-12).** The architecture question below was settled — **artifact,
+mmap'd** — and the integration now exists on presyo's side: `scripts/index-build.sh` (nightly cron,
+06:45, after their materialized-view refresh) and `scripts/index-eval.py`. See
+`presyo/docs/INDEX_EVAL.md`. The engine is built from source at `/opt/presyo/bin/index`.
+
+**Measured on presyo's REAL corpus**, 35,637 rows from `mv_pilot_ready_product` — not recombined
+distractors this time:
+
+| | build | artifact | terms |
+|---|---|---|---|
+| | 0.19 s | 3.47 MB | 50,492 |
+
+precision@10 over 15 queries with a checkable ground truth: **99 % vs their shipped SQL's 93 %**.
+And the entire margin is one thing this repo had not previously identified —
+
+**FILIPINO-LANGUAGE QUERIES.** `sabon` (Filipino: soap) scores **20 % on their SQL path and 90 %
+here**; `tsokolate` 80 % vs 100 %. All 13 English queries tie at 100 %. Their `pg_trgm` similarity
+returns Breeze detergent, Dove bodywash and — literally — "El Sabor Nacho Chips" for `sabon`
+(*sabon* ≈ *sabor*). Trigram similarity has no way to cross the language boundary; the engine
+reaches it through their `search_text` column. For a Philippine price-comparison product that is a
+core use case, and it is a stronger argument for adoption than the latency numbers above.
+
+**A metric warning worth carrying.** The obvious comparison — how many ids do the two engines agree
+on — is misleading: overlap@20 averaged 47 % and `sabon` overlapped on **0 of 20**, which reads as a
+broken engine. Both return 20 relevant products; they return different ones. Overlap measures
+agreement, not quality.
+
+**The decision that was made.** presyo's architecture question was never "is the engine good" but
 **where the index lives**:
 
 - **In the API process** — build at boot from Postgres, rebuild on a schedule. Simplest, no new
   infrastructure, and matches the "no second datastore" thesis. Costs process memory (~160 MB at
   1 M docs) and a rebuild window.
-- **As an artifact** — build in cron, write a `.idx`, API mmaps it. Cheap queries, bounded staleness,
-  one more file to ship.
+- **As an artifact — CHOSEN.** Build in cron, write a `.idx`, API mmaps it. Cheap queries, bounded
+  staleness, one more file to ship. At 3.47 MB for their whole storefront corpus, "one more file"
+  is not much of a cost.
 - **In Postgres via pgrx** — closest to their current shape, and **not portable**: RDS no, Supabase
-  no, Neon deprecated. Viable only because presyo self-hosts.
+  no, Neon deprecated. Viable only because presyo self-hosts — a bet the artifact route avoids.
 
-**Blocking issue.** The engine has **no incremental update**: adding a document means a rebuild.
-presyo's daily scrape processes 2.08 M raw observations. A boot-time rebuild is ~15 s at 1 M
-documents — acceptable for a nightly cycle, not for continuous ingest. **This is the real gate on
-presyo adoption, and it is unbuilt.**
+**The blocking issue is CLOSED.** This section previously read: *"The engine has no incremental
+update: adding a document means a rebuild. … This is the real gate on presyo adoption, and it is
+unbuilt."* `index apply` shipped on 2026-09-08 with `cdc-equivalence` at **0 keys wrong,
+14,288 = 14,288** over 8,000 inserts/updates/deletes. The claim outlived its truth by four days and
+was still being used to justify not adopting; that is the failure this correction records.
+
+**Two build traps, found the hard way, now documented in presyo's script.** CSV `HEADER` is
+REQUIRED — the schema maps by column name, and without it the build reports
+`built 35636 rows, 0 terms`, warns that every row has a blank key, and **exits 0**. A caller that
+trusts the exit code ships an empty index. And `--schema` caps at 4 fields
+(`index: 5 fields, at most 4 are supported`), which is not in the CLI's own usage text.
+
+**Still not done, and not claimed:** presyo's API does not yet SERVE from the artifact, `apply` has
+never been run against their change stream, and no typo/recall benchmark was reproduced on the real
+corpus.
 
 **Honest caveat.** The 260 K comparison is 1,940 real rows plus recombined distractors. It does not
 populate their `search_text` column or their ~296 K aliases, and their input contract
