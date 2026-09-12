@@ -133,6 +133,31 @@ else
   echo "  PASS  a failing reselect is a loud stop rather than a skipped row"
 fi
 
+# ---- --sql: the dump IS the pipe --------------------------------------------------------------
+# A dump a database already wrote — pg_dump --column-inserts, a Supabase seed.sql, sqlite3 .dump —
+# is full of rows and needs no client to run. This exercises both shapes the reader takes:
+# INSERT statements (with the decorations dumps actually carry: OVERRIDING, ON CONFLICT, comments,
+# dollar quotes) and a plain pg_dump COPY ... FROM stdin block, plus the --table filter.
+cat > "$WORK/dump.sql" <<'SQL'
+-- pg_dump-style header noise
+SET search_path = public;
+CREATE TABLE product (sku text, name text, brand text, price numeric); -- skipped
+INSERT INTO public.product (sku, name, brand, price) OVERRIDING SYSTEM VALUE VALUES
+  ('S-1', 'Colgate Total Toothpaste 150g', 'Colgate', 119.5)
+  ON CONFLICT (sku) DO UPDATE SET name = EXCLUDED.name;
+INSERT INTO public.other (x) VALUES ('not this table');
+COPY public.product (sku, name, brand, price) FROM stdin;
+S-2	Colgate Fresh Gel Toothpaste 100g	Colgate	89.0
+S-3	Aquafresh Mini Toothpaste 50g	Aquafresh	45.0
+\.
+SQL
+"$IDX" build -d "$WORK/sqldata" --sql --table public.product \
+  --schema "$SCHEMA" --key sku --facet brand --numeric price < "$WORK/dump.sql" 2>/dev/null
+
+check "INSERT rows from a dump are indexed"    "$(keys "$WORK/sqldata" colgate)"   "S-1 S-2 "
+check "a COPY block's rows are indexed"        "$(keys "$WORK/sqldata" aquafresh)" "S-3 "
+check "dump typos are corrected"               "$(keys "$WORK/sqldata" 'colgaye')" "S-1 S-2 "
+
 # ---- refusals: a tool that silently does the wrong thing is worse than one that stops ------------
 if "$IDX" build -d "$WORK/nokey" --schema "$SCHEMA" < "$WORK/rows.csv" 2>/dev/null; then
   if "$IDX" apply -d "$WORK/nokey" --jsonl < "$WORK/changes.jsonl" 2>/dev/null; then

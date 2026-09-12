@@ -84,7 +84,7 @@ impl<R: BufRead> RowReader<R> {
     /// could not parse produces an index that is quietly missing data, and the only symptom is a
     /// search that does not find something — which is indistinguishable from the engine being bad
     /// at its job.
-    pub fn next(&mut self) -> Result<Option<Record>, String> {
+    pub fn next_row(&mut self) -> Result<Option<Record>, String> {
         loop {
             let Some(line) = self.read_logical_line()? else { return Ok(None) };
             if line.trim().is_empty() {
@@ -164,6 +164,19 @@ impl<R: BufRead> RowReader<R> {
     }
 }
 
+/// A reader is an iterator of records, so `for rec in reader` works and an `Err` item is the
+/// loud stop the malformed-record policy calls for.
+impl<R: BufRead> Iterator for RowReader<R> {
+    type Item = Result<Record, String>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.next_row() {
+            Ok(Some(r)) => Some(Ok(r)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+}
+
 /// Whether a CSV line has an even number of unescaped quotes, i.e. no field is still open.
 fn quotes_balanced(s: &str) -> bool {
     let b = s.as_bytes();
@@ -212,10 +225,10 @@ mod tests {
     use std::io::Cursor;
 
     fn read(text: &str, f: Format, header: bool) -> Result<Vec<Record>, String> {
-        let mut r = RowReader::new(Cursor::new(text.to_string()), f, header);
+        let r = RowReader::new(Cursor::new(text.to_string()), f, header);
         let mut out = Vec::new();
-        while let Some(rec) = r.next()? {
-            out.push(rec);
+        for rec in r {
+            out.push(rec?);
         }
         Ok(out)
     }
@@ -292,8 +305,8 @@ mod tests {
 
         let mut r = RowReader::new(Cursor::new(raw), Format::Csv, true);
         let mut got = Vec::new();
-        while let Some(rec) = r.next().expect("a bad byte must not abort the stream") {
-            got.push(rec);
+        for rec in &mut r {
+            got.push(rec.expect("a bad byte must not abort the stream"));
         }
         assert_eq!(got.len(), 2, "both rows survive");
         assert_eq!(got[1]["name"], "plain tea", "a clean row is untouched");

@@ -26,6 +26,9 @@ mysql -B -e 'SELECT ...'                   | index build -d data/ --tsv ...
 mongoexport --type json                    | index build -d data/ --jsonl ...
 curl -s /api/product | jq -c '.[]'         | index build -d data/ --jsonl ...
 
+# ...or skip the client entirely: the dump the database already wrote IS the pipe
+index build -d data/ --sql --table product   --schema 'sku:0:0.6,name:3:0.4,brand:1:0.6' --key sku --facet brand < dump.sql
+
 index search -d data/ 'colgaye tothpaste'  # typo-corrected, from the shell
 ```
 

@@ -8,6 +8,27 @@ for what was deliberately ruled out.
 
 ## [Unreleased]
 
+### Added — `index build --sql`: the dump is the pipe (2026-09-13)
+
+A fourth input format, and the one that needs **no client and no database running**: the dump a
+database already wrote. `pg_dump --inserts`/`--column-inserts`, a Supabase `seed.sql`,
+`sqlite3 .dump`, `mysqldump` — all of them are files sitting in a repo or a backup directory, full
+of rows. `--sql` reads them (`--table NAME` filters, repeatable); the other three formats keep
+covering "a client prints rows".
+
+Parsed, on the real shapes dumps carry: quoted/bare/schema-qualified identifiers,
+`OVERRIDING SYSTEM VALUE` before or after the column list, multi-row `VALUES`, `''` doubling,
+`E'…'` backslash escapes (octal and `\xHHHH`), dollar-quoted strings, `::type` casts, calls kept
+as literal text, `ON CONFLICT`/`RETURNING` tails, `--` and `/* */` comments, and plain `pg_dump`
+`COPY … FROM stdin` blocks ending at `\.`. Not parsed, on purpose: backslash escapes inside a
+*plain* `'…'` string — that is MySQL dialect, and accepting it would corrupt a Postgres path
+literal (`'C:\tmp'` would grow a tab); MySQL's pipe story stays `mysql -B` TSV.
+
+Gated by 34 `index-cli` tests (18 on the SQL parser) and a new `cli-smoke.sh` section: an
+INSERT+COPY dump builds, typos correct, and the `--table` filter excludes.
+
+## [Unreleased]
+
 ### Added — the two test gaps the honest-gaps list named (2026-09-08)
 
 - **`FmIndex::locate` for an absent pattern.** The contract half `count` had and `locate` did not:

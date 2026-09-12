@@ -32,14 +32,12 @@
 //! small — so it cannot regenerate a segment from itself. Re-run `build` against the source of
 //! truth; `stat` tells you when that is worth doing.
 
-mod collection;
-mod json;
-mod row;
-
+use index_cli::{collection, row, sql};
 use index_text::{Doc, Field, IndexBuilder, Schema};
-use std::collections::HashMap;
 use row::{Format, Record, RowReader};
-use std::io::{BufWriter, Write};
+use sql::SqlDumpReader;
+use std::collections::HashMap;
+use std::io::{BufWriter, BufRead, Write};
 use std::path::PathBuf;
 
 const USAGE: &str = "\
@@ -115,6 +113,12 @@ INPUT FORMAT (both verbs)
   --csv             comma-separated, RFC-4180 quoting. Default.
   --tsv             tab-separated, no quoting.
   --jsonl           one JSON object per line; nested keys address as `a.b.c`.
+  --sql             a SQL dump: INSERT statements (pg_dump --inserts/--column-inserts,
+                    supabase/seed.sql, sqlite3 .dump, mysqldump) or COPY ... FROM stdin
+                    blocks (plain pg_dump). Other statements are skipped and counted.
+  --table NAME      with --sql, read only this table. Repeatable; a bare name (\"product\")
+                    or schema-qualified (\"public.product\"). Without it, every table in
+                    the dump is read.
   --header          first delimited line names the columns. Default for --csv/--tsv.
   --no-header       columns are named c0, c1, ... instead.
   --field NAME=PATH map schema field NAME to input column/path PATH. Repeatable.
@@ -128,6 +132,11 @@ RECIPES — the same tool, every database
   mysql -B -e 'SELECT sku,name,brand FROM product'                 | index build -d data/ --tsv ...
   mongoexport --collection product --type json                     | index build -d data/ --jsonl ...
   curl -s https://api.example.com/product | jq -c '.[]'            | index build -d data/ --jsonl ...
+
+  # the dump IS the pipe: a file the database already wrote, no client needed
+  pg_dump --data-only --column-inserts app > dump.sql
+  index build -d data/ --sql --table product \\
+    --schema 'sku:0:0.6,name:3:0.4,brand:1:0.6' --key sku --facet brand < dump.sql
 
   # keeping it current, from whatever already emits changes
   pg_recvlogical -S idx -f - --start -P wal2json \\
@@ -173,6 +182,10 @@ struct Opt {
     numeric: Vec<String>,
     position: bool,
     format: Option<Format>,
+    /// `--sql`: the input is a SQL dump, not a printed-row stream.
+    sql: bool,
+    /// `--table`, for `--sql`: which tables in the dump to read. Empty = all.
+    table: Vec<String>,
     header: Option<bool>,
     field: Vec<(String, String)>,
     op: Option<String>,
@@ -208,6 +221,8 @@ impl Opt {
                 "--csv" => o.format = Some(Format::Csv),
                 "--tsv" => o.format = Some(Format::Tsv),
                 "--jsonl" => o.format = Some(Format::Jsonl),
+                "--sql" => o.sql = true,
+                "--table" => o.table.push(take(&mut i, "--table")?),
                 "--header" => o.header = Some(true),
                 "--no-header" => o.header = Some(false),
                 "-k" => {
@@ -236,11 +251,48 @@ impl Opt {
     }
 
     /// Input framing. JSON has no header line; delimited text is assumed to have one, because every
-    /// recipe in the usage text emits one and a header is how columns get their names.
-    fn reader(&self) -> RowReader<std::io::StdinLock<'static>> {
+    /// recipe in the usage text emits one and a header is how columns get their names. A SQL dump
+    /// is its own framing: statements, not lines.
+    fn reader(&self) -> Result<Input<std::io::StdinLock<'static>>, String> {
+        if self.sql {
+            if self.format.is_some() || self.header.is_some() {
+                return Err("--sql is a format of its own; --csv/--tsv/--jsonl/--header do not apply".into());
+            }
+            return Ok(Input::Sql(SqlDumpReader::new(std::io::stdin().lock(), &self.table)));
+        }
         let format = self.format.unwrap_or(Format::Csv);
         let header = self.header.unwrap_or(format != Format::Jsonl);
-        RowReader::new(std::io::stdin().lock(), format, header)
+        Ok(Input::Rows(RowReader::new(std::io::stdin().lock(), format, header)))
+    }
+}
+
+/// Either a printed-row stream or a SQL dump, behind one `next_row()`. Both verbs loop over rows
+/// and report line numbers and lossy-line counts, so both input families answer to one interface.
+enum Input<R: BufRead> {
+    Rows(RowReader<R>),
+    Sql(SqlDumpReader<R>),
+}
+
+impl<R: BufRead> Input<R> {
+    fn next_row(&mut self) -> Result<Option<Record>, String> {
+        match self {
+            Input::Rows(r) => r.next().transpose(),
+            Input::Sql(r) => r.next().transpose(),
+        }
+    }
+
+    fn line_no(&self) -> u64 {
+        match self {
+            Input::Rows(r) => r.line_no(),
+            Input::Sql(r) => r.line_no(),
+        }
+    }
+
+    fn lossy_line(&self) -> u64 {
+        match self {
+            Input::Rows(r) => r.lossy_line(),
+            Input::Sql(r) => r.lossy_line(),
+        }
     }
 }
 
@@ -320,9 +372,9 @@ fn cmd_build(o: &Opt) -> Result<(), String> {
         return Err("could not enable positions".into());
     }
 
-    let mut r = o.reader();
+    let mut r = o.reader()?;
     let mut n = 0usize;
-    while let Some(rec) = r.next()? {
+    while let Some(rec) = r.next_row()? {
         b.add(&doc_of(&rec, &path));
         n += 1;
     }
@@ -331,6 +383,19 @@ fn cmd_build(o: &Opt) -> Result<(), String> {
     }
     let ix = b.build()?;
     let lossy = r.lossy_line();
+    // A dump is full of statements that are not rows; say what was skipped so a table that did not
+    // make it in is a visible number, not a mystery.
+    if let Input::Sql(s) = &r {
+        if s.skipped() > 0 {
+            eprintln!(
+                "note: {} statements in the dump were skipped (not INSERT/COPY FROM stdin rows)",
+                s.skipped()
+            );
+        }
+        if s.filtered() > 0 {
+            eprintln!("note: {} rows skipped from tables outside --table", s.filtered());
+        }
+    }
 
     // A fresh collection replaces any existing one. `build` IS the compaction path, so it has to
     // be able to overwrite; removing only `.idx` files leaves anything else in the directory alone.
@@ -420,11 +485,11 @@ fn cmd_apply(o: &Opt) -> Result<(), String> {
     };
     let op_path = o.op.clone().unwrap_or_else(|| "op".to_string());
 
-    let mut r = o.reader();
+    let mut r = o.reader()?;
     let mut change: Vec<Change> = Vec::new();
     let mut reselected = 0usize;
     let mut reread_deleted = 0usize;
-    while let Some(rec) = r.next()? {
+    while let Some(rec) = r.next_row()? {
         // A record with no op field is an upsert. That is what a plain row stream is, so the same
         // command works for "here are some new rows" without inventing an envelope for them.
         let upsert = match rec.get(&op_path) {
@@ -654,7 +719,7 @@ fn reselect_row(cmd: &str, key: &str, o: &Opt) -> Result<Option<Record>, String>
     let format = o.format.unwrap_or(Format::Csv);
     let header = o.header.unwrap_or(format != Format::Jsonl);
     let mut r = RowReader::new(std::io::Cursor::new(out.stdout), format, header);
-    r.next()
+    r.next().transpose()
 }
 
 /// Keep only the LAST record for each key, preserving stream order among the survivors.
