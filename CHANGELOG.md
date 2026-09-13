@@ -8,6 +8,24 @@ for what was deliberately ruled out.
 
 ## [Unreleased]
 
+### Measured — p88: mode-coded posting lists, IDXTEXT11 (2026-09-13)
+
+**57.3 → 35.8 B/doc on presyo's 241,677 real products (−37.5 %), 79.3 → 32.4 B/doc at 1 M
+(−59 %), latency at parity on every interleaved arm, ranking identical.** The posting section was
+51 % of the file, and two thirds of it was term frequencies of which only 1.19 of 4 slots per
+posting are nonzero — a quarter of the section was literal zero bytes. Lists now pick their
+encoding from their own length: sparse varint with a frequency mask below 64 postings (the median
+real list holds ONE), block-FOR columnar — five columns, 128-value blocks, one width byte per
+block, whole-zero columns as a single byte — above. The mode is derived from the count both sides
+read, so there is no mode byte to disagree about.
+
+The measurement the design rests on, the interleaved A/B tables, and the two
+encoder/reader-layout bugs that only `scale`'s reload check could see (the search-side benches
+never cross the serialization boundary) are in [`bench/roadmap/p88-posting-codec.md`](bench/roadmap/p88-posting-codec.md).
+Two regression tests pin the mode boundary, multi-block round-trips, and the new corruption
+modes. Old `IDXTXT10` files are refused with "rebuild", not "bad magic".
+
+
 ### Added — `index build --sql`: the dump is the pipe (2026-09-13)
 
 A fourth input format, and the one that needs **no client and no database running**: the dump a

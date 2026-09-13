@@ -834,6 +834,20 @@ and `p50`'s state-based design never needs a before-image — but it found **a r
 TOAST placeholders silently blanking fields, now guarded by `index apply --require`. §7.1 was
 rejected with reasons.
 
+**`p88` took the postings-compression row from the honest-limits list, measured-first.** Decoding
+the real presyo posting section list by list showed two thirds of its bytes were term frequencies
+with only 1.19 of 4 slots nonzero per posting — a quarter of the section was literal zeros — and
+that the median list holds ONE posting while lists over 64 postings carry 72 % of the bytes. So
+`IDXTEXT11` picks each list's encoding from its own count: sparse varint with a frequency mask
+below 64 postings, block-FOR columnar above. **57.3 → 35.8 B/doc on presyo (−37.5 %), 79.3 →
+32.4 B/doc at 1 M (−59 %), latency at parity on interleaved arms, ranking identical** — and the
+two encoder/reader layout bugs the first draft carried were caught by `scale`'s reload check, not
+by any search-side bench, because the benches never cross the serialization boundary. Full account,
+including the exact A/B tables: [`bench/roadmap/p88-posting-codec.md`](bench/roadmap/p88-posting-codec.md).
+The CLI also grew `--sql` (`p88a`): the dump a database already wrote — `pg_dump --inserts`, a
+Supabase `seed.sql`, `sqlite3 .dump` — as a fourth input format beside the pipe, with `--table`
+filtering, gated by 18 parser tests and a `cli-smoke.sh` section.
+
 **Next, in order** (re-derived 2026-09-08 after the revalidation sweep — two of the items this
 list carried were already closed by later work and are marked as such rather than re-listed as
 open):

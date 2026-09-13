@@ -17,7 +17,7 @@
 /** Bytes of magic + section table. Mirrors `MAGIC.len() + TABLE_BYTE` in `format.rs`.
  *
  * This is why `format.rs` holds the magic at eight bytes forever rather than letting it grow to
- * `IDXTEXT10`: a range reader must know the head's SIZE before it can read the version out of it.
+ * `IDXTEXT11`: a range reader must know the head's SIZE before it can read the version out of it.
  */
 const HEAD_BYTE = 8 + 18 * 16;
 

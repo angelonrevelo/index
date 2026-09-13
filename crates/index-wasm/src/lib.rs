@@ -2948,12 +2948,17 @@ mod tests {
                 host.read_byte,
                 file.len()
             );
-            // The posting section is the bulk, so skipping it must be worth a clear majority.
+            // The property is that the range path SKIPS the bulk — and since p88 the bulk's
+            // size depends on the codec, so measure the skip against the posting section
+            // itself: more than half of it must have gone unread.
+            let table = index_text::read_section_table(&file).expect("fixture has a section table");
+            let skipped = file.len() - host.read_byte;
             assert!(
-                host.read_byte * 2 < file.len(),
-                "read {} of {} bytes, which is not materially less",
-                host.read_byte,
-                file.len()
+                skipped * 2 > table.posting.len as usize,
+                "skipped {} of {} bytes (posting section {}), which is not materially less",
+                skipped,
+                file.len(),
+                table.posting.len
             );
             assert!(after_open < host.read_byte, "the query must read something of its own");
             idx_range_close(rh);

@@ -22,44 +22,46 @@
 use crate::analyze::AliasTable;
 use crate::index::{Field, Index, Schema};
 
-/// `"IDXTEXT10"` — magic plus format version.
+/// `"IDXTEXT11"` — magic plus format version.
 ///
-/// The trailing number has moved 1 -> 10 as sections were added: priors (`2`), facets (`3`),
+/// The trailing number has moved 1 -> 11 as sections were added: priors (`2`), facets (`3`),
 /// multi-slot facets (`4`, same span count but a different encoding), numeric columns (`5`),
 /// token positions (`6`), document keys (`7`), unscored columns (`8`), delta-varint position
-/// sections (`9`), delta-varint posting lists (`10`).
+/// sections (`9`), delta-varint posting lists (`10`), mode-coded posting lists (`11`).
 /// Every bump is forced by the `TABLE_BYTE` assertion in the tests rather than remembered.
 ///
 /// **`10` is nine bytes, not eight.** The version outgrew the digit the magic reserved for it,
 /// which widens the head by one and moves the section table with it -- unavoidable without
 /// abandoning the version number, and every offset in the file is absolute from the start of it,
-/// so nothing else shifts.
+/// so nothing else shifts. Version 11 folded the name back to eight bytes: `IDXTXT` + two digits.
 ///
-/// The last two bumps did **not** widen the section table — they changed the ENCODING of a
-/// section that was already there, which is the same incompatibility in fewer bytes. A `9`
-/// reader decoding a `10` posting section would read a varint list count as a `u32` document id
-/// and the bytes after it as term frequencies, and every answer it returned would be a confident
-/// wrong one. That is exactly the "plausible garbage" this format bumps to avoid, so the magic
-/// moved even though the table did not.
+/// The last three bumps did **not** widen the section table — they changed the ENCODING of a
+/// section that was already there, which is the same incompatibility in fewer bytes. A `10`
+/// reader decoding an `11` posting section would read a varint list count correctly and then
+/// misparse every posting after it, and every answer it returned would be a confident wrong one.
+/// That is exactly the "plausible garbage" this format bumps to avoid, so the magic moved even
+/// though the table did not.
+///
 /// **Eight bytes, always.** The `E` is dropped at version 10 rather than letting the magic grow to
 /// nine, because a RANGE reader has to know how many bytes the head is BEFORE it can know the
 /// version — read 297 and you mis-parse a v9 file, read 296 and you mis-parse a v10 one. A
 /// fixed-width magic keeps `MAGIC.len() + TABLE_BYTE` a constant a browser can fetch blind, which
 /// is what `js/opfs-worker.mjs` does and what `p68` publishes as "296 bytes to open any file".
-pub const MAGIC: [u8; 8] = *b"IDXTXT10";
+pub const MAGIC: [u8; 8] = *b"IDXTXT11";
 
 /// The magic of every format version this crate has ever written, oldest first, so a reader can
-/// say *"that is an `IDXTEXT9` file, this build reads `IDXTEXT10`"* instead of *"bad magic"*.
+/// say *"that is an `IDXTEXT9` file, this build reads `IDXTEXT11`"* instead of *"bad magic"*.
 ///
 /// An index is a file a consumer keeps. Telling them their file is a stale version they must
 /// rebuild is a different instruction from telling them it is not an index at all, and only one of
 /// those is true when the digit moves.
 ///
-/// All of these are eight bytes, so the match is exact rather than a prefix — see `MAGIC` for why
-/// the width is held constant instead of growing at version 10.
-const KNOWN_MAGIC: [&[u8]; 9] = [
+/// All of these are matched as exact-width prefixes, so the eight-byte `IDXTXT10` sits beside the
+/// nine-byte `IDXTEXT1`–`9` names — see `MAGIC` for why the width is held constant instead of
+/// growing at version 10.
+const KNOWN_MAGIC: [&[u8]; 10] = [
     b"IDXTEXT1", b"IDXTEXT2", b"IDXTEXT3", b"IDXTEXT4", b"IDXTEXT5", b"IDXTEXT6", b"IDXTEXT7",
-    b"IDXTEXT8", b"IDXTEXT9",
+    b"IDXTEXT8", b"IDXTEXT9", b"IDXTXT10",
 ];
 
 /// Explain a magic mismatch: an older (or newer) `IDXTEXT` version, or not an index at all.
@@ -114,11 +116,24 @@ pub struct SectionTable {
     /// Still fixed width, deliberately: this is the array a range reader fetches to turn a term
     /// into a byte range, so it has to be indexable without decoding anything before it.
     pub posting_offset: Span,
-    /// Delta-varint posting lists, one per term, in the order [`SectionTable::posting_offset`]
-    /// bounds. Each list is self-describing: a varint **posting count**, then that many postings
-    /// of a varint **document-id delta** followed by `MAX_FIELD` varint term frequencies. The
-    /// first document of a list is written whole; the rest are gaps from the previous, because
-    /// document ids ascend within a list.
+    /// Mode-coded posting lists, one per term, in the order [`SectionTable::posting_offset`]
+    /// bounds. Each list is self-describing — a varint **posting count** chooses the mode by its
+    /// own magnitude, then the postings — so one list still decodes on its own byte range.
+    ///
+    /// **Short lists (`POST_BLOCKED_MIN` or fewer postings) are sparse varint.** The measured
+    /// shape of every real corpus so far is a long tail of distinctive terms whose median list
+    /// holds ONE posting, where per-block framing costs more than it saves. Per posting: a varint
+    /// **document-id delta** (first written whole, rest as gaps — ids ascend within a list), then
+    /// one **mask byte** whose bit `i` says field `i`'s term frequency is nonzero, then a varint
+    /// for each SET bit in field order. Two thirds of frequency slots are zero on the presyo
+    /// catalogue; before `11` every one of those zeros cost a whole byte.
+    ///
+    /// **Long lists are block-FOR columnar.** The head terms carry 72 % of posting bytes, and a
+    /// varint pays 2–3 bytes where a frame of reference pays one. The five columns — document-id
+    /// deltas, then the `MAX_FIELD` term-frequency columns — are each cut into `POST_BLOCK`
+    /// blocks: a column whose every value is zero is a single `0xFF` kind byte; otherwise each
+    /// block is a u8 **bit width** followed by that many values packed LSB-first. A width of zero
+    /// is itself legal (all-zero block, no payload), so an outlier only widens its own block.
     ///
     /// Fixed width through `IDXTEXT9` (`u32` doc + `MAX_FIELD` × `u16`), and `p54` is the
     /// precedent: it measured the position sections paying eight bytes to say *"+1"*. The same
@@ -387,6 +402,91 @@ pub fn posting_span(
     Ok(Span { offset: table.posting.offset + a, len: b - a })
 }
 
+/// Lists at least this long use the block-FOR columnar mode; shorter ones use sparse varint.
+/// The threshold is measured, not aesthetic: on the presyo catalogue lists past this size carry
+/// the strong majority of posting bytes, and below it the median list holds one posting, where
+/// every framing byte costs more than the compression it enables. Both the writer and the reader
+/// branch on the SAME count, so no mode byte exists to disagree about.
+const POST_BLOCKED_MIN: usize = 64;
+
+/// Values per block in the columnar mode. Small enough that the last partial block of a
+/// 128-posting list is half the list; large enough that one width byte amortizes to under a
+/// hundredth of a bit per value.
+const POST_BLOCK: usize = 128;
+
+/// Column kind byte: every value in the column is zero, and no blocks follow.
+const COL_ALL_ZERO: u8 = 0xFF;
+/// Column kind byte: packed blocks follow, each a width byte plus its payload.
+const COL_PACKED: u8 = 0x00;
+
+/// Bit-pack `vals` at `bits` width each, LSB-first, appending whole bytes to `out`.
+/// `bits` is 0..=32; zero-width callers emit nothing.
+fn block_pack(out: &mut Vec<u8>, vals: &[u64], bits: u8) {
+    if bits == 0 {
+        return;
+    }
+    let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let mut acc: u64 = 0;
+    let mut used: u32 = 0;
+    for &v in vals {
+        acc |= (v & mask) << used;
+        used += bits as u32;
+        while used >= 8 {
+            out.push((acc & 0xFF) as u8);
+            acc >>= 8;
+            used -= 8;
+        }
+    }
+    if used > 0 {
+        out.push((acc & 0xFF) as u8);
+    }
+}
+
+/// The width that holds the largest value in `vals` — 0 when they all are, which packs as a
+/// payload-free all-zero block.
+fn column_bits(vals: &[u64]) -> u8 {
+    let max = vals.iter().copied().max().unwrap_or(0);
+    if max == 0 {
+        return 0;
+    }
+    (u64::BITS - max.leading_zeros()) as u8
+}
+
+/// Unpack `block_len` values of `bits` width each from `b[*p..]`, advancing `*p` past the block's
+/// payload. LSB-first, the exact inverse of [`block_pack`].
+fn block_unpack(b: &[u8], p: &mut usize, block_len: usize, bits: u8) -> Result<[u64; POST_BLOCK], String> {
+    let mut out = [0u64; POST_BLOCK];
+    if bits == 0 {
+        return Ok(out);
+    }
+    if bits as usize > 32 {
+        return Err(format!("block width {bits} exceeds the 32-bit maximum"));
+    }
+    let nbytes = (block_len * bits as usize).div_ceil(8);
+    if p.checked_add(nbytes).map_or(true, |end| end > b.len()) {
+        return Err(format!(
+            "block of {block_len} values at {bits} bits needs {nbytes} bytes, {} left",
+            b.len() - *p
+        ));
+    }
+    let mask = (1u64 << bits) - 1;
+    let mut acc: u64 = 0;
+    let mut used: u32 = 0;
+    let mut src = *p;
+    for v in out.iter_mut().take(block_len) {
+        while used < bits as u32 {
+            acc |= (b[src] as u64) << used;
+            src += 1;
+            used += 8;
+        }
+        *v = acc & mask;
+        acc >>= bits;
+        used -= bits as u32;
+    }
+    *p = src;
+    Ok(out)
+}
+
 /// Decode one term's posting list from its own byte range.
 ///
 /// This is the range-read unit -- the decode a browser performs on the bytes [`posting_span`]
@@ -402,28 +502,47 @@ fn read_posting_list(b: &[u8]) -> Result<Vec<(u32, [u16; crate::index::MAX_FIELD
     let mut r = Reader::new(b);
     let n = r.varint()?;
     let n = usize::try_from(n).map_err(|_| "posting count exceeds usize".to_string())?;
-    // A posting costs at least one byte for its document delta and one per field, so a count
-    // the rest of the span is too small to hold is corrupt. Bounded before allocating.
+    // Bound the claimed count before allocating. The floor is mode-aware: a columnar list packs
+    // `POST_BLOCK` deltas into as few as n/8 bytes (an ascending delta is at least one BIT), plus
+    // one kind byte per column, so the old one-byte-per-posting floor rejected legitimate lists —
+    // caught by the reload of a real 20,000-row build, not by a unit test.
     let room = r.b.len().saturating_sub(r.p);
-    if n > room {
+    let floor = if n >= POST_BLOCKED_MIN {
+        n.div_ceil(8) + crate::index::MAX_FIELD + 1
+    } else {
+        // Sparse: every posting costs a document delta and a mask byte at minimum.
+        n * 2
+    };
+    if floor > room {
         return Err(format!("posting list claims {n} postings, {room} bytes left in its span"));
     }
     let mut list = Vec::with_capacity(n);
-    let mut prev = 0u32;
-    for i in 0..n {
-        let delta = u32::try_from(r.varint()?).map_err(|_| "document delta exceeds u32")?;
-        // Strictly ascending, so a zero delta is one document posted twice. Refused rather than
-        // tolerated: two entries for one document double-count it, and BM25 would score it twice.
-        if i > 0 && delta == 0 {
-            return Err(format!("posting {i} repeats document {prev}"));
+    if n >= POST_BLOCKED_MIN {
+        read_blocked_columns(&mut r, n, &mut list)?;
+    } else {
+        let mut prev = 0u32;
+        for i in 0..n {
+            let delta = u32::try_from(r.varint()?).map_err(|_| "document delta exceeds u32")?;
+            // Strictly ascending, so a zero delta is one document posted twice. Refused rather
+            // than tolerated: two entries for one document double-count it, and BM25 would score
+            // it twice.
+            if i > 0 && delta == 0 {
+                return Err(format!("posting {i} repeats document {prev}"));
+            }
+            let doc = prev.checked_add(delta).ok_or("document id overflowed u32")?;
+            prev = doc;
+            // One mask byte names the nonzero frequency slots; only those cost a varint.
+            let mask = r.b.get(r.p).copied().ok_or("posting list ends inside a frequency mask")?;
+            r.p += 1;
+            let mut tf = [0u16; crate::index::MAX_FIELD];
+            for (f, t) in tf.iter_mut().enumerate() {
+                if mask & (1 << f) == 0 {
+                    continue;
+                }
+                *t = u16::try_from(r.varint()?).map_err(|_| "term frequency exceeds u16")?;
+            }
+            list.push((doc, tf));
         }
-        let doc = prev.checked_add(delta).ok_or("document id overflowed u32")?;
-        prev = doc;
-        let mut tf = [0u16; crate::index::MAX_FIELD];
-        for t in tf.iter_mut() {
-            *t = u16::try_from(r.varint()?).map_err(|_| "term frequency exceeds u16")?;
-        }
-        list.push((doc, tf));
     }
     if r.p != r.b.len() {
         return Err(format!(
@@ -432,6 +551,59 @@ fn read_posting_list(b: &[u8]) -> Result<Vec<(u32, [u16; crate::index::MAX_FIELD
         ));
     }
     Ok(list)
+}
+
+/// The block-FOR columnar arm of [`read_posting_list`]: `n` postings as five columns —
+/// document-id deltas, then `MAX_FIELD` frequency columns — each all-zero-flagged or cut into
+/// bit-packed blocks. Fills `list` in document order.
+fn read_blocked_columns(
+    r: &mut Reader,
+    n: usize,
+    list: &mut Vec<(u32, [u16; crate::index::MAX_FIELD])>,
+) -> Result<(), String> {
+    // Column payloads are consumed with a cursor that shares the reader's span, so the
+    // exact-consume check at the end still governs every byte.
+    list.resize(n, (0, [0; crate::index::MAX_FIELD]));
+    for col in 0..=crate::index::MAX_FIELD {
+        let kind = r.b.get(r.p).copied().ok_or("posting list ends inside a column header")?;
+        r.p += 1;
+        match kind {
+            COL_ALL_ZERO => continue, // every value is 0, which is what the list was resized to
+            COL_PACKED => {}
+            other => {
+                return Err(format!("column kind {other:#04x} is neither 0x00 nor 0xFF"));
+            }
+        }
+        let mut prev = 0u32;
+        let mut done = 0usize;
+        while done < n {
+            let len = POST_BLOCK.min(n - done);
+            let bits = r.b.get(r.p).copied().ok_or("posting list ends inside a block header")?;
+            r.p += 1;
+            let vals = block_unpack(r.b, &mut r.p, len, bits)?;
+            for (i, &v) in vals.iter().take(len).enumerate() {
+                let at = done + i;
+                if col == 0 {
+                    let delta =
+                        u32::try_from(v).map_err(|_| "document delta exceeds u32".to_string())?;
+                    if at > 0 && delta == 0 {
+                        return Err(format!("posting {at} repeats document {prev}"));
+                    }
+                    prev = if at == 0 {
+                        delta
+                    } else {
+                        prev.checked_add(delta).ok_or("document id overflowed u32")?
+                    };
+                    list[at].0 = prev;
+                } else {
+                    let t = u16::try_from(v).map_err(|_| "term frequency exceeds u16".to_string())?;
+                    list[at].1[col - 1] = t;
+                }
+            }
+            done += len;
+        }
+    }
+    Ok(())
 }
 
 impl Index {
@@ -489,19 +661,81 @@ impl Index {
         // to compute those offsets from -- they can only be measured.
         let mut post = Writer::new();
         let mut list_byte: Vec<u64> = Vec::with_capacity(s.posting.len());
+        // Scratch for the columnar mode: five columns of at most POST_BLOCK values, reused.
+        let mut cols: Vec<[u64; POST_BLOCK]> =
+            vec![[0u64; POST_BLOCK]; crate::index::MAX_FIELD + 1];
         for list in s.posting.iter() {
             let at = post.here();
             // The count is per LIST rather than once for the section, so one list still decodes
-            // on its own: that is the range-read property this format exists to provide.
+            // on its own: that is the range-read property this format exists to provide. It also
+            // CHOOSES the mode — the reader branches on the same magnitude.
             post.varint(list.len() as u64);
-            let mut prev = 0u32;
-            for p in list.iter() {
-                // Document ids ascend within a list, so the first is written whole and every
-                // later one is the gap from its predecessor -- usually 1, and one byte to say so.
-                post.varint((p.0 - prev) as u64);
-                prev = p.0;
-                for v in p.1.iter() {
-                    post.varint(*v as u64);
+            if list.len() >= POST_BLOCKED_MIN {
+                // Columnar, COLUMN-MAJOR to match the reader: every block of the document-id
+                // column, then every block of each frequency column. An earlier draft interleaved
+                // the columns block by block; the two layouts agree on every single-block list and
+                // diverge silently on the first multi-block one, which is why only the reload
+                // check at scale caught it.
+                let nblocks = list.len().div_ceil(POST_BLOCK);
+                for (c, buf) in cols.iter_mut().enumerate() {
+                    // Column header: an all-zero column — a name-only corpus leaves the other
+                    // fields empty for most terms — is one byte instead of a block per 128
+                    // postings.
+                    if c > 0 && list.iter().all(|p| p.1[c - 1] == 0) {
+                        post.buf.push(COL_ALL_ZERO);
+                        continue;
+                    }
+                    post.buf.push(COL_PACKED);
+                    for blk in 0..nblocks {
+                        let done = blk * POST_BLOCK;
+                        let len = POST_BLOCK.min(list.len() - done);
+                        for (i, v) in buf.iter_mut().take(len).enumerate() {
+                            let p = &list[done + i];
+                            *v = if c == 0 {
+                                // Deltas from the previous posting — the previous BLOCK's last
+                                // doc for position 0, the previous posting within the block
+                                // otherwise. The reader accumulates exactly this: it carries
+                                // `prev` across blocks and adds every gap.
+                                let from = if i == 0 {
+                                    if done > 0 {
+                                        list[done - 1].0
+                                    } else {
+                                        0
+                                    }
+                                } else {
+                                    list[done + i - 1].0
+                                };
+                                (p.0 - from) as u64
+                            } else {
+                                p.1[c - 1] as u64
+                            };
+                        }
+                        let bits = column_bits(&buf[..len]);
+                        post.buf.push(bits);
+                        if bits > 0 {
+                            block_pack(&mut post.buf, &buf[..len], bits);
+                        }
+                    }
+                }
+            } else {
+                // Sparse varint: distinctive terms, most with one posting and mostly-zero
+                // frequencies — a mask byte instead of `MAX_FIELD` mostly-zero varints.
+                let mut prev = 0u32;
+                for p in list.iter() {
+                    post.varint((p.0 - prev) as u64);
+                    prev = p.0;
+                    let mut mask = 0u8;
+                    for (f, v) in p.1.iter().enumerate() {
+                        if *v != 0 {
+                            mask |= 1 << f;
+                        }
+                    }
+                    post.buf.push(mask);
+                    for (f, v) in p.1.iter().enumerate() {
+                        if mask & (1 << f) != 0 {
+                            post.varint(*v as u64);
+                        }
+                    }
                 }
             }
             list_byte.push(post.here() - at);
@@ -1078,6 +1312,34 @@ mod tests {
         }
     }
 
+    /// Both posting modes round-trip EXACTLY, including a MULTI-BLOCK columnar list. The two
+    /// modes branch on list length, and the columnar layout is column-major — an earlier draft
+    /// wrote it block-major, which agrees on every single-block list (≤ `POST_BLOCK` postings)
+    /// and silently corrupts the first multi-block one. The smallest corpus in the suite could
+    /// not build a list that long, so this one synthesizes the boundary sizes: 63 (sparse),
+    /// 64 (columnar, one block), 129 and 300 (columnar, multi-block).
+    #[test]
+    fn posting_round_trip_at_both_mode_boundaries_and_across_blocks() {
+        for shared in [63usize, 64, 129, 300] {
+            let schema = Schema::new(vec![Field::new("name", 1.0, 0.4)]);
+            let mut b = IndexBuilder::new(schema);
+            for d in 0..shared {
+                // A token unique to each document, plus "common" in every one — the latter
+                // builds the posting list whose length selects and stresses the mode.
+                b.add(&Doc::new([format!("unique{d} common")]));
+            }
+            let a = b.build().unwrap();
+            let bytes = a.to_bytes();
+            let loaded = Index::from_bytes(&bytes)
+                .unwrap_or_else(|e| panic!("reload at shared={shared}: {e}"));
+            assert_eq!(loaded.search("common", shared), a.search("common", shared));
+            for d in 0..shared {
+                let q = format!("unique{d}");
+                assert_eq!(loaded.search(&q, 5), a.search(&q, 5));
+            }
+        }
+    }
+
     #[test]
     fn schema_and_alias_survive() {
         let a = built();
@@ -1150,6 +1412,51 @@ mod tests {
             *b = 0xFF;
         }
         let _ = Index::from_bytes(&bad);
+    }
+
+    /// The columnar mode's own failure modes, each of which would otherwise be a confident wrong
+    /// answer inside one term's list: a column kind the writer never emits, a block wider than
+    /// any value it could legally hold, a block whose payload runs past its span, and a count
+    /// the span is too small to hold even at the columnar floor. Built by hand at the byte level
+    /// so each case is exact rather than lucky.
+    #[test]
+    fn columnar_posting_corruption_is_rejected_loudly() {
+        // A legal 64-posting list, encoded the way the writer does, as the base to corrupt.
+        let encode = |n: u32| -> Vec<u8> {
+            let mut w = Writer::new();
+            w.varint(n as u64);
+            w.buf.push(COL_PACKED);
+            let deltas: Vec<u64> = (0..n as u64).map(|i| if i == 0 { 7 } else { 1 }).collect();
+            w.buf.push(column_bits(&deltas));
+            block_pack(&mut w.buf, &deltas, column_bits(&deltas));
+            for _ in 0..crate::index::MAX_FIELD {
+                w.buf.push(COL_ALL_ZERO);
+            }
+            w.buf
+        };
+        let good = encode(64);
+        assert!(read_posting_list(&good).is_ok(), "the hand-encoded list must itself be valid");
+
+        // A column kind that is neither 0x00 nor 0xFF.
+        let mut bad = good.clone();
+        bad[1] = 0x42;
+        assert!(read_posting_list(&bad).is_err(), "unknown column kind must be refused");
+
+        // A block width of 33 bits: more than any u32 delta needs, so always corrupt.
+        let mut bad = good.clone();
+        bad[2] = 33;
+        assert!(read_posting_list(&bad).is_err(), "33-bit block must be refused");
+
+        // A truncated block payload: the width says 8 bits for 64 values, one byte is missing.
+        let mut bad = good.clone();
+        bad.pop();
+        assert!(read_posting_list(&bad).is_err(), "short block payload must be refused");
+
+        // A count the span cannot hold even at the columnar floor (ceil(n/8) + columns): 64
+        // postings need at least 13 bytes of columns, and this span has 10.
+        let mut short = encode(64);
+        short.truncate(10);
+        assert!(read_posting_list(&short).is_err(), "count below the columnar floor must be refused");
     }
 
     #[test]
