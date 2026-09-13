@@ -21,9 +21,14 @@ import { RangeIndex } from './opfs.mjs';
 import { httpRangeReader } from './range-http.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const wasm = await readFile(join(here, 'index_wasm.wasm'));
-const file = await readFile(join(here, 'profstopick.idx'));
-const label = JSON.parse(await readFile(join(here, 'profstopick.label.json'), 'utf8'));
+// Defaults are the committed fixture. INDEX_IDX / INDEX_WASM / INDEX_QUERY (one query per line)
+// point the same check at any other index -- the large-file measurement this file's first run
+// could not make on 119 KB.
+const wasm = await readFile(process.env.INDEX_WASM ?? join(here, 'index_wasm.wasm'));
+const file = await readFile(process.env.INDEX_IDX ?? join(here, 'profstopick.idx'));
+const label = process.env.INDEX_IDX
+  ? null
+  : JSON.parse(await readFile(join(here, 'profstopick.label.json'), 'utf8'));
 
 let failed = 0;
 const check = (ok, msg) => {
@@ -57,7 +62,11 @@ const url = `http://127.0.0.1:${server.address().port}/profstopick.idx`;
 
 // ---- Queries drawn from the corpus itself: surnames, given names, typos, typeahead -------------
 const query = [];
-for (let i = 0; i < label.length && query.length < 60; i += Math.max(1, Math.floor(label.length / 60))) {
+if (process.env.INDEX_QUERY) {
+  const line = (await readFile(process.env.INDEX_QUERY, 'utf8')).split(/\r?\n/).filter(Boolean);
+  line.forEach((q, i) => query.push({ q, prefix: i % 4 === 3 }));
+}
+for (let i = 0; label && i < label.length && query.length < 60; i += Math.max(1, Math.floor(label.length / 60))) {
   const [surname, given = ''] = label[i].toLowerCase().split(',');
   const first = given.trim().split(/\s+/)[0] ?? '';
   const pick = query.length % 4;
@@ -124,6 +133,10 @@ for (const [r, open] of [[a, openNaive], [b, openSmart]]) {
   );
 }
 console.log(`  ${'repeat pass'.padEnd(20)} ${String(c.request).padStart(9)} ${String(c.byte).padStart(10)} ${pct(c.byte).padStart(7)}`);
+// Open and queries separately: on a large file the resident sections read at open can dwarf every
+// posting list the queries fetch, and a single total hides which one to attack.
+console.log(`\n  open (resident sections) ${String(openSmart.byte).padStart(10)} B ${pct(openSmart.byte).padStart(6)} %`);
+console.log(`  ${query.length} queries (postings)   ${String(b.byte).padStart(10)} B ${pct(b.byte).padStart(6)} %`);
 check(b.request + openSmart.request < a.request + openNaive.request, 'coalescing issues fewer requests than one-per-span');
 
 server.close();

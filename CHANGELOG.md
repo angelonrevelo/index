@@ -6,6 +6,21 @@ All notable changes to `index`. The project is pre-release and unversioned, so e
 [ROADMAP.md](ROADMAP.md) for the tiered plan and [docs/roadmap-rejected.md](docs/roadmap-rejected.md)
 for what was deliberately ruled out.
 
+### Measured — the range tier on a 15.5 MB index: the open is the cost, not the queries (2026-09-13)
+
+- 400K synthetic products (`sku`/`name`/`brand`, facet `brand`), 402,668 terms, **15,512,041 B**,
+  built with `index build --jsonl`. `js/range-http-check.mjs` now takes `INDEX_IDX` / `INDEX_QUERY` /
+  `INDEX_WASM` and prints the open and the queries separately.
+- **60/60 queries identical to a whole-file open, 0 refused; a repeat pass costs 0 requests.**
+- One pass still reads **67.1 %** of the file, and the split shows why: opening reads
+  **10,006,822 B (64.5 %)**, while all 60 queries fetch **409,142 B (2.6 %)** of posting lists.
+  The resident set is dominated by `doc_key` (slot 17: 5,888,894 B, 38.0 %, unique SKUs), which a
+  query needs only for its top-k hits. Coalescing barely matters here (99 → 96 requests): large
+  files plan a few big spans, not many small ones.
+- On real-sized files the range tier costs its open, not its queries. Fetching `doc_key` (and the
+  per-doc columns in slots 6/8/12) per hit instead of at open is the next lever. For comparison,
+  the 119 KB fixture: open 38.0 %, queries 12.9 %.
+
 ### Fixed — the range tier had been dead since IDXTEXT12; HTTP Range reader added (2026-09-13)
 
 - **Every range open aborted.** `p91` moved `posting_offset` to a block directory, but the range
