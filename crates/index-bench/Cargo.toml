@@ -97,6 +97,9 @@ path = "src/pool_audit.rs"
 [dependencies]
 index-core = { path = "../index-core" }
 index-text = { path = "../index-text" }
+# The seed-sql reader: the bench parses nookr2's dump through the SAME code the CLI runs --
+# that is why index-cli is a library at all (see crates/index-cli/src/lib.rs).
+index-cli = { path = "../index-cli" }
 index-accel = { path = "../index-accel" }
 index-image = { path = "../index-image" }
 # The pixel decoder, bench crate ONLY. `index-image` deliberately has none -- that is its thesis:
@@ -157,6 +160,10 @@ path = "src/trin_catalog.rs"
 [[bin]]
 name = "wheresthefx-venues"
 path = "src/wheresthefx_venues.rs"
+
+[[bin]]
+name = "nookr2-seed"
+path = "src/nookr2_seed.rs"
 
 [[bin]]
 name = "yclap-species"

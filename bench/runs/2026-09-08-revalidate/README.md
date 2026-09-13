@@ -84,8 +84,8 @@ over the user's own corpus, still a linear scan, still local. `advo` — decline
 `tsvector` corpus search is unchanged. The declines stand on their own measurements, not on
 politeness.
 
-**Search-shaped, never measured, real data on disk — the p84 candidate list, 4 of 7 now measured
-(same day):**
+**Search-shaped, never measured, real data on disk — the p84 candidate list, 5 of 7 measured (p89
+closed nookr2 on 2026-09-13; openbid still needs an export):**
 
 | repo | workload | data on disk | their matcher today | p84 verdict |
 |---|---|---|---|---|
@@ -94,7 +94,7 @@ politeness.
 | `trin` | candidate browse filter | seed catalog 52 entries (live 2,340+) | `toLowerCase().includes()` on name/description | **MEASURED** — [`p86`](../../bench/roadmap/p86-trin-catalog.md): the filter misses its OWN entries on clean input (87.9 % vs engine 97.5 %) — apostrophes break the substring ("Master's" vs typed "masters"); corrupted terms: 88 % zero-results. Facet+text in one pass at no recall cost |
 | `wheresthefx` | venue search | 13,487-venue OSM fixture (1.5 MB) | drizzle `ilike` over title/description/venueName | **MEASURED** — [`p87`](../../bench/roadmap/p87-wheresthefx-venues.md): token-class recall 99.3 % clean / 89.7 % corrupted vs ilike 90.4 % / 12.1 %; ilike finds NOTHING on 1,178 clean queries (punctuation trap: "7eleven" vs "7-Eleven") and 10,185 corrupted ones; typeahead 45 µs p99. Index: 4 B/venue, 38 ms build |
 | `orsem-website` | course search | courses.json 3,768 courses | **not implemented yet** (Search page is a static form) | skipped honestly — no matcher to reproduce; an engine bench there would be spec-making, not measurement |
-| `nookr2` | category + member combobox | Supabase seed 40 KB (SQL) | `toLowerCase().includes()` | candidate — data is SQL seed, needs a parsed export |
+| `nookr2` | category + member combobox | Supabase seed 30 KB (`supabase/seed.sql`) | `toLowerCase().includes()` on name/code | **MEASURED** — [`p89`](../../bench/roadmap/p89-nookr2-seed.md): the category combobox returns NOTHING on 7 of 26 natural queries about its own seeded rows (the `Salaries & Wages` / `CAR_STICKER` separator trap) and 23 of 26 corrupted ones; the member surface survives natural input at seed size. Engine 100 % top-3. Corpus read through the new `--sql` dump reader |
 | `openbid` | bid search | GIN `to_tsvector`, no static seed | Postgres FTS | candidate — needs an export |
 
 **Search-shaped, no static corpus to measure against (6):** `medicapp` (Supabase `ilike`, prod data

@@ -8,6 +8,19 @@ for what was deliberately ruled out.
 
 ## [Unreleased]
 
+### Measured — p89: nookr2's comboboxes, on the seed the database already wrote (2026-09-13)
+
+The fifth and last p84 candidate with data on disk is measured — and the corpus is read through
+`SqlDumpReader`, the `--sql` dump reader's first consumer outside the CLI itself. On the category
+combobox (26 seeded rows), their `toLowerCase().includes()` predicate returns NOTHING for **7 of
+26 natural queries** about its own rows — `'Salaries & Wages'` vs typed `salaries wages`,
+`CAR_STICKER` vs typed `car sticker` — and 23 of 26 corrupted ones. The member surface (7 rows)
+survives natural input at seed size and collapses only on typos (0/7); the bench prints that as
+an honest NOTE rather than manufacturing a miss nobody can produce. Engine: 100 % top-3 on every
+family, 538 B of index. Size verdict stated up front: hobbycat class, no scale claim. Full tables
+and the estate-coverage disposition: [`bench/roadmap/p89-nookr2-seed.md`](bench/roadmap/p89-nookr2-seed.md).
+
+
 ### Measured — p88: mode-coded posting lists, IDXTEXT11 (2026-09-13)
 
 **57.3 → 35.8 B/doc on presyo's 241,677 real products (−37.5 %), 79.3 → 32.4 B/doc at 1 M
