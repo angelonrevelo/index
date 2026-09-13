@@ -59,6 +59,8 @@ BUILD  reads rows and writes a fresh collection (replacing any existing one).
                     to say which row it means.
   --facet COL       schema field to store as a filterable/countable facet. Repeatable.
   --numeric COL     schema field to parse as a number, for ranges and sorting. Repeatable.
+  --reorder         reorder document ids by graph bisection at build time (smaller posting
+                    lists, ties may flip; see bench/roadmap/p90-docid-reorder.md).
   --position        record token positions, enabling phrase queries. Costs bytes.
 
 APPLY  reads change records and updates the collection in place.
@@ -181,6 +183,9 @@ struct Opt {
     facet: Vec<String>,
     numeric: Vec<String>,
     position: bool,
+    /// `--reorder`: enable the build-time graph bisection of document ids (off by default,
+    /// measured in bench/roadmap/p90-docid-reorder.md).
+    reorder: bool,
     format: Option<Format>,
     /// `--sql`: the input is a SQL dump, not a printed-row stream.
     sql: bool,
@@ -217,6 +222,7 @@ impl Opt {
                 "--require" => o.require.push(take(&mut i, "--require")?),
                 "--reselect" => o.reselect = Some(take(&mut i, "--reselect")?),
                 "--position" => o.position = true,
+                "--reorder" => o.reorder = true,
                 "--prefix" => o.prefix = true,
                 "--csv" => o.format = Some(Format::Csv),
                 "--tsv" => o.format = Some(Format::Tsv),
@@ -370,6 +376,9 @@ fn cmd_build(o: &Opt) -> Result<(), String> {
     }
     if o.position && !b.set_position() {
         return Err("could not enable positions".into());
+    }
+    if o.reorder {
+        b = b.with_doc_reorder(true);
     }
 
     let mut r = o.reader()?;

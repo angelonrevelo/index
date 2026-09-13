@@ -23,6 +23,7 @@
 //! sorting, degrades better at large k, and Lucene and PISA converged on it independently.
 
 use crate::analyze::{apply_alias, tokenize, tokenize_into, AliasTable, Token};
+use crate::reorder;
 use crate::dict::TermDict;
 use std::collections::BTreeMap;
 
@@ -519,6 +520,13 @@ pub struct IndexBuilder {
     key_store: Vec<String>,
     /// Whether to record token positions. See [`IndexBuilder::with_position`].
     position_on: bool,
+    /// Recursive graph bisection over the term-document graph at build time. **Off by default
+    /// on measurement** — `bench/roadmap/p90-docid-reorder.md`: −6.2 % of the file on the real
+    /// presyo schema, ~0 % on a short-title schema, latency at parity, and a real cost: every
+    /// consumer that maps a result's doc ordinal back to its own rows breaks unless it addresses
+    /// rows by key (`p48`/`p53` primitives). Same shape as static priors: correct, cheap, and
+    /// ships off until a host wants it.
+    reorder_on: bool,
     /// term text -> per document, that document's packed positions for the term, in ascending
     /// document order — the same order and the same reasoning as `term_post`. Empty unless
     /// `position_on`.
@@ -546,6 +554,7 @@ impl IndexBuilder {
             numeric_field: Vec::new(),
             numeric_store: Vec::new(),
             key_field: None,
+            reorder_on: false,
             key_store: Vec::new(),
             position_on: false,
             term_pos: std::collections::HashMap::new(),
@@ -567,6 +576,19 @@ impl IndexBuilder {
         assert!(self.set_position(), "positions must be enabled before the first document");
         self
     }
+    /// Toggle recursive graph bisection of the term-document graph at build time (default
+    /// off; see the field doc for the measurement that decided it).
+    /// Reordering clusters documents that share terms into adjacent doc ids, which is what a
+    /// posting list's delta widths and a block-max's hit density both feed on. It changes NO
+    /// answer: scores are per-document quantities that move with their document, so ranking is
+    /// identical and only tie-breaks between equal scores may flip. See
+    /// `bench/roadmap/p90-docid-reorder.md` for the measurement and for the length-sort attempt
+    /// this is not.
+    pub fn with_doc_reorder(mut self, on: bool) -> Self {
+        self.reorder_on = on;
+        self
+    }
+
 
     /// Non-consuming [`IndexBuilder::with_position`], for the C ABI. Returns `false` once a
     /// document has been added, rather than panicking -- a trap kills the whole WASM instance.
@@ -962,7 +984,7 @@ impl IndexBuilder {
         raw.into_iter().map(|p| (p / max).clamp(f32::MIN_POSITIVE, 1.0)).collect()
     }
 
-    pub fn build(self) -> Result<Index, String> {
+    pub fn build(mut self) -> Result<Index, String> {
         // The term order every term id in the index refers to. Sorting once here replaces the
         // ordering a `BTreeMap` used to maintain on every insertion, and produces the identical
         // sequence: the keys are distinct, so `sort_unstable_by` over them is a total order.
@@ -979,6 +1001,65 @@ impl IndexBuilder {
             posting.push(post.doc);
             posting_tf.push(post.tf);
         }
+        // DocID reordering, applied before anything consumes an id: every posting list is
+        // remapped and re-sorted so ids ascend again (the saturated score bound rides along —
+        // it is a per-(term, document) quantity and moves with its posting), `term_pos` is
+        // remapped with it so position runs stay attached and aligned, and every per-document
+        // store is permuted by the same map. Scores, ranking, keys and facet values are all
+        // per-document quantities; only the doc-id ORDER moves.
+        if self.reorder_on {
+            let n = self.doc_len.len();
+            let ids: Vec<Vec<u32>> =
+                posting.iter().map(|l| l.iter().map(|p| p.doc).collect()).collect();
+            let refs: Vec<&[u32]> = ids.iter().map(|l| &l[..]).collect();
+            let perm = reorder::graph_bisect_permutation(n, &refs);
+            let identity = (0..n as u32).collect::<Vec<_>>();
+            if perm != identity {
+                for (docs, tfs) in posting.iter_mut().zip(posting_tf.iter_mut()) {
+                    let mut joint: Vec<(u32, [u16; MAX_FIELD])> = docs
+                        .iter()
+                        .zip(tfs.iter())
+                        .map(|(p, t)| (perm[p.doc as usize], *t))
+                        .collect();
+                    joint.sort_unstable_by_key(|(d, _)| *d);
+                    for ((p, tf), (d, t)) in
+                        docs.iter_mut().zip(tfs.iter_mut()).zip(joint)
+                    {
+                        p.doc = d;
+                        *tf = t;
+                    }
+                }
+                for per_doc in self.term_pos.values_mut() {
+                    for (d, _) in per_doc.iter_mut() {
+                        *d = perm[*d as usize];
+                    }
+                    per_doc.sort_unstable_by_key(|(d, _)| *d);
+                }
+                // Per-document stores that are PRESENT are permuted; the optional ones
+                // (priors, facets, numerics) are legitimately empty when unused, and an
+                // empty store has nothing to move.
+                reorder::apply(&mut self.doc_len, &perm);
+                if self.raw_prior.len() == n {
+                    reorder::apply(&mut self.raw_prior, &perm);
+                }
+                if self.first_text.len() == n {
+                    reorder::apply(&mut self.first_text, &perm);
+                }
+                if self.facet_text.len() == n {
+                    reorder::apply(&mut self.facet_text, &perm);
+                }
+                if self.facet_store.len() == n {
+                    reorder::apply(&mut self.facet_store, &perm);
+                }
+                if self.numeric_store.len() == n {
+                    reorder::apply(&mut self.numeric_store, &perm);
+                }
+                if self.key_store.len() == n {
+                    reorder::apply(&mut self.key_store, &perm);
+                }
+            }
+        }
+
         let dict = TermDict::build(&term)?;
 
         let doc_count = self.doc_len.len();

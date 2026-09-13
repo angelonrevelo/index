@@ -38,6 +38,15 @@ const P99_NS_MAX: f64 = 5_000_000.0;
 /// product; this bounds it at roughly 200 MB.
 const BYTE_PER_DOC_MAX: f64 = 200.0;
 
+
+/// Bench-layer A/B switch for p90: the library reads no environment, so the bench does.
+/// `INDEX_REORDER=1` builds every index in this bin with reordering ON — note that benches
+/// whose truth maps results by ordinal (most of them) are then scoring against the wrong
+/// rows; that harness limitation is recorded in the p90 document.
+fn reorder_on() -> bool {
+    std::env::var("INDEX_REORDER").as_deref() == Ok("1")
+}
+
 fn corpus_path() -> PathBuf {
     if let Ok(d) = std::env::var("INDEX_CORPUS_DIR") {
         return PathBuf::from(d).join("blead").join("data").join("schools-masterlist.csv");
@@ -163,7 +172,7 @@ fn build(school: &[School], target: usize) -> (Index, f64) {
         Field::new("locality", 1.5, 0.5),
         Field::new("region", 1.0, 0.6),
     ]);
-    let mut b = IndexBuilder::new(schema);
+    let mut b = IndexBuilder::new(schema).with_doc_reorder(reorder_on());
     let t0 = std::time::Instant::now();
     let n = school.len();
     // Coprime strides over the real corpus, so above `n` documents are distinct recombinations of

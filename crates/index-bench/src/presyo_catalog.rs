@@ -40,6 +40,15 @@ struct Product {
     category: String,
 }
 
+
+/// Bench-layer A/B switch for p90: the library reads no environment, so the bench does.
+/// `INDEX_REORDER=1` builds every index in this bin with reordering ON — note that benches
+/// whose truth maps results by ordinal (most of them) are then scoring against the wrong
+/// rows; that harness limitation is recorded in the p90 document.
+fn reorder_on() -> bool {
+    std::env::var("INDEX_REORDER").as_deref() == Ok("1")
+}
+
 fn corpus_dir() -> PathBuf {
     std::env::var("INDEX_CORPUS_DIR").map(PathBuf::from).unwrap_or_else(|_| {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("..")
@@ -127,7 +136,7 @@ fn main() {
 
     // Brand is a weak second field: it disambiguates, it does not make a product match.
     let schema = Schema::new(vec![Field::new("name", 3.0, 0.5), Field::new("brand", 0.5, 0.75)]);
-    let mut b = IndexBuilder::new(schema);
+    let mut b = IndexBuilder::new(schema).with_doc_reorder(reorder_on());
     for p in &product {
         b.add(&Doc::new([p.name.as_str(), p.brand.as_str()]));
     }
@@ -229,7 +238,7 @@ fn main() {
             Field::new("category", 0.0, 0.75),
         ]);
         let t = std::time::Instant::now();
-        let mut bb = IndexBuilder::new(sch).learn_expansion(2, 20);
+        let mut bb = IndexBuilder::new(sch).with_doc_reorder(reorder_on()).learn_expansion(2, 20);
         for p in &product {
             bb.add(&Doc::new([p.name.as_str(), p.brand.as_str(), p.category.as_str()]));
         }
@@ -248,7 +257,8 @@ fn main() {
             Field::new("name", 3.0, 0.5),
             Field::new("brand", 0.5, 0.75),
             Field::new("category", 0.0, 0.75),
-        ]));
+        ]))
+        .with_doc_reorder(reorder_on());
         for p in &product {
             bplain.add(&Doc::new([p.name.as_str(), p.brand.as_str(), p.category.as_str()]));
         }
