@@ -1076,12 +1076,7 @@ pub unsafe extern "C" fn idx_facet_tally(
         return u32::MAX;
     };
     let tally = handle.index.facet_tally_at(query, slot as usize);
-    handle.result.clear();
-    for (label, count) in &tally {
-        handle.result.extend_from_slice(&(label.len() as u32).to_le_bytes());
-        handle.result.extend_from_slice(label.as_bytes());
-        handle.result.extend_from_slice(&(*count as u32).to_le_bytes());
-    }
+    write_facet_tally(&mut handle.result, &tally);
     tally.len() as u32
 }
 
@@ -1148,10 +1143,7 @@ pub unsafe extern "C" fn idx_range_tally(
     };
     let edge = std::slice::from_raw_parts(edge, edge_n);
     let count = handle.index.range_tally(query, slot as usize, edge);
-    handle.result.clear();
-    for c in &count {
-        handle.result.extend_from_slice(&(*c as u32).to_le_bytes());
-    }
+    write_bucket_count(&mut handle.result, &count);
     count.len() as u32
 }
 
@@ -1975,6 +1967,13 @@ const SLOT_POSTING: usize = 5;
 const SLOT_POSITION_AT: usize = 15;
 /// Table slot of `position`, dropped for the same reason.
 const SLOT_POSITION: usize = 16;
+/// Table slot of `doc_key`, also never fetched by a range handle.
+///
+/// Keys serve `doc_of_key` / `key_of` -- the change-stream path -- and nothing a range query does:
+/// no scoring, filter, tally or range reads them. On a keyed catalogue they are also the largest
+/// section: 5,888,894 of 15,512,041 bytes (38.0 %) on a 400K-product index with unique SKUs, where
+/// keeping them resident made the OPEN cost 64.5 % of the file and dropping them makes it 26.5 %.
+const SLOT_DOC_KEY: usize = 17;
 
 /// An index opened from its 296-byte head, plus whichever sections a host has since fetched for it.
 ///
@@ -1982,7 +1981,7 @@ const SLOT_POSITION: usize = 16;
 pub struct RangeHandle {
     /// Where every section lives **in the original file**, which is what the host reads from.
     table: SectionTable,
-    /// Resident section bytes by table slot. `posting` and the two position slots stay empty.
+    /// Resident section bytes by table slot. `posting`, the two position slots and `doc_key` stay empty.
     part: Vec<Vec<u8>>,
     /// The file's own posting-offset array, kept verbatim: the assembled image gets a rewritten
     /// one, but `posting_span` must keep addressing the FILE.
@@ -2021,9 +2020,14 @@ fn section_span(t: &SectionTable, i: usize) -> Span {
     }
 }
 
-/// Whether slot `i` is fetched once at open rather than per query.
+/// Whether slot `i` is fetched once at open rather than per query (or never).
+///
+/// Resident: everything scoring, planning and filtering touches for EVERY query -- the dictionary,
+/// aliases, expansions, `doc_len` and `first_term` (scoring), `prior`, `deleted`, and the facet and
+/// numeric columns (filters and tallies). Per query: `posting`, by plan. Never: the two position
+/// sections (a range handle does not answer phrases) and `doc_key` (no range query reads a key).
 fn is_resident(i: usize) -> bool {
-    !matches!(i, SLOT_POSTING | SLOT_POSITION_AT | SLOT_POSITION)
+    !matches!(i, SLOT_POSTING | SLOT_POSITION_AT | SLOT_POSITION | SLOT_DOC_KEY)
 }
 
 /// Lay eighteen sections out as a valid index file, backfilling the section table.
@@ -2106,6 +2110,67 @@ impl RangeHandle {
         part[SLOT_POSTING] = posting;
         Index::from_bytes(&assemble(&part)).ok()
     }
+
+    /// The second phase every range query shares: take the bytes the last plan named, build the
+    /// narrowed image, and PROVE it can answer `query` before anyone asks it to.
+    ///
+    /// `None` -- which every caller turns into the `u32::MAX` sentinel -- when nothing is loaded,
+    /// when `len` is not exactly the planned byte count, when the image does not assemble, or when
+    /// the query expands to a term the plan did not fetch. One implementation, so text search,
+    /// facet clauses, tallies and numeric ranges cannot disagree about what "planned" means.
+    ///
+    /// Facet and numeric filters need nothing beyond the posting lists: `facet_label`, `facet_id`,
+    /// `numeric_field` and `numeric_value` are resident (fetched once at open), and the tallies and
+    /// the filtered scan expand the query exactly as the unfiltered search does -- non-prefix, via
+    /// the same planner -- so the posting plan of [`idx_range_plan_query`] with `prefix = 0` covers
+    /// them. The verification below is what turns that argument into a checked property.
+    ///
+    /// # Safety
+    /// `ptr` must be readable for `len` bytes when `len` is non-zero.
+    unsafe fn answer_image(&self, query: &str, prefix: bool, ptr: *const u8, len: usize) -> Option<Index> {
+        self.resident.as_ref()?;
+        let want: u64 = self.plan.iter().map(|(_, s)| s.len).sum();
+        if want != len as u64 {
+            return None;
+        }
+        let posting = if len == 0 { Vec::new() } else { std::slice::from_raw_parts(ptr, len).to_vec() };
+        let (narrow_posting, offset_array) = self.narrow(&posting);
+        let index = self.open_image(narrow_posting, offset_array)?;
+
+        // The verification. `term_stat` is the expansion `plan_stat` runs for the real search, so a
+        // term it names that nothing fetched is a plan that no longer describes this query.
+        for (text, _) in index.term_stat(query, prefix) {
+            let id = index.term_id_of(&text)?;
+            // A term with no postings in the FILE either: nothing was owed for it.
+            if index_text::posting_span(&self.table, &self.posting_offset, id).is_ok_and(|s| s.len == 0) {
+                continue;
+            }
+            if self.plan.binary_search_by_key(&id, |(t, _)| *t).is_err() {
+                return None;
+            }
+        }
+        Some(index)
+    }
+}
+
+/// Shared by [`idx_facet_tally`] and [`idx_range_facet_tally`], so a range tally is byte-identical
+/// to a full-open one by construction rather than by a second copy of the layout: per entry
+/// `u32 label_len`, the UTF-8 label, `u32 count`, little-endian.
+fn write_facet_tally(out: &mut Vec<u8>, tally: &[(&str, usize)]) {
+    out.clear();
+    for (label, count) in tally {
+        out.extend_from_slice(&(label.len() as u32).to_le_bytes());
+        out.extend_from_slice(label.as_bytes());
+        out.extend_from_slice(&(*count as u32).to_le_bytes());
+    }
+}
+
+/// Shared by [`idx_range_tally`] and [`idx_range_range_tally`]: one little-endian `u32` per bucket.
+fn write_bucket_count(out: &mut Vec<u8>, count: &[usize]) {
+    out.clear();
+    for c in count {
+        out.extend_from_slice(&(*c as u32).to_le_bytes());
+    }
 }
 
 /// Bytes of a file's head that [`idx_range_open`] requires. Constant for every index this format
@@ -2151,8 +2216,9 @@ pub unsafe extern "C" fn idx_range_open(ptr: *const u8, len: usize) -> *mut Rang
 /// positions. Writes [`idx_range_span_byte`] records into the handle's result buffer and returns
 /// how many, or `u32::MAX` on a null handle.
 ///
-/// Fifteen records, always, including any that are zero-length -- a fixed count is a shape the host
-/// can concatenate against without branching, and a zero-length read costs nothing.
+/// Fourteen records, always, including any that are zero-length -- a fixed count is a shape the host
+/// can concatenate against without branching, and a zero-length read costs nothing. (Fifteen before
+/// `doc_key` left the resident set; hosts read the count from the return value, never assume it.)
 ///
 /// # Safety
 /// `rh` must be a live handle from [`idx_range_open`].
@@ -2308,29 +2374,7 @@ pub unsafe extern "C" fn idx_range_search(
     let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
         return u32::MAX;
     };
-    if h.resident.is_none() {
-        return u32::MAX;
-    }
-    let want: u64 = h.plan.iter().map(|(_, s)| s.len).sum();
-    if want != len as u64 {
-        return u32::MAX;
-    }
-    let posting = if len == 0 { Vec::new() } else { std::slice::from_raw_parts(ptr, len).to_vec() };
-    let (narrow_posting, offset_array) = h.narrow(&posting);
-    let Some(index) = h.open_image(narrow_posting, offset_array) else { return u32::MAX };
-
-    // The verification. `term_stat` is the expansion `plan_stat` runs for the real search, so a
-    // term it names that nothing fetched is a plan that no longer describes this query.
-    for (text, _) in index.term_stat(query, prefix != 0) {
-        let Some(id) = index.term_id_of(&text) else { return u32::MAX };
-        // A term with no postings in the FILE either: nothing was owed for it.
-        if index_text::posting_span(&h.table, &h.posting_offset, id).is_ok_and(|s| s.len == 0) {
-            continue;
-        }
-        if h.plan.binary_search_by_key(&id, |(t, _)| *t).is_err() {
-            return u32::MAX;
-        }
-    }
+    let Some(index) = h.answer_image(query, prefix != 0, ptr, len) else { return u32::MAX };
 
     let hit = if prefix != 0 {
         index.search_prefix(query, k as usize)
@@ -2339,6 +2383,142 @@ pub unsafe extern "C" fn idx_range_search(
     };
     write_hit(&mut h.result, &hit);
     hit.len() as u32
+}
+
+// ---- Filtered range queries -------------------------------------------------------------------
+//
+// The same two-call contract as `idx_range_search`: the host runs `idx_range_plan_query(rh, q, 0)`,
+// fetches exactly those spans, and hands them to one of these. No separate plan call exists because
+// none is needed: every facet and numeric section is resident, so the ONLY bytes a filtered query
+// or a tally owes beyond the open are the query's posting lists -- the same set the unfiltered plan
+// names. Each result buffer is byte-identical to the corresponding full-open export
+// (`idx_search_clause`, `idx_facet_tally`, `idx_search_range`, `idx_range_tally`), which the tests
+// assert against a full `idx_open` of the same file.
+
+/// Range-tier [`idx_search_clause`]: the full filter bar (OR within a clause, AND across clauses,
+/// NOT, offset) over the posting bytes the last `idx_range_plan_query(.., prefix = 0)` asked for.
+///
+/// Returns the hit count, or `u32::MAX` on a null handle, non-UTF-8 input, a malformed spec, a
+/// buffer that does not match the plan, or a plan this query has outrun.
+///
+/// # Safety
+/// `rh` must be a live handle; `q`, `spec` and `ptr` readable for their lengths.
+#[no_mangle]
+pub unsafe extern "C" fn idx_range_search_clause(
+    rh: *mut RangeHandle,
+    q: *const u8,
+    q_len: usize,
+    k: u32,
+    offset: u32,
+    spec: *const u8,
+    spec_len: usize,
+    ptr: *const u8,
+    len: usize,
+) -> u32 {
+    let Some(h) = rh.as_mut() else { return u32::MAX };
+    if q.is_null() || spec.is_null() || (ptr.is_null() && len != 0) {
+        return u32::MAX;
+    }
+    let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
+        return u32::MAX;
+    };
+    let Ok(text) = std::str::from_utf8(std::slice::from_raw_parts(spec, spec_len)) else {
+        return u32::MAX;
+    };
+    let Some(parsed) = parse_clause_spec(text) else { return u32::MAX };
+    let clause = borrow_clause(&parsed);
+    let Some(index) = h.answer_image(query, false, ptr, len) else { return u32::MAX };
+    let hit = index.search_clause(query, k as usize, offset as usize, &clause, &[]);
+    write_hit(&mut h.result, &hit);
+    hit.len() as u32
+}
+
+/// Range-tier [`idx_facet_tally`]: per-value counts of facet `slot` over every document matching
+/// `query`, in the same length-prefixed layout. Returns the entry count or `u32::MAX`.
+///
+/// # Safety
+/// `rh` must be a live handle; `q` and `ptr` readable for their lengths.
+#[no_mangle]
+pub unsafe extern "C" fn idx_range_facet_tally(
+    rh: *mut RangeHandle,
+    q: *const u8,
+    q_len: usize,
+    slot: u32,
+    ptr: *const u8,
+    len: usize,
+) -> u32 {
+    let Some(h) = rh.as_mut() else { return u32::MAX };
+    if q.is_null() || (ptr.is_null() && len != 0) {
+        return u32::MAX;
+    }
+    let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
+        return u32::MAX;
+    };
+    let Some(index) = h.answer_image(query, false, ptr, len) else { return u32::MAX };
+    let tally = index.facet_tally_at(query, slot as usize);
+    write_facet_tally(&mut h.result, &tally);
+    tally.len() as u32
+}
+
+/// Range-tier [`idx_search_range`]: search restricted to `lo <= value < hi` on numeric column
+/// `slot`. Returns the hit count or `u32::MAX`; an unknown slot returns 0, not everything.
+///
+/// # Safety
+/// `rh` must be a live handle; `q` and `ptr` readable for their lengths.
+#[no_mangle]
+pub unsafe extern "C" fn idx_range_search_range(
+    rh: *mut RangeHandle,
+    q: *const u8,
+    q_len: usize,
+    k: u32,
+    slot: u32,
+    lo: f64,
+    hi: f64,
+    ptr: *const u8,
+    len: usize,
+) -> u32 {
+    let Some(h) = rh.as_mut() else { return u32::MAX };
+    if q.is_null() || (ptr.is_null() && len != 0) {
+        return u32::MAX;
+    }
+    let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
+        return u32::MAX;
+    };
+    let Some(index) = h.answer_image(query, false, ptr, len) else { return u32::MAX };
+    let hit = index.search_range(query, k as usize, slot as usize, lo, hi);
+    write_hit(&mut h.result, &hit);
+    hit.len() as u32
+}
+
+/// Range-tier [`idx_range_tally`]: histogram of numeric column `slot` over every document matching
+/// `query`, bucket `i` being `edge[i] <= v < edge[i+1]`. Writes `edge_n - 1` little-endian `u32`
+/// counts and returns that number, or `u32::MAX` (including for fewer than two edges).
+///
+/// # Safety
+/// `rh` must be a live handle; `q`, `edge` (`edge_n` doubles) and `ptr` readable.
+#[no_mangle]
+pub unsafe extern "C" fn idx_range_range_tally(
+    rh: *mut RangeHandle,
+    q: *const u8,
+    q_len: usize,
+    slot: u32,
+    edge: *const f64,
+    edge_n: usize,
+    ptr: *const u8,
+    len: usize,
+) -> u32 {
+    let Some(h) = rh.as_mut() else { return u32::MAX };
+    if q.is_null() || edge.is_null() || edge_n < 2 || (ptr.is_null() && len != 0) {
+        return u32::MAX;
+    }
+    let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
+        return u32::MAX;
+    };
+    let edge = std::slice::from_raw_parts(edge, edge_n);
+    let Some(index) = h.answer_image(query, false, ptr, len) else { return u32::MAX };
+    let count = index.range_tally(query, slot as usize, edge);
+    write_bucket_count(&mut h.result, &count);
+    count.len() as u32
 }
 
 /// Documents in the file `rh` was opened from, or 0 before [`idx_range_load`].
@@ -3071,6 +3251,276 @@ mod tests {
             assert_eq!(idx_range_plan_query(rh2, bad.as_ptr(), 2, 0), u32::MAX);
             idx_range_close(rh);
             idx_range_close(rh2);
+        }
+    }
+
+    // ---- Filtered range queries ----------------------------------------------------------------
+
+    /// A corpus with one facet (`brand`) and one numeric column (`size`), some sizes unparseable,
+    /// so facet clauses, tallies and half-open ranges all have something non-trivial to decide.
+    fn filtered_blob() -> Vec<u8> {
+        let brand = ["Colgate", "Nescafe", "Bear Brand", "Lucky Me", "Oral B", "Milo"];
+        let kind = ["Toothpaste", "Coffee", "Powdered Milk", "Instant Noodle"];
+        let mut b = IndexBuilder::new(Schema::new(vec![
+            Field::new("name", 3.0, 0.4),
+            Field::new("brand", 1.0, 0.6),
+            Field::new("size", 0.0, 0.6),
+        ]))
+        .with_facet(1)
+        .with_numeric(2);
+        for i in 0..600usize {
+            let grams = 50 + (i % 40) * 5;
+            let name = format!("{} {} {grams}g", brand[i % brand.len()], kind[i % kind.len()]);
+            let size = if i % 29 == 0 { "n/a".to_string() } else { grams.to_string() };
+            b.add(&Doc::new([name, brand[i % brand.len()].to_string(), size]));
+        }
+        b.build().unwrap().to_bytes()
+    }
+
+    /// Plan `q` without prefix semantics and fetch exactly its spans.
+    unsafe fn fetch_plan(host: &mut RangeHost, rh: *mut RangeHandle, q: &str) -> Vec<u8> {
+        let n = idx_range_plan_query(rh, q.as_ptr(), q.len(), 0);
+        let mut buf = Vec::new();
+        for (at, len) in plan_of(rh, n) {
+            buf.extend_from_slice(&host.read(at, len));
+        }
+        buf
+    }
+
+    /// Every filtered entry point, byte for byte against a full `idx_open` — and ONE fetched plan
+    /// per query serves all of them, which is the claim that facet and numeric sections are resident.
+    #[test]
+    fn filtered_range_queries_match_a_full_open_byte_for_byte() {
+        let file = filtered_blob();
+        unsafe {
+            let p = idx_alloc(file.len());
+            std::ptr::copy_nonoverlapping(file.as_ptr(), p, file.len());
+            let full = idx_open(p, file.len());
+            idx_free(p, file.len());
+            assert!(!full.is_null());
+            let full_out = |n: u32| -> (u32, Vec<u8>) {
+                (n, std::slice::from_raw_parts(idx_result_ptr(full), idx_result_len(full)).to_vec())
+            };
+
+            let mut host = RangeHost { file: file.clone(), read_byte: 0 };
+            let rh = range_open(&mut host);
+            let range_out = |n: u32| -> (u32, Vec<u8>) {
+                assert_ne!(n, u32::MAX, "a planned filtered query must not be refused");
+                (n, std::slice::from_raw_parts(idx_range_result_ptr(rh), idx_range_result_len(rh)).to_vec())
+            };
+
+            let spec: [&[u8]; 5] = [b"0=Colgate", b"0=Colgate|Milo", b"0!=Nescafe", b"0=Nobody", b""];
+            let edge = [0.0f64, 100.0, 150.0, 400.0];
+            let mut nonempty = 0;
+            for q in ["toothpaste", "colgaye", "coffee 100g", "powdered milk", "bearbrand", "milo", "zzzznothing"] {
+                let buf = fetch_plan(&mut host, rh, q);
+                let (bp, bl) = (buf.as_ptr(), buf.len());
+
+                for s in spec {
+                    for (k, offset) in [(10u32, 0u32), (5, 3)] {
+                        let want = full_out(idx_search_clause(full, q.as_ptr(), q.len(), k, offset, s.as_ptr(), s.len()));
+                        let got = range_out(idx_range_search_clause(rh, q.as_ptr(), q.len(), k, offset, s.as_ptr(), s.len(), bp, bl));
+                        assert_eq!(got, want, "clause {:?} disagrees for {q:?}", std::str::from_utf8(s));
+                        nonempty += usize::from(got.0 > 0);
+                    }
+                }
+                for slot in [0u32, 3] {
+                    let want = full_out(idx_facet_tally(full, q.as_ptr(), q.len(), slot));
+                    let got = range_out(idx_range_facet_tally(rh, q.as_ptr(), q.len(), slot, bp, bl));
+                    assert_eq!(got, want, "facet tally slot {slot} disagrees for {q:?}");
+                }
+                for (slot, lo, hi) in [(0u32, 100.0, 200.0), (0, -1e308, 1e308), (0, 150.0, 150.0), (7, 0.0, 1.0)] {
+                    let want = full_out(idx_search_range(full, q.as_ptr(), q.len(), 10, slot, lo, hi));
+                    let got = range_out(idx_range_search_range(rh, q.as_ptr(), q.len(), 10, slot, lo, hi, bp, bl));
+                    assert_eq!(got, want, "range {slot} [{lo}, {hi}) disagrees for {q:?}");
+                }
+                for slot in [0u32, 7] {
+                    let want = full_out(idx_range_tally(full, q.as_ptr(), q.len(), slot, edge.as_ptr(), edge.len()));
+                    let got = range_out(idx_range_range_tally(rh, q.as_ptr(), q.len(), slot, edge.as_ptr(), edge.len(), bp, bl));
+                    assert_eq!(got, want, "histogram slot {slot} disagrees for {q:?}");
+                }
+            }
+            assert!(nonempty > 10, "the comparison must not be vacuous: {nonempty} non-empty clause answers");
+            idx_range_close(rh);
+            idx_close(full);
+        }
+    }
+
+    /// Where the filter bytes live, measured rather than asserted in prose: the four facet and
+    /// numeric sections are resident, and after the open a filtered query reads its posting plan
+    /// and not one byte more.
+    #[test]
+    fn facet_and_numeric_sections_are_resident_and_cost_nothing_per_query() {
+        let file = filtered_blob();
+        let t = index_text::read_section_table(&file).expect("fixture has a section table");
+        for slot in 11..=14 {
+            assert!(is_resident(slot), "slot {slot} must be fetched at open, not per query");
+        }
+        let filter = t.facet_label.len + t.facet_id.len + t.numeric_field.len + t.numeric_value.len;
+        let resident: u64 = (0..SECTION_COUNT).filter(|i| is_resident(*i)).map(|i| section_span(&t, i).len).sum();
+        eprintln!(
+            "filtered_blob: file {} B | resident at open {resident} B, of which facet+numeric {filter} B | posting {} B",
+            file.len(),
+            t.posting.len
+        );
+        assert!(filter > 0, "the fixture must actually carry facet and numeric bytes");
+
+        let mut host = RangeHost { file, read_byte: 0 };
+        unsafe {
+            let rh = range_open(&mut host);
+            let q = "toothpaste";
+            let before = host.read_byte;
+            let buf = fetch_plan(&mut host, rh, q);
+            assert_eq!(host.read_byte - before, buf.len());
+            let spec = b"0=Colgate";
+            let edge = [0.0f64, 200.0, 400.0];
+            assert_ne!(idx_range_search_clause(rh, q.as_ptr(), q.len(), 10, 0, spec.as_ptr(), spec.len(), buf.as_ptr(), buf.len()), u32::MAX);
+            assert_ne!(idx_range_facet_tally(rh, q.as_ptr(), q.len(), 0, buf.as_ptr(), buf.len()), u32::MAX);
+            assert_ne!(idx_range_search_range(rh, q.as_ptr(), q.len(), 10, 0, 100.0, 200.0, buf.as_ptr(), buf.len()), u32::MAX);
+            assert_ne!(idx_range_range_tally(rh, q.as_ptr(), q.len(), 0, edge.as_ptr(), edge.len(), buf.as_ptr(), buf.len()), u32::MAX);
+            assert_eq!(host.read_byte - before, buf.len(), "a filter must not need bytes beyond the posting plan");
+            idx_range_close(rh);
+        }
+    }
+
+    /// Every filtered range entry point, given every bad input a host can produce. Nothing may trap,
+    /// and a query the plan never covered is refused rather than answered from empty lists.
+    #[test]
+    fn filtered_range_bad_input_returns_sentinels_rather_than_trapping() {
+        let file = filtered_blob();
+        let q = b"toothpaste";
+        let spec = b"0=Colgate";
+        let edge = [0.0f64, 100.0, 200.0];
+        let none = std::ptr::null::<u8>();
+        unsafe {
+            let null = std::ptr::null_mut::<RangeHandle>();
+            assert_eq!(idx_range_search_clause(null, q.as_ptr(), q.len(), 10, 0, spec.as_ptr(), spec.len(), none, 0), u32::MAX);
+            assert_eq!(idx_range_facet_tally(null, q.as_ptr(), q.len(), 0, none, 0), u32::MAX);
+            assert_eq!(idx_range_search_range(null, q.as_ptr(), q.len(), 10, 0, 0.0, 1.0, none, 0), u32::MAX);
+            assert_eq!(idx_range_range_tally(null, q.as_ptr(), q.len(), 0, edge.as_ptr(), edge.len(), none, 0), u32::MAX);
+
+            // Opened from the head but never loaded: nothing can be answered yet.
+            let cold = idx_range_open(file.as_ptr(), file.len());
+            assert!(!cold.is_null());
+            assert_eq!(idx_range_facet_tally(cold, q.as_ptr(), q.len(), 0, none, 0), u32::MAX, "not loaded");
+            assert_eq!(idx_range_search_range(cold, q.as_ptr(), q.len(), 10, 0, 0.0, 1.0, none, 0), u32::MAX, "not loaded");
+            idx_range_close(cold);
+
+            let mut host = RangeHost { file: file.clone(), read_byte: 0 };
+            let rh = range_open(&mut host);
+            let buf = fetch_plan(&mut host, rh, "toothpaste");
+            assert!(buf.len() > 1);
+            let (bp, bl) = (buf.as_ptr(), buf.len());
+
+            // The plan said N bytes; one fewer is a sentinel, not a guess.
+            assert_eq!(idx_range_search_clause(rh, q.as_ptr(), q.len(), 10, 0, spec.as_ptr(), spec.len(), bp, bl - 1), u32::MAX);
+            assert_eq!(idx_range_facet_tally(rh, q.as_ptr(), q.len(), 0, bp, bl - 1), u32::MAX);
+            assert_eq!(idx_range_search_range(rh, q.as_ptr(), q.len(), 10, 0, 0.0, 1e9, bp, bl - 1), u32::MAX);
+            assert_eq!(idx_range_range_tally(rh, q.as_ptr(), q.len(), 0, edge.as_ptr(), edge.len(), bp, bl - 1), u32::MAX);
+            // A null posting pointer with a non-zero length.
+            assert_eq!(idx_range_facet_tally(rh, q.as_ptr(), q.len(), 0, none, bl), u32::MAX);
+            // Malformed spec, too few edges, a null edge array, a non-UTF-8 query.
+            let bad_spec = b"Colgate";
+            assert_eq!(idx_range_search_clause(rh, q.as_ptr(), q.len(), 10, 0, bad_spec.as_ptr(), bad_spec.len(), bp, bl), u32::MAX);
+            assert_eq!(idx_range_range_tally(rh, q.as_ptr(), q.len(), 0, edge.as_ptr(), 1, bp, bl), u32::MAX);
+            assert_eq!(idx_range_range_tally(rh, q.as_ptr(), q.len(), 0, std::ptr::null(), 3, bp, bl), u32::MAX);
+            let bad = [0xffu8, 0xfe];
+            assert_eq!(idx_range_facet_tally(rh, bad.as_ptr(), bad.len(), 0, bp, bl), u32::MAX);
+
+            // The right number of bytes for the WRONG query: "coffee" was never planned, so its
+            // lists are empty in the image and answering would under-count. Refused.
+            let other = b"coffee";
+            assert_eq!(idx_range_facet_tally(rh, other.as_ptr(), other.len(), 0, bp, bl), u32::MAX);
+            assert_eq!(idx_range_search_range(rh, other.as_ptr(), other.len(), 10, 0, -1e308, 1e308, bp, bl), u32::MAX);
+            idx_range_close(rh);
+        }
+    }
+
+    /// `doc_key` is not resident. On a KEYED index -- the only kind where the section has bytes --
+    /// the open reads exactly the head plus the resident sections, never a key, and every range
+    /// query (text, clause, tally, range, histogram) still answers byte-for-byte like a full open.
+    #[test]
+    fn a_keyed_index_answers_without_ever_fetching_doc_key() {
+        let brand = ["Colgate", "Nescafe", "Bear Brand", "Lucky Me", "Oral B", "Milo"];
+        let kind = ["Toothpaste", "Coffee", "Powdered Milk", "Instant Noodle"];
+        let mut b = IndexBuilder::new(Schema::new(vec![
+            Field::new("name", 3.0, 0.4),
+            Field::new("brand", 1.0, 0.6),
+            Field::new("size", 0.0, 0.6),
+            Field::new("sku", 0.0, 0.6),
+        ]))
+        .with_facet(1)
+        .with_numeric(2)
+        .with_key(3);
+        for i in 0..600usize {
+            let grams = 50 + (i % 40) * 5;
+            let name = format!("{} {} {grams}g", brand[i % brand.len()], kind[i % kind.len()]);
+            b.add(&Doc::new([name, brand[i % brand.len()].to_string(), grams.to_string(), format!("SKU-{i:05}")]));
+        }
+        let file = b.build().unwrap().to_bytes();
+        let t = index_text::read_section_table(&file).expect("fixture has a section table");
+        assert!(t.doc_key.len > 0, "the fixture must actually carry keys");
+        assert!(!is_resident(SLOT_DOC_KEY));
+        let resident: u64 = (0..SECTION_COUNT).filter(|i| is_resident(*i)).map(|i| section_span(&t, i).len).sum();
+
+        unsafe {
+            let p = idx_alloc(file.len());
+            std::ptr::copy_nonoverlapping(file.as_ptr(), p, file.len());
+            let full = idx_open(p, file.len());
+            idx_free(p, file.len());
+            assert!(!full.is_null());
+            let full_out = |n: u32| -> (u32, Vec<u8>) {
+                (n, std::slice::from_raw_parts(idx_result_ptr(full), idx_result_len(full)).to_vec())
+            };
+
+            let mut host = RangeHost { file: file.clone(), read_byte: 0 };
+            let rh = range_open(&mut host);
+            assert_eq!(
+                host.read_byte as u64,
+                RANGE_HEAD_BYTE as u64 + resident,
+                "the open reads the head and the resident sections -- and not the {} key bytes",
+                t.doc_key.len
+            );
+            let range_out = |n: u32| -> (u32, Vec<u8>) {
+                assert_ne!(n, u32::MAX, "a planned query must not be refused");
+                (n, std::slice::from_raw_parts(idx_range_result_ptr(rh), idx_range_result_len(rh)).to_vec())
+            };
+
+            let spec = b"0=Colgate|Milo";
+            let edge = [0.0f64, 100.0, 150.0, 400.0];
+            for q in ["toothpaste", "colgaye", "coffee 100g", "milo powdered"] {
+                let before = host.read_byte;
+                let buf = fetch_plan(&mut host, rh, q);
+                let (bp, bl) = (buf.as_ptr(), buf.len());
+                assert_eq!(
+                    range_out(idx_range_search(rh, q.as_ptr(), q.len(), 10, 0, bp, bl)),
+                    full_out(idx_search(full, q.as_ptr(), q.len(), 10, 0)),
+                    "text search disagrees for {q:?}"
+                );
+                assert_eq!(
+                    range_out(idx_range_search_clause(rh, q.as_ptr(), q.len(), 10, 0, spec.as_ptr(), spec.len(), bp, bl)),
+                    full_out(idx_search_clause(full, q.as_ptr(), q.len(), 10, 0, spec.as_ptr(), spec.len())),
+                    "clause disagrees for {q:?}"
+                );
+                assert_eq!(
+                    range_out(idx_range_facet_tally(rh, q.as_ptr(), q.len(), 0, bp, bl)),
+                    full_out(idx_facet_tally(full, q.as_ptr(), q.len(), 0)),
+                    "facet tally disagrees for {q:?}"
+                );
+                assert_eq!(
+                    range_out(idx_range_search_range(rh, q.as_ptr(), q.len(), 10, 0, 100.0, 200.0, bp, bl)),
+                    full_out(idx_search_range(full, q.as_ptr(), q.len(), 10, 0, 100.0, 200.0)),
+                    "numeric range disagrees for {q:?}"
+                );
+                assert_eq!(
+                    range_out(idx_range_range_tally(rh, q.as_ptr(), q.len(), 0, edge.as_ptr(), edge.len(), bp, bl)),
+                    full_out(idx_range_tally(full, q.as_ptr(), q.len(), 0, edge.as_ptr(), edge.len())),
+                    "histogram disagrees for {q:?}"
+                );
+                assert_eq!(host.read_byte - before, buf.len(), "a query reads its posting plan and nothing else");
+            }
+            idx_range_close(rh);
+            idx_close(full);
         }
     }
 }

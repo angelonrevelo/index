@@ -285,10 +285,148 @@ export class RangeIndex {
     }
   }
 
+  // ---- Filtered queries --------------------------------------------------------------------------
+  //
+  // Facet ids and numeric columns are resident (read once at open), so a filtered query or a tally
+  // owes exactly the bytes an unfiltered query does: its posting lists, planned WITHOUT prefix
+  // semantics. One plan, one read, one answer -- the same await-between-two-calls shape as search().
+
+  /** Copy `bytes` in, allocating at least one byte so an empty string is a pointer, not a null. */
+  #hold(bytes) {
+    const p = u32(this.#e.idx_alloc(bytes.length || 1));
+    if (p === 0) throw new Error(`idx_alloc(${bytes.length}) failed`);
+    if (bytes.length) new Uint8Array(this.#e.memory.buffer, p, bytes.length).set(bytes);
+    return [p, bytes.length];
+  }
+
+  /** Plan `query` (non-prefix), fetch its spans, run `answer(qp, ql, pp, pl)`, free everything. */
+  async #withPosting(query, answer) {
+    const e = this.#e;
+    const [qp, ql] = this.#hold(new TextEncoder().encode(query));
+    try {
+      const n = u32(e.idx_range_plan_query(this.#rh, qp, ql, 0));
+      if (n === ERR) throw new Error('idx_range_plan_query failed');
+      const posting = await this.#read(this.#plan(n));
+      const [pp, pl] = this.#hold(posting);
+      try {
+        return answer(qp, ql, pp, pl);
+      } finally {
+        e.idx_free(pp, pl || 1);
+      }
+    } finally {
+      e.idx_free(qp, ql || 1);
+    }
+  }
+
+  /** Decode `n` 12-byte hit records from the handle's result buffer. */
+  #hits(n) {
+    const e = this.#e;
+    const view = new DataView(e.memory.buffer, u32(e.idx_range_result_ptr(this.#rh)), n * HIT_BYTE);
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const doc = view.getUint32(i * HIT_BYTE, true);
+      out.push({
+        doc,
+        score: view.getFloat32(i * HIT_BYTE + 4, true),
+        typoBucket: view.getUint32(i * HIT_BYTE + 8, true),
+        label: this.#label?.[doc] ?? null,
+      });
+    }
+    return out;
+  }
+
+  #refused(what) {
+    return new Error(`${what} refused this query — fall back to a whole-file open`);
+  }
+
+  /**
+   * The full filter bar: `clause` is `[{slot, value: string[], exclude?}]`, OR within a clause,
+   * AND across clauses. Identical to `idx_search_clause` on a full open.
+   */
+  async searchClause(query, clause, { k = 10, offset = 0 } = {}) {
+    return this.#withPosting(query, (qp, ql, pp, pl) => {
+      const [sp, sl] = this.#hold(new TextEncoder().encode(clauseSpec(clause)));
+      try {
+        const n = u32(this.#e.idx_range_search_clause(this.#rh, qp, ql, k, offset, sp, sl, pp, pl));
+        if (n === ERR) throw this.#refused('idx_range_search_clause');
+        return this.#hits(n);
+      } finally {
+        this.#e.idx_free(sp, sl || 1);
+      }
+    });
+  }
+
+  /** Per-value counts of facet `slot` over every document matching `query`, count descending. */
+  async facetTally(query, slot) {
+    return this.#withPosting(query, (qp, ql, pp, pl) => {
+      const n = u32(this.#e.idx_range_facet_tally(this.#rh, qp, ql, slot, pp, pl));
+      if (n === ERR) throw this.#refused('idx_range_facet_tally');
+      return decodeFacetTally(this.#e, u32(this.#e.idx_range_result_ptr(this.#rh)), n);
+    });
+  }
+
+  /** Search restricted to `lo <= value < hi` on numeric column `slot`. */
+  async searchRange(query, slot, lo, hi, { k = 10 } = {}) {
+    return this.#withPosting(query, (qp, ql, pp, pl) => {
+      const n = u32(this.#e.idx_range_search_range(this.#rh, qp, ql, k, slot, lo, hi, pp, pl));
+      if (n === ERR) throw this.#refused('idx_range_search_range');
+      return this.#hits(n);
+    });
+  }
+
+  /** Histogram of numeric column `slot`: one count per `[edge[i], edge[i+1])` bucket. */
+  async rangeTally(query, slot, edge) {
+    return this.#withPosting(query, (qp, ql, pp, pl) => {
+      const e = this.#e;
+      const bytes = new Uint8Array(edge.length * 8);
+      const dv = new DataView(bytes.buffer);
+      edge.forEach((x, i) => dv.setFloat64(i * 8, x, true));
+      const [ep, el] = this.#hold(bytes);
+      try {
+        const n = u32(e.idx_range_range_tally(this.#rh, qp, ql, slot, ep, edge.length, pp, pl));
+        if (n === ERR) throw this.#refused('idx_range_range_tally');
+        return Array.from(new Uint32Array(e.memory.buffer.slice(u32(e.idx_range_result_ptr(this.#rh)), u32(e.idx_range_result_ptr(this.#rh)) + n * 4)));
+      } finally {
+        e.idx_free(ep, el || 1);
+      }
+    });
+  }
+
   close() {
     this.#e.idx_range_close(this.#rh);
     this.#rh = 0;
   }
+}
+
+/**
+ * The NUL-separated clause spec `idx_search_clause` and `idx_range_search_clause` parse: each clause
+ * `slot[!]=v1|v2`. A value containing `|` cannot be expressed, so it is refused rather than split.
+ */
+export function clauseSpec(clause) {
+  return clause
+    .map(({ slot, value, exclude = false }) => {
+      for (const v of value) {
+        if (v.includes('|')) throw new Error(`a facet value containing '|' cannot be expressed: ${v}`);
+      }
+      return `${slot}${exclude ? '!' : ''}=${value.join('|')}`;
+    })
+    .join('\0');
+}
+
+/** Decode `n` length-prefixed `(label, count)` tally entries starting at `ptr`. */
+export function decodeFacetTally(exports, ptr, n) {
+  const dv = new DataView(exports.memory.buffer);
+  const dec = new TextDecoder();
+  const out = [];
+  let at = ptr;
+  for (let i = 0; i < n; i++) {
+    const len = dv.getUint32(at, true);
+    const label = dec.decode(new Uint8Array(exports.memory.buffer, at + 4, len));
+    const count = dv.getUint32(at + 4 + len, true);
+    out.push({ label, count });
+    at += 8 + len;
+  }
+  return out;
 }
 
 /**

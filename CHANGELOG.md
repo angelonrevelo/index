@@ -6,6 +6,37 @@ All notable changes to `index`. The project is pre-release and unversioned, so e
 [ROADMAP.md](ROADMAP.md) for the tiered plan and [docs/roadmap-rejected.md](docs/roadmap-rejected.md)
 for what was deliberately ruled out.
 
+### Added — faceted and numeric-range queries through the range tier; doc_key leaves the resident set (2026-09-13)
+
+The range tier answered one question, ranked text search. A filter bar asks four more, and a host that
+could only read byte ranges had to fetch the whole file for any of them.
+
+- **`idx_range_search_clause`, `idx_range_facet_tally`, `idx_range_search_range`,
+  `idx_range_range_tally`** mirror `idx_search_clause`, `idx_facet_tally`, `idx_search_range` and
+  `idx_range_tally`. They use the same two calls with one await between them, and they take the bytes
+  of an ordinary `idx_range_plan_query(.., prefix = 0)`. No new plan call is needed: `facet_label`,
+  `facet_id`, `numeric_field` and `numeric_value` are resident, so a filtered query owes only its
+  posting lists. Result buffers are byte-identical to the full-open exports, and the tally encoders
+  are now shared so the two can't drift apart. Only exports were added, so `ABI_VERSION` stays 14.
+- **One verification path.** `answer_image` now holds the plan-length check, the image assembly and
+  the refusal of any term the plan didn't fetch, for text search and all four filters.
+- **`doc_key` is no longer resident.** No range query reads a key. On a keyed 400K-product index
+  (15,512,041 B, unique SKUs) the section is 5,888,894 B (38.0 %). The range open drops from
+  10,006,822 B (64.5 %) to 4,117,928 B (26.5 %). Sixty queries add 341,154 B (2.2 %) uncached, so
+  open plus all queries reads 28.7 % of the file. 120/120 answers (search + facet tally) match a
+  full open.
+- **Where the bytes are:**
+  - `profstopick.idx` (119,390 B, no facet): 45,014 B resident (37.7 %), 74,080 B posting fetched
+    per query (62.0 %).
+  - Synthetic 2K-doc facet+numeric index (49,640 B): 33,726 B resident (67.9 %), of which
+    facet+numeric is 18,123 B; 15,618 B posting.
+- **Tests:** four new Rust tests. Every filtered entry point matches a full open byte for byte. One
+  plan's bytes serve every filter with no extra reads. Bad input returns sentinels, never traps. A
+  keyed index answers without ever fetching `doc_key`.
+- **`js/range-facet-check.mjs`:** 144/144 filtered answers identical to a full open. Each call
+  performs exactly one read. A truncated range response is refused by all four calls.
+  `INDEX_IDX`/`INDEX_QUERY` point it at any other index.
+- **`RangeIndex`** gains `searchClause`, `facetTally`, `searchRange` and `rangeTally`.
 ### Measured — the range tier on a 15.5 MB index: the open is the cost, not the queries (2026-09-13)
 
 - 400K synthetic products (`sku`/`name`/`brand`, facet `brand`), 402,668 terms, **15,512,041 B**,
