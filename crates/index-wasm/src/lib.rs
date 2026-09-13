@@ -2193,10 +2193,17 @@ pub unsafe extern "C" fn idx_range_load(rh: *mut RangeHandle, ptr: *const u8, le
     }
 
     let off = std::mem::take(&mut part[SLOT_POSTING_OFFSET]);
-    if off.len() % 8 != 0 || off.len() < 16 {
+    // `12` layout: an entry count, then a 16-byte-per-block directory, then varint deltas.
+    // Term count comes from the header, not from a byte stride.
+    if off.len() < 8 {
         return 0;
     }
-    h.term_count = off.len() / 8 - 1;
+    let entries = u64::from_le_bytes(off[0..8].try_into().unwrap()) as usize;
+    let blocks = entries.div_ceil(64);
+    if entries == 0 || off.len() < 8 + blocks * 16 {
+        return 0;
+    }
+    h.term_count = entries - 1;
     h.posting_offset = off;
     h.part = part;
     // The resident image: every posting list present, every posting list empty. It answers no

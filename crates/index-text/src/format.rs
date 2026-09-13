@@ -24,10 +24,11 @@ use crate::index::{Field, Index, Schema};
 
 /// `"IDXTEXT11"` — magic plus format version.
 ///
-/// The trailing number has moved 1 -> 11 as sections were added: priors (`2`), facets (`3`),
+/// The trailing number has moved 1 -> 12 as sections were added: priors (`2`), facets (`3`),
 /// multi-slot facets (`4`, same span count but a different encoding), numeric columns (`5`),
 /// token positions (`6`), document keys (`7`), unscored columns (`8`), delta-varint position
-/// sections (`9`), delta-varint posting lists (`10`), mode-coded posting lists (`11`).
+/// sections (`9`), delta-varint posting lists (`10`), mode-coded posting lists (`11`),
+/// checkpointed posting offsets, columnar doc lengths and width-coded facet ids (`12`).
 /// Every bump is forced by the `TABLE_BYTE` assertion in the tests rather than remembered.
 ///
 /// **`10` is nine bytes, not eight.** The version outgrew the digit the magic reserved for it,
@@ -47,7 +48,7 @@ use crate::index::{Field, Index, Schema};
 /// version — read 297 and you mis-parse a v9 file, read 296 and you mis-parse a v10 one. A
 /// fixed-width magic keeps `MAGIC.len() + TABLE_BYTE` a constant a browser can fetch blind, which
 /// is what `js/opfs-worker.mjs` does and what `p68` publishes as "296 bytes to open any file".
-pub const MAGIC: [u8; 8] = *b"IDXTXT11";
+pub const MAGIC: [u8; 8] = *b"IDXTXT12";
 
 /// The magic of every format version this crate has ever written, oldest first, so a reader can
 /// say *"that is an `IDXTEXT9` file, this build reads `IDXTEXT11`"* instead of *"bad magic"*.
@@ -59,9 +60,9 @@ pub const MAGIC: [u8; 8] = *b"IDXTXT11";
 /// All of these are matched as exact-width prefixes, so the eight-byte `IDXTXT10` sits beside the
 /// nine-byte `IDXTEXT1`–`9` names — see `MAGIC` for why the width is held constant instead of
 /// growing at version 10.
-const KNOWN_MAGIC: [&[u8]; 10] = [
+const KNOWN_MAGIC: [&[u8]; 11] = [
     b"IDXTEXT1", b"IDXTEXT2", b"IDXTEXT3", b"IDXTEXT4", b"IDXTEXT5", b"IDXTEXT6", b"IDXTEXT7",
-    b"IDXTEXT8", b"IDXTEXT9", b"IDXTXT10",
+    b"IDXTEXT8", b"IDXTEXT9", b"IDXTXT10", b"IDXTXT11",
 ];
 
 /// Explain a magic mismatch: an older (or newer) `IDXTEXT` version, or not an index at all.
@@ -274,6 +275,20 @@ impl<'a> Reader<'a> {
     /// and `self.p + n` then overflows and PANICS -- which this format explicitly promises not to
     /// do. Found by `corrupt_input_errors_rather_than_panics` when the facet sections gave it a
     /// second length-prefixed section to reach; `expansion` had the same latent path.
+    fn u8(&mut self) -> Result<u8, String> {
+        self.need(1)?;
+        let v = self.b[self.p];
+        self.p += 1;
+        Ok(v)
+    }
+
+    fn u16(&mut self) -> Result<u16, String> {
+        self.need(2)?;
+        let v = u16::from_le_bytes(self.b[self.p..self.p + 2].try_into().unwrap());
+        self.p += 2;
+        Ok(v)
+    }
+
     fn need(&self, n: usize) -> Result<(), String> {
         match self.p.checked_add(n) {
             Some(end) if end <= self.b.len() => Ok(()),
@@ -391,15 +406,50 @@ pub fn posting_span(
     posting_offset_bytes: &[u8],
     term_id: u32,
 ) -> Result<Span, String> {
-    let i = term_id as usize;
-    if (i + 2) * 8 > posting_offset_bytes.len() {
-        return Err(format!("term {term_id} out of range of the offset array"));
+    posting_span_from_bytes(posting_offset_bytes, term_id)
+        .map(|(a, b)| Span { offset: table.posting.offset + a, len: b - a })
+}
+
+/// Entries `i` and `i+1` of the block-directory posting-offset array, decoded from the
+/// section's own bytes: entry `i`'s block directory record sits at a COMPUTABLE byte position,
+/// so the decode is the directory read plus at most `OFFSET_CHECKPOINT` varints. Returns
+/// `(offset of term i, offset of term i+1)`, in posting-section units.
+fn posting_span_from_bytes(b: &[u8], term_id: u32) -> Result<(u64, u64), String> {
+    if b.len() < 8 {
+        return Err("posting offset section is truncated".into());
     }
-    let get = |k: usize| -> u64 {
-        u64::from_le_bytes(posting_offset_bytes[k * 8..k * 8 + 8].try_into().unwrap())
+    let entries = u64::from_le_bytes(b[0..8].try_into().unwrap()) as usize;
+    if entries == 0 {
+        return Err("posting offset section claims no entries".into());
+    }
+    if term_id as usize + 1 >= entries {
+        return Err(format!(
+            "term {term_id} out of range of the offset array ({entries} entries)"
+        ));
+    }
+    let dir = |block: usize| -> Result<(u64, u64), String> {
+        let at = 8 + block * 16;
+        if at + 16 > b.len() {
+            return Err("posting offset directory is truncated".into());
+        }
+        Ok((
+            u64::from_le_bytes(b[at..at + 8].try_into().unwrap()),
+            u64::from_le_bytes(b[at + 8..at + 16].try_into().unwrap()),
+        ))
     };
-    let (a, b) = (get(i), get(i + 1));
-    Ok(Span { offset: table.posting.offset + a, len: b - a })
+    // Decode `(start_value, deltas 1..=r)` for the block a given entry lives in.
+    let entry = |j: usize| -> Result<u64, String> {
+        let block = j / OFFSET_CHECKPOINT;
+        let (mut val, start_byte) = dir(block)?;
+        let mut at = start_byte as usize;
+        for _ in 0..(j % OFFSET_CHECKPOINT) {
+            let mut r = Reader::new(&b[at..]);
+            val += r.varint()?;
+            at += r.p;
+        }
+        Ok(val)
+    };
+    Ok((entry(term_id as usize)?, entry(term_id as usize + 1)?))
 }
 
 /// Lists at least this long use the block-FOR columnar mode; shorter ones use sparse varint.
@@ -413,6 +463,10 @@ const POST_BLOCKED_MIN: usize = 64;
 /// 128-posting list is half the list; large enough that one width byte amortizes to under a
 /// hundredth of a bit per value.
 const POST_BLOCK: usize = 128;
+
+/// Whole-`u64` checkpoints between varint deltas in the posting-offset section: term `i`'s
+/// span is decoded by walking at most `OFFSET_CHECKPOINT - 1` varints from its checkpoint.
+const OFFSET_CHECKPOINT: usize = 64;
 
 /// Column kind byte: every value in the column is zero, and no blocks follow.
 const COL_ALL_ZERO: u8 = 0xFF;
@@ -742,24 +796,59 @@ impl Index {
         }
 
         // Offsets are relative to the start of the posting section, so the section can be
-        // relocated or fetched independently.
-        let start = w.here();
-        let mut acc: u64 = 0;
-        w.u64(0);
-        for byte in list_byte.iter() {
+        // relocated or fetched independently. `12` re-laid it out as a directory of blocks:
+        // every `OFFSET_CHECKPOINT` entries gets a fixed 16-byte `(cumulative value, byte
+        // where this block's deltas start)` record at a COMPUTABLE position, and the entries
+        // inside a block are varint deltas from their predecessor. Fixed-width `u64` spent
+        // eight bytes on a list length that is usually one or two; the directory keeps any
+        // single entry decodable in at most `OFFSET_CHECKPOINT` varints, which a flat varint
+        // array cannot — variable widths make byte positions of later blocks unknowable
+        // without decoding everything before them.
+        let start = w.here() as usize;
+        let entries = list_byte.len() + 1;
+        let blocks = entries.div_ceil(OFFSET_CHECKPOINT);
+        w.u64(entries as u64);
+        let dir_at = w.here() as usize;
+        w.buf.extend_from_slice(&vec![0u8; blocks * 16]);
+        let deltas_at = w.here() as usize;
+        let mut acc = 0u64;
+        let mut block = 0usize;
+        let set_dir = |buf: &mut Vec<u8>, block: usize, value: u64, byte: u64| {
+            let at = dir_at + block * 16;
+            buf[at..at + 8].copy_from_slice(&value.to_le_bytes());
+            buf[at + 8..at + 16].copy_from_slice(&byte.to_le_bytes());
+        };
+        set_dir(&mut w.buf, 0, 0, (deltas_at - start) as u64);
+        for (i, byte) in list_byte.iter().enumerate() {
+            let j = i + 1;
             acc += byte;
-            w.u64(acc);
+            if j % OFFSET_CHECKPOINT == 0 {
+                block += 1;
+                let byte_at = (w.here() as usize - start) as u64;
+                set_dir(&mut w.buf, block, acc, byte_at);
+            } else {
+                w.varint(*byte);
+            }
         }
-        let posting_offset = w.span_from(start);
+        debug_assert_eq!(block + 1, blocks);
+        let posting_offset = w.span_from(start as u64);
 
         let start = w.here();
         w.buf.extend_from_slice(&post.buf);
         let posting = w.span_from(start);
 
+        // `12` columnar: one varint column per field, an all-zero field (a name-only corpus
+        // leaves fields 1.. empty for EVERY document) a single 0xFF flag byte instead of two
+        // bytes per document. The old fixed `u16` stride was the third-largest section.
         let start = w.here();
-        for l in s.doc_len.iter() {
-            for v in l.iter() {
-                w.u16(*v);
+        for f in 0..crate::index::MAX_FIELD {
+            if s.doc_len.iter().all(|l| l[f] == 0) {
+                w.buf.push(0xFF);
+            } else {
+                w.buf.push(0x00);
+                for l in s.doc_len.iter() {
+                    w.varint(l[f] as u64);
+                }
             }
         }
         let doc_len = w.span_from(start);
@@ -824,11 +913,42 @@ impl Index {
         }
         let facet_label = w.span_from(start);
 
+        // `12` width-coded: a slot whose label count fits u8 costs one byte per document, not
+        // four. The all-values-absent column is a 0 width code and nothing else. The sentinel
+        // for "no value" is the width's maximum (0xFF / 0xFFFF / u32::MAX), which is why the
+        // writer picks a width the label ids actually fit UNDER.
         let start = w.here();
         if !facet_label_src.is_empty() {
             for column in facet_id_src.iter() {
+                let max = column
+                    .iter()
+                    .copied()
+                    .filter(|v| *v != u32::MAX)
+                    .max()
+                    .unwrap_or(0);
+                let (code, width): (u8, usize) = if column.iter().all(|v| *v == u32::MAX) {
+                    (0, 0)
+                } else if max < 0xFF {
+                    (1, 1)
+                } else if max < 0xFFFF {
+                    (2, 2)
+                } else {
+                    (4, 4)
+                };
+                w.buf.push(code);
                 for v in column.iter() {
-                    w.u32(*v);
+                    match width {
+                        0 => {}
+                        1 => {
+                            let b = if *v == u32::MAX { 0xFF } else { *v as u8 };
+                            w.buf.push(b);
+                        }
+                        2 => {
+                            let x = if *v == u32::MAX { 0xFFFFu16 } else { *v as u16 };
+                            w.u16(x);
+                        }
+                        _ => w.u32(*v),
+                    }
                 }
             }
         }
@@ -1004,16 +1124,40 @@ impl Index {
         let dict_bytes = buf[table.dict.range()].to_vec();
 
         let off = &buf[table.posting_offset.range()];
-        if off.len() % 8 != 0 || off.len() < 8 {
+        if off.len() < 8 {
             return Err("posting offset array is malformed".into());
         }
-        let term_count = off.len() / 8 - 1;
-        let get = |k: usize| -> u64 { u64::from_le_bytes(off[k * 8..k * 8 + 8].try_into().unwrap()) };
+        let entries = u64::from_le_bytes(off[0..8].try_into().unwrap()) as usize;
+        let blocks = entries.div_ceil(OFFSET_CHECKPOINT);
+        if off.len() < 8 + blocks * 16 {
+            return Err("posting offset directory is truncated".into());
+        }
+        let term_count = entries - 1;
         let post_bytes = &buf[table.posting.range()];
         let mut posting = Vec::with_capacity(term_count);
         // Total postings across every term -- the count `position_at` must have one entry for,
         // plus a terminator. Summed from what was actually decoded, so it cannot drift from it.
         let mut posting_count = 0usize;
+        // Full sequential decode of the block directory: walk every block, accumulate deltas,
+        // resetting to each block's own start value so a corrupt block cannot poison the next.
+        let mut all_offsets = vec![0u64; entries];
+        for block in 0..blocks {
+            let at = 8 + block * 16;
+            let val = u64::from_le_bytes(off[at..at + 8].try_into().unwrap());
+            all_offsets[block * OFFSET_CHECKPOINT] = val;
+            let byte_at = u64::from_le_bytes(off[at + 8..at + 16].try_into().unwrap()) as usize;
+            if byte_at > off.len() {
+                return Err(format!("posting offset block {block} points past the section"));
+            }
+            let mut r = Reader::new(&off[byte_at..]);
+            let mut acc = val;
+            let last = ((block + 1) * OFFSET_CHECKPOINT).min(entries);
+            for slot in all_offsets[(block * OFFSET_CHECKPOINT + 1)..last].iter_mut() {
+                acc += r.varint()?;
+                *slot = acc;
+            }
+        }
+        let get = { let get = &all_offsets; move |k: usize| get[k] };
         for i in 0..term_count {
             let (a, b) = (get(i), get(i + 1));
             // Checked as `u64` before narrowing: on a 32-bit target a cast would silently
@@ -1027,19 +1171,25 @@ impl Index {
             posting.push(list);
         }
 
-        let dl = &buf[table.doc_len.range()];
-        let stride = 2 * crate::index::MAX_FIELD;
-        if dl.len() != doc_count * stride {
-            return Err(format!("doc_len section is {} bytes, expected {}", dl.len(), doc_count * stride));
-        }
-        let mut doc_len = Vec::with_capacity(doc_count);
-        for d in 0..doc_count {
-            let mut l = [0u16; crate::index::MAX_FIELD];
-            for (f, v) in l.iter_mut().enumerate() {
-                let at = d * stride + f * 2;
-                *v = u16::from_le_bytes(dl[at..at + 2].try_into().unwrap());
+        // `12` columnar decode, exactly as the range path does it: one flag-and-varint column
+        // per field, an all-zero field one flag byte, exact-consume at the end.
+        let mut doc_len = vec![[0u16; crate::index::MAX_FIELD]; doc_count];
+        {
+            let mut r = Reader::new(&buf[table.doc_len.range()]);
+            for f in 0..crate::index::MAX_FIELD {
+                let flag = r.b.get(r.p).copied().ok_or("doc_len section ends inside a flag")?;
+                r.p += 1;
+                if flag == 0xFF {
+                    continue;
+                }
+                for l in doc_len.iter_mut() {
+                    *l.get_mut(f).expect("field in range") =
+                        u16::try_from(r.varint()?).map_err(|_| "field length exceeds u16")?;
+                }
             }
-            doc_len.push(l);
+            if r.p != r.b.len() {
+                return Err(format!("doc_len section has {} bytes left over", r.b.len() - r.p));
+            }
         }
 
         let mut ix =
@@ -1211,21 +1361,51 @@ impl Index {
                 }
                 label.push(l);
             }
-            // The id section is slot-major, per-document and fixed width, so a length mismatch is a
-            // corrupt artifact rather than an older one -- the magic already excludes older writers.
-            if table.facet_id.len as usize != slot_n * doc_count * 4 {
-                return Err(format!(
-                    "facet id section is {} bytes, expected {} for {slot_n} slots x {doc_count} documents",
-                    table.facet_id.len,
-                    slot_n * doc_count * 4
-                ));
-            }
+            // `12` width-coded decode, exactly as the range path does it: each slot declares a
+            // byte width whose maximum value is the "no value" sentinel; 0 means every
+            // document is absent in that slot.
             let mut r = Reader::new(&buf[table.facet_id.range()]);
             let mut id = Vec::with_capacity(slot_n);
             for _ in 0..slot_n {
+                let code = r.u8()?;
+                let per_doc = match code {
+                    0 => 0usize,
+                    1 => 1,
+                    2 => 2,
+                    4 => 4,
+                    other => {
+                        return Err(format!("facet slot width {other} is not 0, 1, 2 or 4"));
+                    }
+                };
+                if per_doc as u64 * doc_count as u64 > r.b.len() as u64 - r.p as u64 {
+                    return Err(format!(
+                        "facet slot needs {} x {doc_count} values, {} bytes left",
+                        per_doc,
+                        r.b.len() - r.p
+                    ));
+                }
                 let mut column = Vec::with_capacity(doc_count);
                 for _ in 0..doc_count {
-                    column.push(r.u32()?);
+                    column.push(match per_doc {
+                        0 => u32::MAX,
+                        1 => {
+                            let b = r.u8()?;
+                            if b == 0xFF {
+                                u32::MAX
+                            } else {
+                                b as u32
+                            }
+                        }
+                        2 => {
+                            let x = r.u16()?;
+                            if x == 0xFFFF {
+                                u32::MAX
+                            } else {
+                                x as u32
+                            }
+                        }
+                        _ => r.u32()?,
+                    });
                 }
                 id.push(column);
             }

@@ -8,6 +8,26 @@ for what was deliberately ruled out.
 
 ## [Unreleased]
 
+### Measured — p90 + p91: reordering built (opt-in) and the secondary sections re-encoded, IDXTEXT12 (2026-09-13)
+
+Two levers from the honest-limits list, built and measured the same day:
+
+- **p90 — docID reordering** (recursive graph bisection, cut-minimizing refinement). Built,
+  measured, ships **opt-in** (`IndexBuilder::with_doc_reorder(true)` / CLI `--reorder`), default
+  OFF: −6.2 % of the file on the real presyo schema, ~0 % on a short-title schema, latency at
+  parity, per-key scores identical — and one real cost: every consumer that maps a result's doc
+  ordinal back to its own rows breaks unless it addresses rows by key. Same disposition as static
+  priors. A one-shot BFS-parity bisection was implemented first and collapsed on near-universal
+  terms; both attempts are recorded in
+  [`bench/roadmap/p90-docid-reorder.md`](bench/roadmap/p90-docid-reorder.md).
+- **p91 — the secondary sections** (IDXTEXT12): posting_offset as a block directory + varint
+  deltas (any entry decodable in ≤64 varints, so the range tier keeps O(1)-ish term→span),
+  doc_len as per-field varint columns with an all-zero flag, facet_id width-coded per slot.
+  **18,305,266 → 13,704,342 bytes on the real presyo schema (−25.1 %), latency at parity,
+  precision identical.** Combined with p88: −45.5 % of the file this session, 103.9 → 56.7 B/doc.
+  [`bench/roadmap/p91-secondary-sections.md`](bench/roadmap/p91-secondary-sections.md).
+
+
 ### Verified — IDXTEXT11 across the estate (2026-09-13)
 
 Pushed to the mesh hub and pulled on `gelos-macbook-pro` (aarch64 macOS, rustc 1.93): 134/134
