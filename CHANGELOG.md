@@ -8,6 +8,16 @@ for what was deliberately ruled out.
 
 ## [Unreleased]
 
+### Verified — IDXTEXT11 across the estate (2026-09-13)
+
+Pushed to the mesh hub and pulled on `gelos-macbook-pro` (aarch64 macOS, rustc 1.93): 134/134
+index-text tests pass, the Windows-built presyo-fixture index answers identically there, and the
+Mac's own build of the same 25,979-row fixture hashes byte-identical to the Windows build
+(`16ea2441955932f63a9104e9`). One binary per machine, one file everywhere — recorded in the p88
+document. Also synced with two commits the Mac had pushed first: presyo adoption is decided and
+built (99 % vs 93 % on their real 35,637-row corpus, the margin entirely Filipino-language
+queries), plus a per-query in-process presyo bench replacing the useless fork-per-query numbers.
+
 ### Measured — p89: nookr2's comboboxes, on the seed the database already wrote (2026-09-13)
 
 The fifth and last p84 candidate with data on disk is measured — and the corpus is read through

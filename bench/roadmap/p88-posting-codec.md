@@ -88,6 +88,21 @@ One incidental find: the old count sanity bound (`count ≤ bytes remaining`) re
 columnar lists, because 64 ascending deltas pack into 8 bytes — an order of magnitude under the
 old one-byte-per-posting floor. It is now mode-aware.
 
+## Cross-machine, same day: one file, two architectures
+
+The format's portability claim, exercised on the new codec across the estate's two primary
+machines over Tailscale, the day it shipped (both repos at `ae88e61`):
+
+- Windows (`geldan-pc`, x86_64-pc-windows-gnu) built an index from the repo's own
+  `bench/fixture/blead-lead.tsv` (25,979 rows) and answered 7 queries, including the typo probe
+  `apalegn` (the p51 probe) → exactly 1 document.
+- macOS (`gelos-macbook-pro`, aarch64-apple-darwin, rustc 1.93) pulled, built, and passed all
+  134 index-text tests, answered the same 7 queries on the **Windows-built file** — **identical
+  answer sets**, query for query — then built the same fixture itself: **both files hash to
+  `16ea2441955932f63a9104e9`**.
+
+One binary per machine, one file everywhere, byte-for-byte — including every bit-packed block.
+
 ## What it costs and what it does not claim
 
 - The 5 ms typo bar still fails at 1 M (14.07 ms, recombined) and still passes to ~250 K on real
