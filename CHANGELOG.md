@@ -6,7 +6,16 @@ All notable changes to `index`. The project is pre-release and unversioned, so e
 [ROADMAP.md](ROADMAP.md) for the tiered plan and [docs/roadmap-rejected.md](docs/roadmap-rejected.md)
 for what was deliberately ruled out.
 
-## [Unreleased]
+### Measured — p92: SIMD block decode, built and reverted (2026-09-13)
+
+The last row of the honest-limits speed list, closed the way `p83` was: measured first
+(`from_bytes` on the 13.7 MB presyo index = 164-181 ms, `examples/loadtime.rs`), width-specialized
+unpack arms implemented and differentially tested against the reference across 14 widths x 6 block
+lengths — and **no measurable win**, because the bit-unpack arithmetic is not where load time
+goes (allocation and dictionary parse dominate). Reverted; the negative result and the measurement
+tool are what ship.
+[`bench/roadmap/p92-block-decode.md`](bench/roadmap/p92-block-decode.md).
+
 
 ### Measured — p90 + p91: reordering built (opt-in) and the secondary sections re-encoded, IDXTEXT12 (2026-09-13)
 

@@ -538,8 +538,8 @@ production corpora. **`index-core` remains dependency-free.**
   documents and not beyond; `p56` measured 8.29 M real rows at a 33 ms typo p99. The ceiling tracks
   vocabulary rather than document count. Postings compression shipped as `p88` and the secondary sections as `p91` (IDXTEXT12: block-directory
   offsets, columnar doc lengths, width-coded facets) — together −45.5 % of the presyo file this session,
-  latency at parity. DocID reordering is built and ships opt-in (`p90`, default off on measurement);
-  SIMD block decode remains unbuilt.
+  latency at parity. DocID reordering is built and ships opt-in (`p90`, default off on measurement); SIMD block decode was
+  built, measured and reverted (`p92`: the bit-loop was never the load cost — the negative result is recorded).
 - **Nothing is deployed.** All four integrations are measurements on throwaway worktree branches; no
   `main` was modified and no PR opened. [`docs/adoption.md`](docs/adoption.md) has the per-app plan,
   gate, cost and rollback so that becomes one decision rather than an investigation.
