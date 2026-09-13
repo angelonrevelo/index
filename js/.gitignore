@@ -1,0 +1,4 @@
+# Browser-tier test artifacts: rebuilt from dist/ and emit-artifact, never source.
+index_wasm.wasm
+profstopick.idx
+profstopick.label.json
