@@ -319,7 +319,12 @@ OVERALL: PASS
 This is the tier profstopick actually ships to, and the only place `instantiateStreaming` and its
 hard `application/wasm` MIME requirement are exercised. **Persistence shipped in `p68`** — the index
 is stored in OPFS and survives a page navigation, and since `p72` a query can be answered from byte
-ranges without reading the whole file. See `js/opfs.mjs` and `js/opfs-check.mjs`.
+ranges without reading the whole file — text search, facet clauses, facet tallies and numeric
+ranges, each byte-identical to a whole-file open. `RangeIndex` takes any byte reader: OPFS
+(`js/opfs.mjs`, checked by `js/opfs-check.mjs`) or HTTP `Range` requests (`js/range-http.mjs`, which
+coalesces nearby spans and caches every byte it has fetched; checked by `js/range-http-check.mjs`
+and `js/range-facet-check.mjs`). On a 15.5 MB, 400 K-document index, opening reads 26.5 % of the
+file; each query then fetches only its posting lists.
 
 *The transcript above predates `p69`, which took the index file from 386,043 to 220,470 bytes; the
 figures in it are an upper bound. It is not re-run here because Playwright is deliberately not a
@@ -553,6 +558,10 @@ production corpora. **`index-core` remains dependency-free.**
   Chromium is checked; Safari's `opfs-sahpool` behaviour is untested here, and Safari evicts
   script-written storage after 7 days regardless. Nothing writes to OPFS from the engine side — a
   browser can persist and query an index, but not update one in place.
+- **Range reads answer with document ordinals, not keys.** A range open never reads `doc_key` (38 %
+  of a keyed 400 K-document file), so mapping a hit back to its row is the host's job — a label
+  array, or the host's own key column. The HTTP reader is measured against a local server only;
+  real CDN round trips, and indexes larger than 15.5 MB, are unmeasured.
 - **The 260 K presyo run is padded** — only 1,940 rows are real exported data, and it does not
   populate their `search_text` column or their ~296 K aliases.
 - **sisia's hybrid path is still untouched** — the `ts_rank_cd` sparse arm fused with pgvector by
