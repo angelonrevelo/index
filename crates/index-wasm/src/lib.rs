@@ -2070,12 +2070,15 @@ impl RangeHandle {
     /// bytes; it is the one place the encoding change reaches into the range path.
     fn narrow(&self, fetched: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let mut posting = Vec::with_capacity(fetched.len() + self.term_count);
-        let mut out = Vec::with_capacity((self.term_count + 1) * 8);
-        let mut acc = 0u64;
+        // The offset array is built by the SAME encoder the file writer uses. This function used to
+        // lay out a fixed `u64` stride by hand, and `p91` moved the section to a block directory
+        // without touching it: the image then led with an entry count of 0, `from_bytes` computed
+        // `term_count = 0 - 1`, and the resulting `with_capacity(usize::MAX)` aborted the module on
+        // every range open. A private copy of an encoding is a second place for it to drift.
+        let mut list_byte = Vec::with_capacity(self.term_count);
         let mut next = 0usize;
         let mut at = 0usize;
         for i in 0..self.term_count {
-            out.extend_from_slice(&acc.to_le_bytes());
             match self.plan.get(next) {
                 Some((id, span)) if *id as usize == i => {
                     let n = span.len as usize;
@@ -2084,17 +2087,16 @@ impl RangeHandle {
                     let Some(bytes) = fetched.get(at..at + n) else { break };
                     posting.extend_from_slice(bytes);
                     at += n;
-                    acc += n as u64;
+                    list_byte.push(n as u64);
                     next += 1;
                 }
                 _ => {
                     posting.push(0);
-                    acc += 1;
+                    list_byte.push(1);
                 }
             }
         }
-        out.extend_from_slice(&acc.to_le_bytes());
-        (posting, out)
+        (posting, index_text::encode_posting_offset(&list_byte))
     }
 
     /// Assemble an image from the resident sections plus `posting`, and open it.

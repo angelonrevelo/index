@@ -6,6 +6,33 @@ All notable changes to `index`. The project is pre-release and unversioned, so e
 [ROADMAP.md](ROADMAP.md) for the tiered plan and [docs/roadmap-rejected.md](docs/roadmap-rejected.md)
 for what was deliberately ruled out.
 
+### Fixed — the range tier had been dead since IDXTEXT12; HTTP Range reader added (2026-09-13)
+
+- **Every range open aborted.** `p91` moved `posting_offset` to a block directory, but the range
+  tier's `narrow` still hand-wrote the old fixed `u64` stride. Its image led with an entry count
+  of 0, `from_bytes` wrapped `term_count` to `usize::MAX`, and `with_capacity` aborted the module.
+  In the browser that showed up as `unreachable` with no message. Natively,
+  `a_range_query_answers_from_a_fraction_of_the_file` and the other range tests aborted the test
+  binary instead of reporting failures.
+  - Fix: `encode_posting_offset` is now the only encoder for the section. The file writer and the
+    range tier both call it, so the two can't drift apart again.
+  - Proof that the format didn't change: `profstopick.idx` rebuilds to the identical hash
+    (`4a892c2c…`).
+- **`from_bytes` returns an error instead of aborting** on a zero or overflowing offset entry
+  count.
+- **`js/range-http.mjs`** is the HTTP Range reader `opfs.mjs` referred to but never shipped.
+  - Spans closer than `gap` bytes share one request.
+  - Every byte it fetches is kept in a cache owned by the host, capped at `maxByte`.
+  - A server that ignores `Range` and returns `200` still gives correct answers.
+- **`js/range-http-check.mjs`** runs 60 corpus-drawn queries (surnames, given+surname, typos,
+  typeahead) through a local server that honours `Range`. Every answer matches a whole-file open:
+  **60/60 for both readers, 0 refused.**
+  - One pass (open plus all queries): one request per span took **105 requests and 50,861 B
+    (42.6 % of the file)**. Coalescing with the cache took **72 requests and 60,668 B (50.8 %)**:
+    ~31 % fewer round trips for ~10 KB of filler.
+  - A repeat pass costs **0 requests**.
+  - This is measured on one 119 KB file. Large-file behaviour is still unmeasured.
+
 ### Measured — p92: SIMD block decode, built and reverted (2026-09-13)
 
 The last row of the honest-limits speed list, closed the way `p83` was: measured first

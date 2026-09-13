@@ -452,6 +452,43 @@ fn posting_span_from_bytes(b: &[u8], term_id: u32) -> Result<(u64, u64), String>
     Ok((entry(term_id as usize)?, entry(term_id as usize + 1)?))
 }
 
+/// The `12` posting-offset section, from each term's posting-list byte length in term-id order.
+///
+/// The one encoder for this section: the file writer calls it, and so does the range tier when it
+/// assembles an image around the lists it fetched. Offsets are relative to the start of the posting
+/// section; directory byte positions are relative to the start of THIS section, so the bytes are
+/// position-independent and the caller may place them anywhere.
+pub fn encode_posting_offset(list_byte: &[u64]) -> Vec<u8> {
+    let mut w = Writer::new();
+    let entries = list_byte.len() + 1;
+    let blocks = entries.div_ceil(OFFSET_CHECKPOINT);
+    w.u64(entries as u64);
+    let dir_at = w.here() as usize;
+    w.buf.extend_from_slice(&vec![0u8; blocks * 16]);
+    let deltas_at = w.here();
+    let set_dir = |buf: &mut Vec<u8>, block: usize, value: u64, byte: u64| {
+        let at = dir_at + block * 16;
+        buf[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        buf[at + 8..at + 16].copy_from_slice(&byte.to_le_bytes());
+    };
+    set_dir(&mut w.buf, 0, 0, deltas_at);
+    let mut acc = 0u64;
+    let mut block = 0usize;
+    for (i, byte) in list_byte.iter().enumerate() {
+        let j = i + 1;
+        acc += byte;
+        if j % OFFSET_CHECKPOINT == 0 {
+            block += 1;
+            let byte_at = w.here();
+            set_dir(&mut w.buf, block, acc, byte_at);
+        } else {
+            w.varint(*byte);
+        }
+    }
+    debug_assert_eq!(block + 1, blocks);
+    w.buf
+}
+
 /// Lists at least this long use the block-FOR columnar mode; shorter ones use sparse varint.
 /// The threshold is measured, not aesthetic: on the presyo catalogue lists past this size carry
 /// the strong majority of posting bytes, and below it the median list holds one posting, where
@@ -804,34 +841,9 @@ impl Index {
         // single entry decodable in at most `OFFSET_CHECKPOINT` varints, which a flat varint
         // array cannot — variable widths make byte positions of later blocks unknowable
         // without decoding everything before them.
-        let start = w.here() as usize;
-        let entries = list_byte.len() + 1;
-        let blocks = entries.div_ceil(OFFSET_CHECKPOINT);
-        w.u64(entries as u64);
-        let dir_at = w.here() as usize;
-        w.buf.extend_from_slice(&vec![0u8; blocks * 16]);
-        let deltas_at = w.here() as usize;
-        let mut acc = 0u64;
-        let mut block = 0usize;
-        let set_dir = |buf: &mut Vec<u8>, block: usize, value: u64, byte: u64| {
-            let at = dir_at + block * 16;
-            buf[at..at + 8].copy_from_slice(&value.to_le_bytes());
-            buf[at + 8..at + 16].copy_from_slice(&byte.to_le_bytes());
-        };
-        set_dir(&mut w.buf, 0, 0, (deltas_at - start) as u64);
-        for (i, byte) in list_byte.iter().enumerate() {
-            let j = i + 1;
-            acc += byte;
-            if j % OFFSET_CHECKPOINT == 0 {
-                block += 1;
-                let byte_at = (w.here() as usize - start) as u64;
-                set_dir(&mut w.buf, block, acc, byte_at);
-            } else {
-                w.varint(*byte);
-            }
-        }
-        debug_assert_eq!(block + 1, blocks);
-        let posting_offset = w.span_from(start as u64);
+        let start = w.here();
+        w.buf.extend_from_slice(&encode_posting_offset(&list_byte));
+        let posting_offset = w.span_from(start);
 
         let start = w.here();
         w.buf.extend_from_slice(&post.buf);
@@ -1128,9 +1140,17 @@ impl Index {
             return Err("posting offset array is malformed".into());
         }
         let entries = u64::from_le_bytes(off[0..8].try_into().unwrap()) as usize;
+        // Both checks turn what used to be an ABORT into an Err. An entry count of 0 made
+        // `term_count` wrap to usize::MAX (release builds do not trap on underflow) and the
+        // `with_capacity` below died with "capacity overflow" -- inside wasm, `unreachable`, with
+        // no message for the host. A huge count could also overflow `blocks * 16` back into range.
+        if entries == 0 {
+            return Err("posting offset section claims no entries".into());
+        }
         let blocks = entries.div_ceil(OFFSET_CHECKPOINT);
-        if off.len() < 8 + blocks * 16 {
-            return Err("posting offset directory is truncated".into());
+        match blocks.checked_mul(16).and_then(|d| d.checked_add(8)) {
+            Some(need) if off.len() >= need => {}
+            _ => return Err("posting offset directory is truncated".into()),
         }
         let term_count = entries - 1;
         let post_bytes = &buf[table.posting.range()];
