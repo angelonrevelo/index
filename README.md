@@ -536,9 +536,10 @@ production corpora. **`index-core` remains dependency-free.**
   JavaScript and Python; no napi-rs binding does.
 - **1 M documents still misses the interactive p99 bar.** The bar holds to roughly 250 K real
   documents and not beyond; `p56` measured 8.29 M real rows at a 33 ms typo p99. The ceiling tracks
-  vocabulary rather than document count. Postings compression shipped as `p88` (IDXTEXT11, mode-coded
-  lists: −37.5 % of the presyo index, −59 % at 1 M, latency at parity); docID reordering and SIMD block
-  decode remain unbuilt.
+  vocabulary rather than document count. Postings compression shipped as `p88` and the secondary sections as `p91` (IDXTEXT12: block-directory
+  offsets, columnar doc lengths, width-coded facets) — together −45.5 % of the presyo file this session,
+  latency at parity. DocID reordering is built and ships opt-in (`p90`, default off on measurement);
+  SIMD block decode remains unbuilt.
 - **Nothing is deployed.** All four integrations are measurements on throwaway worktree branches; no
   `main` was modified and no PR opened. [`docs/adoption.md`](docs/adoption.md) has the per-app plan,
   gate, cost and rollback so that becomes one decision rather than an investigation.
