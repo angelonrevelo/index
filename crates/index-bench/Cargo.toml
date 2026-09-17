@@ -172,3 +172,7 @@ path = "src/yclap_species.rs"
 [[bin]]
 name = "real-million"
 path = "src/real_million.rs"
+
+[[bin]]
+name = "tin-shape"
+path = "src/tin_shape.rs"
