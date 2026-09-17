@@ -260,19 +260,56 @@ Nothing here is hidden elsewhere in this file.
   work. That is a different bet from spending a process's cores on one interactive query.
 - **10 M is unmeasured** because 10 M of real text does not exist in this estate, and recombining to
   reach it would report a number ~2x worse than reality.
+- **~12x behind TIN on its one comparable row** (extrapolated, not measured): disjunction COUNT
+  projects to ~870 QPS / ~26 ms p99 on 8.0 GB of Wikipedia against TIN's 10,260 QPS / 2 ms. The full
+  corpus needs ~28 GB of peak memory to build and this Mac has 24 GB, so the row isn't run at size.
 - **Learned-expansion queries still score per segment** — the expansion table stores term ids, not
   text, so those fall back to local document frequency.
+
+---
+
+## 7. Against a published engine: TIN's workload
+
+PlanetScale's TIN (2026-09-16) publishes QPS and p99 for conjunction, disjunction and phrase
+queries, run as both top-10 and `COUNT(*)`. `tin-shape`
+reproduces its recipe: 2–15-token substrings of the corpus, each run all three ways (1,719
+queries), a warm-up pass, then concurrent clients for 30 s. **Different machine from the rest of
+this file**: Apple M5 (4P + 6E), 8 client threads, Wikipedia `20231101.en`.
+
+| workload | TIN | 0.71 GB, 156,289 docs | 1.84 GB, 468,867 docs |
+|---|---|---|---|
+| mixed; top-10 | 199 QPS, 256 ms (Stack Exchange 85 GB) | 939 QPS, 42.2 ms | 499 QPS, 81.4 ms |
+| conjunction+phrase; top-10 | 242 QPS, 212 ms (Stack Exchange 85 GB) | 847 QPS, 36.3 ms | 363 QPS, 86.4 ms |
+| disjunction; top-10 | 148 QPS, 324 ms (Stack Exchange 85 GB) | 3,800 QPS, 10.4 ms | 1,756 QPS, 24.5 ms |
+| conjunction+disjunction; COUNT | — | 13,815 QPS, 3.9 ms | 5,667 QPS, 8.4 ms |
+| **disjunction; COUNT** | **10,260 QPS, 2 ms (Wikipedia 8.0 GB)** | 9,925 QPS, 2.4 ms | 3,774 QPS, 6.0 ms |
+| build · index · peak RSS | 8m10s · 50.7 GB (Stack Exchange) | 20.1 s · 361.8 MB · 4.22 GB | 65.5 s · 949.7 MB · 6.54 GB |
+
+**Read it this way:**
+
+- **Only the Wikipedia COUNT row can be compared, and only by extrapolation.** Count cost is linear
+  in postings: 2.6x the corpus costs 2.6x the QPS and 2.55x the p99. At 8.0 GB that projects to about
+  870 QPS at a ~26 ms p99, **~12x behind TIN**. That figure is unmeasured. TIN ANDs and ORs page
+  bitmaps and reads exact per-term counts; this engine walks every posting.
+- **The top-10 rows say where the cost is, not who is faster.** TIN's run over 46–120x more text,
+  with an index 1.6x larger than RAM, through Postgres. These runs are resident and in process.
+- **Phrase is the tail**: its p99 is 4x the conjunction p99 at both sizes.
+- **Ranking differs.** Disjunction top-10 ranks all-terms matches first, then BM25F; TIN ranks by
+  BM25 alone. Typo expansion is capped at 1.
+
+Full account: [`p93`](../bench/roadmap/p93-tin-shape.md).
 
 ---
 
 ## Reproducing
 
 ```sh
-cargo test --workspace                                        # 268 tests
+cargo test --workspace                                        # 348 tests
 cargo run -p index-bench --release --bin real-corpus          # recall, two production corpora
 cargo run -p index-bench --release --bin pool-audit           # pruning == brute force
 cargo run -p index-bench --release --bin cdc-equivalence      # the staleness contract
 cargo run -p index-bench --release --bin segment-scale        # segmentation cost
+INDEX_TIN_TSV=wiki.tsv cargo run -p index-bench --release --bin tin-shape  # TIN's workload (scripts/tin-corpus.py)
 cargo run -p index-bench --release --bin real-million         # the scaling grid (needs the export)
 bash scripts/cli-smoke.sh                                     # the CLI, end to end
 node js/opfs-check.mjs                                        # the browser tier (needs playwright)

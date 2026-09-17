@@ -3964,6 +3964,92 @@ impl Index {
         (self.search(query, k), term.len(), total)
     }
 
+    /// **`COUNT(*)` of documents containing ANY query token**, exactly as written: no typo
+    /// expansion, no prefix, no ranking. Deleted documents are not counted.
+    ///
+    /// A count is a set question, so it skips everything [`Index::search`] exists for — scoring,
+    /// pools, the typo bucket — and reads posting lists only. Tokens absent from the dictionary
+    /// contribute nothing. Measured against TIN's published count row in `p93`.
+    pub fn count_any(&self, query: &str) -> usize {
+        let list = self.count_list(query);
+        let total: usize = list.iter().map(|l| l.len()).sum();
+        match list.len() {
+            0 => 0,
+            1 => list[0].iter().filter(|p| !self.is_deleted(p.doc)).count(),
+            // Dense unions go through a bitmap sized to the corpus; sparse ones are merged, so a
+            // query of two rare words never allocates `doc_count / 8` bytes.
+            _ if total > self.doc_count / 16 => {
+                let mut bit = vec![0u64; self.doc_count.div_ceil(64)];
+                for l in &list {
+                    for p in l.iter() {
+                        bit[p.doc as usize / 64] |= 1u64 << (p.doc % 64);
+                    }
+                }
+                for (w, d) in bit.iter_mut().zip(self.deleted.iter()) {
+                    *w &= !d;
+                }
+                bit.iter().map(|w| w.count_ones() as usize).sum()
+            }
+            _ => {
+                let mut doc: Vec<u32> = list.iter().flat_map(|l| l.iter().map(|p| p.doc)).collect();
+                doc.sort_unstable();
+                doc.dedup();
+                doc.iter().filter(|&&d| !self.is_deleted(d)).count()
+            }
+        }
+    }
+
+    /// **`COUNT(*)` of documents containing EVERY query token**, exactly as written. A token absent
+    /// from the dictionary makes the answer 0, which is what a conjunction means.
+    pub fn count_all(&self, query: &str) -> usize {
+        let tok = self.count_token(query);
+        if tok.is_empty() {
+            return 0;
+        }
+        let Some(mut id) = tok.into_iter().collect::<Option<Vec<u32>>>() else {
+            return 0;
+        };
+        id.sort_unstable();
+        id.dedup();
+        let mut list: Vec<&[Posting]> = id.iter().map(|&t| self.posting[t as usize].as_slice()).collect();
+        // Shortest first: every candidate comes from the rarest list, and each longer list is
+        // probed by a forward-only binary search, so the cost follows the rarest term.
+        list.sort_unstable_by_key(|l| l.len());
+        let (head, rest) = list.split_first().expect("non-empty");
+        let mut from = vec![0usize; rest.len()];
+        let mut n = 0;
+        'doc: for p in head.iter() {
+            for (l, at) in rest.iter().zip(from.iter_mut()) {
+                *at += l[*at..].partition_point(|q| q.doc < p.doc);
+                if *at >= l.len() {
+                    break 'doc;
+                }
+                if l[*at].doc != p.doc {
+                    continue 'doc;
+                }
+            }
+            if !self.is_deleted(p.doc) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// The query's tokens through the index's own analysis, resolved to exact term ids.
+    fn count_token(&self, query: &str) -> Vec<Option<u32>> {
+        let mut tok = crate::analyze::tokenize(query);
+        crate::analyze::apply_alias(&mut tok, &self.alias);
+        tok.iter().map(|t| self.dict.exact(&t.text)).collect()
+    }
+
+    /// Distinct posting lists of the query tokens present in the dictionary.
+    fn count_list(&self, query: &str) -> Vec<&[Posting]> {
+        let mut id: Vec<u32> = self.count_token(query).into_iter().flatten().collect();
+        id.sort_unstable();
+        id.dedup();
+        id.iter().map(|&t| self.posting[t as usize].as_slice()).collect()
+    }
+
     /// Exhaustive OR scoring — **the same algorithm with the pruning removed.**
     ///
     /// This is the oracle for [`Index::search`], and it mirrors its candidate-pool semantics
@@ -4803,5 +4889,42 @@ mod tests {
         let mut b = IndexBuilder::new(schema);
         assert!(!b.set_facet_field(MAX_COLUMN), "a column past the end is refused, not stored");
         assert!(b.set_facet_field(MAX_COLUMN - 1));
+    }
+
+    /// `count_any` / `count_all` against a brute-force set over the raw words, with deletions,
+    /// across both the merged and the bitmap union paths.
+    #[test]
+    fn counts_agree_with_brute_force_sets_including_deleted_documents() {
+        let word = ["red", "blue", "green", "milk", "bread", "soap", "tea", "rice"];
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut row: Vec<Vec<&str>> = Vec::new();
+        let mut b = IndexBuilder::new(Schema::new(vec![Field::new("name", 1.0, 0.4)]));
+        for _ in 0..600 {
+            let n = 1 + (next() % 4) as usize;
+            let r: Vec<&str> = (0..n).map(|_| word[(next() % word.len() as u64) as usize]).collect();
+            b.add(&Doc::new([r.join(" ")]));
+            row.push(r);
+        }
+        let mut ix = b.build().unwrap();
+        for d in (0..600u32).step_by(7) {
+            ix.delete(d);
+        }
+        let query = ["rice", "milk tea", "red blue green", "tea nosuchword", "nosuchword", "soap soap"];
+        for q in query {
+            let tok: Vec<&str> = q.split(' ').collect();
+            let live = |i: &usize| *i % 7 != 0;
+            let any = (0..600).filter(live).filter(|&i| tok.iter().any(|t| row[i].contains(t))).count();
+            let all = (0..600).filter(live).filter(|&i| tok.iter().all(|t| row[i].contains(t))).count();
+            assert_eq!(ix.count_any(q), any, "any {q}");
+            assert_eq!(ix.count_all(q), all, "all {q}");
+        }
+        assert_eq!(ix.count_any(""), 0);
+        assert_eq!(ix.count_all(""), 0);
     }
 }
