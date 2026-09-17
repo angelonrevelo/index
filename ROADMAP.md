@@ -848,6 +848,16 @@ The CLI also grew `--sql` (`p88a`): the dump a database already wrote — `pg_du
 Supabase `seed.sql`, `sqlite3 .dump` — as a fourth input format beside the pipe, with `--table`
 filtering, gated by 18 parser tests and a `cli-smoke.sh` section.
 
+**`p93` measured the engine against a published competitor for the first time**: PlanetScale's TIN,
+on its own recipe of 2–15-token substrings run as conjunction, disjunction and phrase, with 8
+concurrent clients. It added exact `count_any` / `count_all`. The one comparable row, disjunction
+`COUNT(*)` on Wikipedia, matches TIN's 10,260 QPS at 1/11 of the corpus. It scales linearly in
+postings, which projects to **~12x behind at TIN's 8.0 GB** (extrapolated; the full build needs ~28
+GB of peak memory against this Mac's 24 GB). Phrase is the top-10 tail at 4x the conjunction p99.
+The lever the numbers name is TIN's own: page-level bitmaps and stored per-term counts, so a count
+doesn't walk postings. It isn't a roadmap row yet, because no consumer here counts at that scale.
+Full account: [`bench/roadmap/p93-tin-shape.md`](bench/roadmap/p93-tin-shape.md).
+
 **Next, in order** (re-derived 2026-09-08 after the revalidation sweep — two of the items this
 list carried were already closed by later work and are marked as such rather than re-listed as
 open):

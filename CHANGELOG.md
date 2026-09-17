@@ -6,6 +6,44 @@ All notable changes to `index`. The project is pre-release and unversioned, so e
 [ROADMAP.md](ROADMAP.md) for the tiered plan and [docs/roadmap-rejected.md](docs/roadmap-rejected.md)
 for what was deliberately ruled out.
 
+## p93 — TIN's published workload, at the size this machine holds (2026-09-17)
+
+PlanetScale published TIN on 2026-09-16 with QPS / p99 tables for conjunction, disjunction and
+phrase queries, top-10 and `COUNT(*)`. Their trace isn't published, only the recipe. This entry
+reproduces the recipe at a size a 24 GB Mac can build.
+
+### Added
+
+- **`Index::count_any` / `Index::count_all`** give an exact `COUNT(*)` of documents holding any or
+  every query token. They skip typo expansion and ranking, and they honour deletions. A union is
+  merged when sparse and goes through a corpus bitmap when dense. An intersection walks the rarest
+  list and forward-binary-searches the others. They are pinned against a brute-force set over 600
+  random documents with deletions. They are Rust-only: there is no C ABI or WASM export yet.
+- **`tin-shape`** (`crates/index-bench/src/tin_shape.rs`) implements TIN's recipe:
+  reservoir-sampled substrings of 2–15 tokens, 573 × 3 = 1,719 queries, one warm-up pass, then N
+  client threads looping for 30 s per workload. It reports QPS, p50, p99, per-kind p99 and the
+  zero-result rate.
+- **`scripts/tin-corpus.py`** converts Wikipedia parquet shards to `title<TAB>text`.
+
+### Measured — Apple M5, 8 threads, Wikipedia `20231101.en`
+
+| workload | TIN (8.0 GB Wikipedia / 85 GB Stack Exchange) | 0.71 GB, 156,289 docs | 1.84 GB, 468,867 docs |
+|---|---|---|---|
+| mixed; top-10 | 199 QPS, 256 ms | 939 QPS, 42.2 ms | 499 QPS, 81.4 ms |
+| disjunction; top-10 | 148 QPS, 324 ms | 3,800 QPS, 10.4 ms | 1,756 QPS, 24.5 ms |
+| **disjunction; COUNT** | **10,260 QPS, 2 ms** | 9,925 QPS, 2.4 ms | 3,774 QPS, 6.0 ms |
+
+- **Counts scale linearly with postings.** Going from 0.71 to 1.84 GB (2.6x) cost 2.6x in QPS and
+  2.55x in p99. Extrapolated to TIN's 8.0 GB (not measured), that is about 870 QPS at a ~26 ms p99,
+  **~12x behind**.
+- **Phrase is the tail.** Its p99 is 4x the conjunction p99 at both sizes.
+- **Peak RSS is 4.22 GB and 6.54 GB**, so the full 8.0 GB corpus (~28 GB, extrapolated) doesn't
+  build on this machine.
+- The top-10 rows aren't comparable to TIN's: they cover 46–120x less text, the index is resident,
+  and nothing runs through Postgres.
+- Not done: Stack Exchange, RAM-capped runs, a ParadeDB run under matching limits, concurrent
+  updates, phrase COUNT. Full account: [`bench/roadmap/p93-tin-shape.md`](bench/roadmap/p93-tin-shape.md).
+
 ### Added — faceted and numeric-range queries through the range tier; doc_key leaves the resident set (2026-09-13)
 
 The range tier answered one question, ranked text search. A filter bar asks four more, and a host that
