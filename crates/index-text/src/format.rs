@@ -22,6 +22,34 @@
 use crate::analyze::AliasTable;
 use crate::index::{Field, Index, Schema};
 
+/// CRC-32 of a complete index image, excluding the four-byte footer itself.
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+fn strip_crc(buf: &[u8]) -> Result<&[u8], String> {
+    if buf.len() < 4 {
+        return Err("truncated: missing checksum".into());
+    }
+    let (body, tail) = buf.split_at(buf.len() - 4);
+    let got = u32::from_le_bytes(tail.try_into().unwrap());
+    if crc32(body) != got {
+        return Err("checksum mismatch: index file is corrupt".into());
+    }
+    Ok(body)
+}
+
 /// `"IDXTEXT11"` — magic plus format version.
 ///
 /// The trailing number has moved 1 -> 12 as sections were added: priors (`2`), facets (`3`),
@@ -1059,6 +1087,8 @@ impl Index {
             t.extend_from_slice(&sp.len.to_le_bytes());
         }
         w.buf[table_at..table_at + TABLE_BYTE].copy_from_slice(&t);
+        let crc = crc32(&w.buf);
+        w.buf.extend_from_slice(&crc.to_le_bytes());
         w.buf
     }
 
@@ -1066,7 +1096,14 @@ impl Index {
     ///
     /// Every length is validated against the buffer, so a truncated or corrupt file returns an
     /// error rather than panicking — this parses untrusted input the moment it is served over HTTP.
+    /// A trailing CRC32 must match; a truncated or byte-flipped file is refused, not loaded as
+    /// plausible garbage.
     pub fn from_bytes(buf: &[u8]) -> Result<Index, String> {
+        let buf = if buf.len() >= MAGIC.len() && buf.starts_with(&MAGIC) {
+            strip_crc(buf)?
+        } else {
+            buf
+        };
         let table = read_section_table(buf)?;
         let end = |s: &Span| (s.offset + s.len) as usize;
         for s in [
@@ -1600,18 +1637,23 @@ mod tests {
         let good = built().to_bytes();
         assert!(Index::from_bytes(&[]).is_err());
         assert!(Index::from_bytes(b"NOTANIDX").is_err());
-        // Truncation at every 1/8th of the file must be handled, not panic.
+        // Truncation at every 1/8th of the file must ERROR, not load garbage or panic.
         for frac in 1..8 {
-            let cut = good.len() * frac / 8;
-            let _ = Index::from_bytes(&good[..cut]);
+            let cut = (good.len() * frac / 8).max(1);
+            assert!(
+                Index::from_bytes(&good[..cut]).is_err(),
+                "truncated at {cut}/{} must be refused",
+                good.len()
+            );
         }
-        // A valid header with a garbage body.
         let mut bad = good.clone();
         let n = bad.len();
-        for b in bad[n / 2..].iter_mut() {
-            *b = 0xFF;
-        }
-        let _ = Index::from_bytes(&bad);
+        bad[n / 2] ^= 0xFF;
+        let err = Index::from_bytes(&bad).expect_err("byte-flipped file must be refused");
+        assert!(
+            err.contains("checksum") || err.contains("corrupt") || err.contains("truncated"),
+            "got {err}"
+        );
     }
 
     /// The columnar mode's own failure modes, each of which would otherwise be a confident wrong
@@ -1699,7 +1741,11 @@ mod tests {
             assert_eq!(s.offset, at, "sections must tile contiguously");
             at += s.len;
         }
-        assert_eq!(at as usize, bytes.len(), "the last section must end at EOF");
+        assert_eq!(
+            at as usize,
+            bytes.len() - 4,
+            "the last section must end at the checksum footer"
+        );
     }
 
     #[test]

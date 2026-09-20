@@ -151,7 +151,7 @@ the critical path; it delivers profstopick's win with **no infrastructure at all
 |---|---|---|---|---|
 | Reframe README/CHANGELOG to the demand-led thesis | The repo currently advertises a thesis its own evidence contradicts; every downstream decision inherits the error | S | T3 → README's "Honest limits" section names the Finding 0 reframe explicitly | **DONE** (this file + `docs/research/`) |
 | Close the `pgm-extra` build-vs-buy Triage row | An open decision blocking P0 closure for three months | S | T2 → crates.io maturity audit | **DONE — answer is neither.** `pgm-extra` has **134 downloads in 90 days**, `pgm_index` 80. Nothing to inherit, and per Finding 0 more PGM is not what any consumer needs. See [`build-or-buy.md`](docs/research/build-or-buy.md) |
-| CI gate | Tests and benches run only locally; the "green gate" is a claim about one machine | S | T1 → `.github/workflows` running `cargo test -p index-core` + clippy, with `bench/roadmap/` exclusion intact | **not started** (open item since 2026-06-19) |
+| CI gate | Tests and benches run only locally; the "green gate" is a claim about one machine | S | T1 → `.github/workflows` running `cargo test -p index-core` + clippy, with `bench/roadmap/` exclusion intact | **file written, first GitHub run pending** |
 
 ### P4 — Normalization and tokenization (the actual product) — **SHIPPED**
 
@@ -855,8 +855,10 @@ concurrent clients. It added exact `count_any` / `count_all`. The one comparable
 postings, which projects to **~12x behind at TIN's 8.0 GB** (extrapolated; the full build needs ~28
 GB of peak memory against this Mac's 24 GB). Phrase is the top-10 tail at 4x the conjunction p99.
 The lever the numbers name is TIN's own: page-level bitmaps and stored per-term counts, so a count
-doesn't walk postings. It isn't a roadmap row yet, because no consumer here counts at that scale.
-Full account: [`bench/roadmap/p93-tin-shape.md`](bench/roadmap/p93-tin-shape.md).
+doesn't walk postings. **Parked in p93** (no in-house consumer counted at that scale). **Reopened
+2026-09-20** as the still-open TIN-parity plan below: this OBJECTIVE names TIN's Wikipedia COUNT as
+the bar. Full account: [`bench/roadmap/p93-tin-shape.md`](bench/roadmap/p93-tin-shape.md);
+acceptance: [`bench/roadmap/p97-tin-parity.md`](bench/roadmap/p97-tin-parity.md).
 
 **Next, in order** (re-derived 2026-09-08 after the revalidation sweep — two of the items this
 list carried were already closed by later work and are marked as such rather than re-listed as
@@ -1051,7 +1053,7 @@ misses, 188 (14.6 %) name a category sharing a word with the true one — `Spiri
 not claimed**: whether `Spirits` may stand in for `Liquor` is presyo's call about its own taxonomy,
 not this project's.
 
-## The next row, and why it is the next one
+## Historical next row (superseded — prune-consistency)
 
 **Make pruning consistent with ranking.**
 
@@ -1374,3 +1376,81 @@ caught only by comparing against the independent Rust implementation.
   citable, and is why P11's rerank row is flagged rather than assumed.
 - Minor test gaps carried over: no `FmIndex::locate` test for an absent pattern; no `PgmIndex` ≡
   `PlaIndex` result-equivalence test.
+
+---
+
+## 2026-09-20 — whole-project sweep (COUNT on the public surface)
+
+Discovered 14 (signals 8 · github 3 · web 3) → 3 genuine · 8 rejected (already in
+[`docs/roadmap-rejected.md`](docs/roadmap-rejected.md) or this file's p93 note) · 3 triage.
+
+The in-flight leftover this sweep exists to close: **`Index::count_any` / `count_all` are exact and
+tested, and no host can call them.** CHANGELOG p93 says so in as many words. TIN, Tantivy, Lucene,
+Meilisearch, Elasticsearch and Typesense all expose a count that is not "rank k and take `len`".
+This engine already has the integer; it is missing the surface.
+
+| Item | What it closes | Surface | Effort | Benchmark | Status |
+|---|---|---|---|---|---|
+| Exact COUNT(*) from every host that already searches | A JS / C / CLI caller cannot ask how many documents match without ranking `k` hits and reading `len`, which is wrong the moment `k` < matches. `count_any` / `count_all` already exist in `crates/index-text/src/index.rs` and honour deletions. | `idx_count_any` / `idx_count_all` (`include/index.h`); `SearchIndex.countAny` / `countAll` (`js/index.mjs`); `Searcher::count_any` / `count_all`; `index search --count any\|all QUERY` | S | T3 → `js/smoke.mjs` and `scripts/cli-smoke.sh` assert a fixture integer; a two-segment Rust test agrees with a rebuilt `Index`. Live tests, not quarantined. | **SHIPPED 2026-09-20** |
+| Phrase COUNT(*) | p93 named phrase as the top-10 tail and left phrase COUNT unbuilt. A quoted query still cannot answer `COUNT(*)`. | `Index::count_phrase`; `idx_count_phrase`; `SearchIndex.countPhrase`; `index search --count phrase QUERY`; `idx_searcher_count_any` / `_all` / `_phrase` | M | T3 → live `#[cfg(test)]` + `js/smoke.mjs` + `cli-smoke.sh`. Gapped reverse is 1 vs 0; without positions is 0 not `count_all`. | **SHIPPED 2026-09-20** |
+| P3 CI row vs the files on disk | The P3 table still said CI gate **not started** while workflow files exist. Two `## The next row` headings. | P3 status cell + one live next-row heading | S | T3 → P3 cell reads **file written, first GitHub run pending**; one `## The next row, and why it is the next one`. Check-run still unobserved (`gh run list` = 0). | **docs closed; check-run blocked** |
+
+**New problems surfaced during validation (not from discovery):** `Searcher` has no `count_any` /
+`count_all`, so the CLI — which opens a collection, not a single `Index` — would undercount a
+multi-segment corpus if it only called the first segment. That is why the COUNT row names
+`Searcher` as part of the surface, not as a follow-up.
+
+Rejected this run (already killed, not re-opened): sidecar, AGPL, learned-sparse in v1, mmap-first
+format, wasm-bindgen, Block-Max WAND, VByte postings, consumer-app PRs.
+
+**TIN-style stored per-term counts / page-level bitmaps** were parked here ("Not a row until one
+exists" / "no consumer here counts at that scale"). **Superseded 2026-09-20** by the TIN-parity
+plan below: this OBJECTIVE is the named consumer (pipe/library hosts that already COUNT, plus TIN
+as the competitor bar). Sidecar, AGPL, and consumer-app PRs stay rejected.
+
+Triage (need a decision or an external event):
+
+- **`idx_searcher_count_*` on the C ABI** — parked at sweep time (the CLI could call `Searcher`
+  in-process; a WASM host counting across live segments would need the symbols). **SHIPPED
+  2026-09-20**: `idx_searcher_count_any`, `idx_searcher_count_all`, `idx_searcher_count_phrase`
+  are exported from `include/index.h` and `crates/index-wasm/src/lib.rs`.
+- **First GitHub Actions check-run** — the workflow files exist; "green gate" is still one Windows
+  box until a push actually runs them. Restated as an enterprise-grade row below; still unobserved.
+
+Tier split: 2 Tier 3 · 0 Tier 2 · 1 Tier 1-shaped live test (the COUNT integer is a silent
+corruption if it is wrong, so it ships behind `js/smoke.mjs` / `cli-smoke.sh` / a Searcher unit
+test rather than a written-only line). Rows with a named surface: 2/3. Research/governance: 1
+(the P3 status cell).
+
+---
+
+## 2026-09-20 — still open: TIN parity (efficiency, speed) and enterprise-grade (reliability)
+
+This is a **plan**, not a claim the bars are met. Deploy an integration remains the next *product*
+row nobody in this repo can do. These rows are the next *engine* work if that consumer is TIN's
+published COUNT bar and in-process reliability rather than a Postgres extension.
+
+TIN's published Wikipedia disjunction `COUNT(*)` bar, verbatim: **10,260 QPS / 2 ms p99 / 1.7 MB/query
+on 8.0 GB**. This repo's current measured gap, verbatim: cost is linear in postings, **~12x behind**
+at 8.0 GB (**~870 QPS / ~26 ms**, extrapolated from 1.84 GB). The 8.0 GB corpus needs ~28 GB peak
+RSS; this Mac has 24 GB. The falsifiable proxy is the largest holdable Wikipedia slice plus that
+already-measured linear extrapolation — the named bar stays 10,260 / 2 ms / 1.7 MB/query.
+
+Reliability here is **in-process**: readers stay exact while `index apply` / Searcher mutation
+runs, and a corrupt `.idx` fails loud. It is **not** Postgres MVCC, WAL, VACUUM, replicas, or
+`CREATE EXTENSION`. Enterprise-grade here is an observed CI check-run plus that integrity check —
+not SLA / SSO / SOC2.
+
+Consumer named for the COUNT lever: the pipe/library hosts that already COUNT (CLI, C ABI, WASM,
+Python) plus TIN itself as the competitor this OBJECTIVE set.
+
+| Item | What it closes | Effort | Benchmark | Status |
+|---|---|---|---|---|
+| **Efficiency** — stored per-term counts + page-level work elision | Live COUNT of an undeleted term (and disjoint-page disjunction) returns stored df; `count_any_cost` visits 0 postings as list length grows. Overlapping pages and deletions still walk. TIN's 8.0 GB QPS is a separate speed row. | L | T3 → `count_any_of_a_live_term_does_not_walk_postings` (0 visits at 64 and 4096). | **SHIPPED 2026-09-20** (in-process stored df / page bits; not the 10,260 QPS bar) |
+| **Speed** — close the Wikipedia COUNT gap | TIN **10,260 QPS / 2 ms p99 / 1.7 MB/query on 8.0 GB**. This engine at 1.84 GB: 3,774 QPS / 6.0 ms, linear in postings → **~12x behind** (~870 QPS / ~26 ms at 8.0 GB, extrapolated). Stored df does not by itself rewrite that projection. | L | T3 → holdable `tin-shape` COUNT plus linear extrapolation. Marking DONE while still ~12x behind is forbidden. `INDEX_TIN_TSV` absent this session. | **not started** |
+| **Reliability** — exact answers under concurrent apply | Readers during Searcher push/delete; after the writer finishes, COUNT and live_count match a rebuilt snapshot. | M | T3 → `concurrent_mutation_and_count_match_a_rebuild`. | **SHIPPED 2026-09-20** |
+| **Enterprise grade** — integrity check + observed CI | Truncated / byte-flipped `.idx` refused by `Index::from_bytes` (CRC32 footer) and by `index search` / `index stat`. `master` was pushed to GitHub (`d48134c..5bb89e3`). Workflow dispatch returns **HTTP 422: Actions has been disabled for this user**; `gh run list` remains empty. | S | T3 → integrity tests green; CI half needs GitHub account Actions enabled. | **integrity SHIPPED; CI blocked (Actions disabled for user)** |
+
+Sidecar, AGPL, `CREATE EXTENSION`, hosted SLA, and consumer-app PRs stay rejected. Phrase COUNT
+order-sensitivity already shipped (p95); this plan does not reopen that integer.
+

@@ -158,8 +158,10 @@ impl Searcher {
         if segment.has_key() && self.segment.iter().any(Index::has_key) {
             // Collected first: resolution borrows `self` immutably and the tombstoning needs it
             // mutably. Keys are borrowed from the incoming segment, which is not yet moved in.
-            let retire: Vec<u32> =
-                segment.key_iter().filter_map(|(k, _)| self.doc_of_key(k)).collect();
+            let retire: Vec<u32> = segment
+                .key_iter()
+                .filter_map(|(k, _)| self.doc_of_key(k))
+                .collect();
             for global in retire {
                 if self.delete(global) {
                     shadowed += 1;
@@ -227,7 +229,10 @@ impl Searcher {
         &self,
         query: &str,
         prefix_last: bool,
-    ) -> Option<(crate::index::CollectionStat, Vec<crate::index::QueryExpansion>)> {
+    ) -> Option<(
+        crate::index::CollectionStat,
+        Vec<crate::index::QueryExpansion>,
+    )> {
         if !self.collection_stat || self.segment.len() < 2 {
             return None;
         }
@@ -243,7 +248,13 @@ impl Searcher {
                 *df.entry(text).or_insert(0) += d;
             }
         }
-        Some((crate::index::CollectionStat { doc_count: self.doc_count, df }, per))
+        Some((
+            crate::index::CollectionStat {
+                doc_count: self.doc_count,
+                df,
+            },
+            per,
+        ))
     }
 
     /// Point every segment at the collection's document count, so IDF means the same thing in all
@@ -348,7 +359,12 @@ impl Searcher {
         if self.doc_count == 0 {
             return 0.0;
         }
-        let largest = self.segment.iter().map(|s| s.doc_count()).max().unwrap_or(0);
+        let largest = self
+            .segment
+            .iter()
+            .map(|s| s.doc_count())
+            .max()
+            .unwrap_or(0);
         (self.doc_count - largest) as f32 / self.doc_count as f32
     }
 
@@ -418,6 +434,28 @@ impl Searcher {
         self.doc_count - self.deleted_count()
     }
 
+    /// Exact `COUNT(*)` of live documents containing ANY query token, summed across segments.
+    ///
+    /// A document lives in one segment, so the sum is the collection count. Same contract as
+    /// [`Index::count_any`]: no typo expansion, no ranking, deletions not counted.
+    pub fn count_any(&self, query: &str) -> usize {
+        self.segment.iter().map(|ix| ix.count_any(query)).sum()
+    }
+
+    /// Exact `COUNT(*)` of live documents containing EVERY query token, summed across segments.
+    pub fn count_all(&self, query: &str) -> usize {
+        self.segment.iter().map(|ix| ix.count_all(query)).sum()
+    }
+
+    /// Exact `COUNT(*)` of live documents containing the query as a phrase, summed across segments.
+    ///
+    /// A document lives in one segment, so the sum is the collection count. Same contract as
+    /// [`Index::count_phrase`]: no ranking, no bag-of-words fallback, a segment without positions
+    /// contributes 0.
+    pub fn count_phrase(&self, query: &str) -> usize {
+        self.segment.iter().map(|ix| ix.count_phrase(query)).sum()
+    }
+
     /// Translate a global ordinal back to `(segment, local ordinal)`.
     pub fn locate(&self, global: u32) -> Option<(usize, u32)> {
         if global as usize >= self.doc_count {
@@ -439,9 +477,7 @@ impl Searcher {
         // The expansions the stat pass produced are handed back to the segment that built them, so
         // the weigh phase re-derives nothing (`p52`'s recovered second expansion).
         match self.stat_for(query, false) {
-            Some((stat, ex)) => {
-                self.merge(k, |i, ix| ix.search_expanded(query, &ex[i], k, &stat))
-            }
+            Some((stat, ex)) => self.merge(k, |i, ix| ix.search_expanded(query, &ex[i], k, &stat)),
             None => self.merge(k, |_i, ix| ix.search(query, k)),
         }
     }
@@ -485,7 +521,9 @@ impl Searcher {
         // Each segment must yield everything up to the end of the page, because the global page
         // boundary is only known after the merge -- a segment's 3rd-best can be the page's 1st.
         let want = k.saturating_add(offset);
-        let mut all = self.merge(want, |_i, ix| ix.search_clause(query, want, 0, clause, range));
+        let mut all = self.merge(want, |_i, ix| {
+            ix.search_clause(query, want, 0, clause, range)
+        });
         if offset > 0 {
             all.drain(..offset.min(all.len()));
         }
@@ -624,7 +662,9 @@ impl Searcher {
             let base = self.base[i];
             let mut out: Vec<(f64, Hit)> = Vec::new();
             for h in ix.search_sorted_filtered(query, k, slot, ascending, want, range) {
-                let Some(v) = ix.numeric_of(h.doc, slot) else { continue };
+                let Some(v) = ix.numeric_of(h.doc, slot) else {
+                    continue;
+                };
                 let mut g = h;
                 g.doc += base;
                 out.push((v, g));
@@ -636,7 +676,11 @@ impl Searcher {
             all.extend(chunk);
         }
         all.sort_by(|a, b| {
-            let primary = if ascending { a.0.total_cmp(&b.0) } else { b.0.total_cmp(&a.0) };
+            let primary = if ascending {
+                a.0.total_cmp(&b.0)
+            } else {
+                b.0.total_cmp(&a.0)
+            };
             primary.then_with(|| crate::index::rank_cmp(&a.1, &b.1))
         });
         all.truncate(k);
@@ -688,7 +732,9 @@ impl Searcher {
     /// silently return a mixture. Nothing prevents that at `push` time -- a segment is just an
     /// `Index` -- so this is offered as a check an application can assert once after loading.
     pub fn facet_config_is_uniform(&self) -> bool {
-        let Some(first) = self.segment.first() else { return true };
+        let Some(first) = self.segment.first() else {
+            return true;
+        };
         self.segment.iter().all(|s| {
             s.facet_field() == first.facet_field() && s.numeric_field() == first.numeric_field()
         })
@@ -696,9 +742,9 @@ impl Searcher {
 
     pub fn search_prefix(&self, query: &str, k: usize) -> Vec<Hit> {
         match self.stat_for(query, true) {
-            Some((stat, ex)) => {
-                self.merge(k, |i, ix| ix.search_prefix_expanded(query, &ex[i], k, &stat))
-            }
+            Some((stat, ex)) => self.merge(k, |i, ix| {
+                ix.search_prefix_expanded(query, &ex[i], k, &stat)
+            }),
             None => self.merge(k, |_i, ix| ix.search_prefix(query, k)),
         }
     }
@@ -770,7 +816,12 @@ impl Searcher {
     /// higher-ranked bound would be an allocation the serial path never made.
     fn fan<'a, T: Send>(&'a self, f: impl Fn(usize, &'a Index) -> T + Sync) -> Vec<T> {
         if !self.wants_thread() {
-            return self.segment.iter().enumerate().map(|(i, ix)| f(i, ix)).collect();
+            return self
+                .segment
+                .iter()
+                .enumerate()
+                .map(|(i, ix)| f(i, ix))
+                .collect();
         }
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -853,6 +904,135 @@ mod tests {
         b.build().unwrap()
     }
 
+    /// A collection of two segments must report the same COUNT(*) as a single rebuilt index,
+    /// including a document deleted in the second segment. Summing per-segment counts is only
+    /// correct because a document lives in one segment; this pins that.
+    #[test]
+    fn count_any_and_count_all_agree_with_a_rebuilt_index_across_segments() {
+        let mk = |row: &[&str]| {
+            let mut b = IndexBuilder::new(Schema::new(vec![Field::new("name", 3.0, 0.4)]));
+            for r in row {
+                b.add(&Doc::new([*r]));
+            }
+            b.build().unwrap()
+        };
+        let first = mk(&["Colgate Total Toothpaste", "Safeguard Pure White Soap"]);
+        let mut second = mk(&["Lucky Me Pancit Canton", "Bear Brand Fortified Milk"]);
+        second.delete(0);
+        let mut s = Searcher::new(first);
+        s.push(second);
+
+        let mut whole = mk(&[
+            "Colgate Total Toothpaste",
+            "Safeguard Pure White Soap",
+            "Lucky Me Pancit Canton",
+            "Bear Brand Fortified Milk",
+        ]);
+        whole.delete(2);
+
+        assert_eq!(s.count_any("toothpaste"), whole.count_any("toothpaste"));
+        assert_eq!(s.count_any("toothpaste"), 1);
+        assert_eq!(
+            s.count_all("colgate toothpaste"),
+            whole.count_all("colgate toothpaste")
+        );
+        assert_eq!(s.count_all("colgate toothpaste"), 1);
+        assert_eq!(s.count_any("soap milk"), whole.count_any("soap milk"));
+        assert_eq!(s.count_any("soap milk"), 2);
+        assert_eq!(s.count_all("soap milk"), 0);
+        assert_eq!(
+            s.count_any("canton"),
+            0,
+            "a deleted document is not counted"
+        );
+        assert_eq!(s.count_any(""), 0);
+    }
+
+    /// Two segments, one phrase each, one of them deleted: the sum must not count the deleted
+    /// row and must not treat reversed order as a match.
+    #[test]
+    fn count_phrase_agrees_with_a_rebuilt_index_across_segments() {
+        let mk = |row: &[&str]| {
+            let mut b =
+                IndexBuilder::new(Schema::new(vec![Field::new("name", 3.0, 0.4)])).with_position();
+            for r in row {
+                b.add(&Doc::new([*r]));
+            }
+            b.build().unwrap()
+        };
+        let first = mk(&["Colgate Total Toothpaste"]);
+        let mut second = mk(&["Total Colgate Toothpaste"]);
+        second.delete(0);
+        let mut s = Searcher::new(first);
+        s.push(second);
+
+        let mut whole = mk(&["Colgate Total Toothpaste", "Total Colgate Toothpaste"]);
+        whole.delete(1);
+
+        assert_eq!(
+            s.count_phrase("Colgate Total"),
+            whole.count_phrase("Colgate Total")
+        );
+        assert_eq!(s.count_phrase("Colgate Total"), 1);
+        assert_eq!(s.count_phrase("Total Colgate"), 0);
+        assert_eq!(
+            s.count_all("Colgate Total"),
+            1,
+            "bag-of-words still sees the live row"
+        );
+        assert_eq!(s.count_phrase(""), 0);
+    }
+
+    /// Readers during a push/delete must see a consistent collection: after the writer
+    /// finishes, COUNT and live membership match a rebuild of the same final rows.
+    #[test]
+    fn concurrent_mutation_and_count_match_a_rebuild() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, RwLock};
+        use std::thread;
+        let schema = || {
+            Schema::new(vec![
+                Field::new("name", 1.0, 0.4),
+                Field::new("sku", 0.0, 0.6),
+            ])
+        };
+        let mut base = IndexBuilder::new(schema()).with_key(1);
+        for i in 0..32u32 {
+            base.add(&Doc::new([format!("row {i} toothpaste"), format!("K{i}")]));
+        }
+        let s = Arc::new(RwLock::new(Searcher::new(base.build().unwrap())));
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let s = s.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let g = s.read().unwrap();
+                    let _ = g.count_any("toothpaste");
+                    let _ = g.search("toothpaste", 5);
+                }
+            })
+        };
+        {
+            let mut w = s.write().unwrap();
+            let mut delta = IndexBuilder::new(schema()).with_key(1);
+            delta.add(&Doc::new(["row extra toothpaste", "K99"]));
+            w.push(delta.build().unwrap());
+            w.delete(0);
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+        let g = s.read().unwrap();
+        let mut whole = IndexBuilder::new(schema()).with_key(1);
+        for i in 1..32u32 {
+            whole.add(&Doc::new([format!("row {i} toothpaste"), format!("K{i}")]));
+        }
+        whole.add(&Doc::new(["row extra toothpaste", "K99"]));
+        let whole = whole.build().unwrap();
+        assert_eq!(g.count_any("toothpaste"), whole.count_any("toothpaste"));
+        assert_eq!(g.live_count(), whole.live_count());
+    }
+
     /// Two segments that intern the SAME label at DIFFERENT ids.
     ///
     /// This is the case a tally merged on the integer id gets silently wrong: it would add
@@ -880,7 +1060,10 @@ mod tests {
         assert!(s.facet_config_is_uniform());
 
         let t = s.facet_tally("Toothpaste");
-        assert_eq!(t, vec![("Aquafresh".to_string(), 3), ("Colgate".to_string(), 2)]);
+        assert_eq!(
+            t,
+            vec![("Aquafresh".to_string(), 3), ("Colgate".to_string(), 2)]
+        );
         assert_eq!(t.iter().map(|x| x.1).sum::<usize>(), s.doc_count());
     }
 
@@ -895,8 +1078,11 @@ mod tests {
         let mut s = Searcher::new(a);
         s.push(b);
 
-        let mut got: Vec<u32> =
-            s.search_facet("Toothpaste", 10, "Colgate").iter().map(|h| h.doc).collect();
+        let mut got: Vec<u32> = s
+            .search_facet("Toothpaste", 10, "Colgate")
+            .iter()
+            .map(|h| h.doc)
+            .collect();
         got.sort_unstable();
         assert_eq!(got, vec![0, 1], "segment 1's local 0 is global 1");
         for d in &got {
@@ -904,8 +1090,11 @@ mod tests {
         }
 
         // A value only one segment has ever seen is not an error.
-        let only_b: Vec<u32> =
-            s.search_facet("Toothpaste", 10, "Aquafresh").iter().map(|h| h.doc).collect();
+        let only_b: Vec<u32> = s
+            .search_facet("Toothpaste", 10, "Aquafresh")
+            .iter()
+            .map(|h| h.doc)
+            .collect();
         assert_eq!(only_b, vec![2]);
         assert!(s.search_facet("Toothpaste", 10, "Nestle").is_empty());
     }
@@ -925,21 +1114,35 @@ mod tests {
         s.push(b);
         let q = "Toothpaste";
 
-        let mut mid: Vec<u32> =
-            s.search_range(q, 10, 0, 100.0, 200.0).iter().map(|h| h.doc).collect();
+        let mut mid: Vec<u32> = s
+            .search_range(q, 10, 0, 100.0, 200.0)
+            .iter()
+            .map(|h| h.doc)
+            .collect();
         mid.sort_unstable();
         assert_eq!(mid, vec![0, 3], "150 from segment 0 and 100 from segment 1");
 
         // Buckets add elementwise; the row with no size is counted nowhere.
         let hist = s.range_tally(q, 0, &[0.0, 100.0, 200.0]);
         assert_eq!(hist, vec![1, 2]);
-        assert_eq!(hist.iter().sum::<usize>(), 3, "the empty size is in no bucket");
+        assert_eq!(
+            hist.iter().sum::<usize>(),
+            3,
+            "the empty size is in no bucket"
+        );
 
         // The globally cheapest is in segment 1, which a per-segment top-k must not lose.
-        let asc: Vec<u32> = s.search_sorted(q, 10, 0, true).iter().map(|h| h.doc).collect();
+        let asc: Vec<u32> = s
+            .search_sorted(q, 10, 0, true)
+            .iter()
+            .map(|h| h.doc)
+            .collect();
         assert_eq!(asc, vec![2, 3, 0], "25, 100, 150");
         assert_eq!(
-            s.search_sorted(q, 1, 0, true).iter().map(|h| h.doc).collect::<Vec<_>>(),
+            s.search_sorted(q, 1, 0, true)
+                .iter()
+                .map(|h| h.doc)
+                .collect::<Vec<_>>(),
             vec![2],
             "k=1 returns the global cheapest, not the first segment's cheapest"
         );
@@ -967,7 +1170,13 @@ mod tests {
 
         // OR reaching into the second segment.
         assert_eq!(
-            docs(s.search_clause(q, 10, 0, &[FacetClause::any(0, &["Colgate", "Oral B"])], &[])),
+            docs(s.search_clause(
+                q,
+                10,
+                0,
+                &[FacetClause::any(0, &["Colgate", "Oral B"])],
+                &[]
+            )),
             vec![0, 2, 3]
         );
         // NOT, across segments.
@@ -976,9 +1185,12 @@ mod tests {
             vec![1, 2]
         );
         // The unknown-value rules survive the merge.
-        assert!(s.search_clause(q, 10, 0, &[FacetClause::any(0, &["Nestle"])], &[]).is_empty());
+        assert!(s
+            .search_clause(q, 10, 0, &[FacetClause::any(0, &["Nestle"])], &[])
+            .is_empty());
         assert_eq!(
-            s.search_clause(q, 10, 0, &[FacetClause::none(0, &["Nestle"])], &[]).len(),
+            s.search_clause(q, 10, 0, &[FacetClause::none(0, &["Nestle"])], &[])
+                .len(),
             4,
             "an all-unknown exclude excludes nothing, across segments too"
         );
@@ -989,7 +1201,10 @@ mod tests {
         for page in 0..2 {
             paged.extend(s.search_page(q, page * 2, 2).iter().map(|h| h.doc));
         }
-        assert_eq!(paged, all, "two pages of 2 equal one request for 4, across segments");
+        assert_eq!(
+            paged, all,
+            "two pages of 2 equal one request for 4, across segments"
+        );
         assert!(s.search_page(q, 99, 5).is_empty());
     }
 
@@ -1007,25 +1222,43 @@ mod tests {
 
         let mut s = Searcher::new(a.build().unwrap());
         s.push(b.build().unwrap());
-        let mut doc: Vec<u32> = s.search_phrase("Ice Cream", 10).iter().map(|h| h.doc).collect();
+        let mut doc: Vec<u32> = s
+            .search_phrase("Ice Cream", 10)
+            .iter()
+            .map(|h| h.doc)
+            .collect();
         doc.sort_unstable();
-        assert_eq!(doc, vec![0, 2], "the phrase is found at global ordinals in both segments");
-        assert_eq!(s.search("Ice Cream", 10).len(), 4, "the bag-of-words search still sees all four");
+        assert_eq!(
+            doc,
+            vec![0, 2],
+            "the phrase is found at global ordinals in both segments"
+        );
+        assert_eq!(
+            s.search("Ice Cream", 10).len(),
+            4,
+            "the bag-of-words search still sees all four"
+        );
 
         // A segment with no positions contributes nothing. Silently falling back to a term match
         // would mix phrase and non-phrase rows in one list with no way to tell them apart.
         let mut c = IndexBuilder::new(Schema::new(field));
         c.add(&Doc::new(["Strawberry Ice Cream Cone"]));
         let mut s2 = Searcher::new(c.build().unwrap());
-        assert!(s2.search_phrase("Ice Cream", 10).is_empty(), "no positions, no phrase results");
+        assert!(
+            s2.search_phrase("Ice Cream", 10).is_empty(),
+            "no positions, no phrase results"
+        );
         s2.push({
-            let mut d = IndexBuilder::new(Schema::new(vec![Field::new("name", 3.0, 0.4)]))
-                .with_position();
+            let mut d =
+                IndexBuilder::new(Schema::new(vec![Field::new("name", 3.0, 0.4)])).with_position();
             d.add(&Doc::new(["Durian Ice Cream Tub"]));
             d.build().unwrap()
         });
         assert_eq!(
-            s2.search_phrase("Ice Cream", 10).iter().map(|h| h.doc).collect::<Vec<_>>(),
+            s2.search_phrase("Ice Cream", 10)
+                .iter()
+                .map(|h| h.doc)
+                .collect::<Vec<_>>(),
             vec![1],
             "only the segment that CAN verify contributes"
         );
@@ -1056,7 +1289,11 @@ mod tests {
         assert_eq!(s.keyed_count(), 2);
         assert_eq!(s.doc_of_key("sku-1"), Some(0));
         assert_eq!(s.key_of(1), Some("sku-2"));
-        assert_eq!(s.doc_of_key("sku-404"), None, "an unknown key resolves to nothing");
+        assert_eq!(
+            s.doc_of_key("sku-404"),
+            None,
+            "an unknown key resolves to nothing"
+        );
 
         // sku-1 is UPDATED and sku-3 is new. The update must replace, not accumulate.
         let shadowed = s.push(keyed(&[
@@ -1070,11 +1307,20 @@ mod tests {
 
         // The live row for sku-1 is the NEW one, and there is exactly one of it.
         assert_eq!(s.doc_of_key("sku-1"), Some(2));
-        let hit: Vec<u32> = s.search("Colgate Toothpaste", 10).iter().map(|h| h.doc).collect();
+        let hit: Vec<u32> = s
+            .search("Colgate Toothpaste", 10)
+            .iter()
+            .map(|h| h.doc)
+            .collect();
         assert_eq!(hit.first(), Some(&2), "the new version ranks first");
-        assert!(!hit.contains(&0), "the superseded version does not come back");
+        assert!(
+            !hit.contains(&0),
+            "the superseded version does not come back"
+        );
         assert_eq!(
-            hit.iter().filter(|&&d| s.key_of(d) == Some("sku-1")).count(),
+            hit.iter()
+                .filter(|&&d| s.key_of(d) == Some("sku-1"))
+                .count(),
             1,
             "exactly one row for the key, not one per version"
         );
@@ -1085,8 +1331,14 @@ mod tests {
 
         // A delete arriving from a change stream, expressed the only way an application can.
         assert!(s.delete_key("sku-2"));
-        assert!(!s.delete_key("sku-2"), "deleting twice is not an error but is not a second delete");
-        assert!(!s.delete_key("sku-404"), "deleting a key that never existed reports false");
+        assert!(
+            !s.delete_key("sku-2"),
+            "deleting twice is not an error but is not a second delete"
+        );
+        assert!(
+            !s.delete_key("sku-404"),
+            "deleting a key that never existed reports false"
+        );
         assert_eq!(s.live_count(), 2);
         assert_eq!(s.doc_of_key("sku-2"), None);
     }
@@ -1130,13 +1382,17 @@ mod tests {
 
         let mut more = IndexBuilder::new(Schema::new(vec![Field::new("name", 3.0, 0.4)]));
         more.add(&Doc::new(["Aquafresh Mini Toothpaste"]));
-        assert_eq!(s.push(more.build().unwrap()), 0, "nothing is shadowed without keys");
+        assert_eq!(
+            s.push(more.build().unwrap()),
+            0,
+            "nothing is shadowed without keys"
+        );
         assert_eq!(s.search("Toothpaste", 10).len(), 2);
 
         // One unkeyed segment makes the COLLECTION unkeyed, so an `apply` cannot claim to be
         // keeping it in sync with a source of truth it cannot fully address.
-        let mut keyed = IndexBuilder::new(Schema::new(vec![Field::new("name", 3.0, 0.4)]))
-            .with_key(0);
+        let mut keyed =
+            IndexBuilder::new(Schema::new(vec![Field::new("name", 3.0, 0.4)])).with_key(0);
         keyed.add(&Doc::new(["Oral B Toothpaste Pro"]));
         s.push(keyed.build().unwrap());
         assert!(!s.has_key(), "a partially keyed collection reports unkeyed");
@@ -1162,7 +1418,9 @@ mod tests {
         };
 
         // 400 filler rows sharing a common word, plus one row with a distinctive one.
-        let mut row: Vec<String> = (0..400).map(|i| format!("common listing number {i}")).collect();
+        let mut row: Vec<String> = (0..400)
+            .map(|i| format!("common listing number {i}"))
+            .collect();
         row.push("common listing zamboanga special".to_string());
 
         let whole = mk(&row);
@@ -1174,7 +1432,10 @@ mod tests {
         // The distinctive term must identify the same document either way.
         let a = whole.search("zamboanga", 5);
         let b = split.search("zamboanga", 5);
-        assert_eq!(a[0].doc, b[0].doc, "a unique term must find the same row after segmentation");
+        assert_eq!(
+            a[0].doc, b[0].doc,
+            "a unique term must find the same row after segmentation"
+        );
 
         // And the SCORE must be close. Without collection statistics the delta scores `zamboanga`
         // against one document instead of 401, so `idf` collapses and the score is a fraction of
@@ -1194,7 +1455,10 @@ mod tests {
         // it as rare just because it holds one of the 401 rows carrying it.
         let ca = whole.search("common", 10);
         let cb = split.search("common", 10);
-        assert_eq!(ca[0].doc, cb[0].doc, "a common term must not be inflated inside a small delta");
+        assert_eq!(
+            ca[0].doc, cb[0].doc,
+            "a common term must not be inflated inside a small delta"
+        );
     }
 
     /// Mismatched facet layout is detectable rather than silently wrong.
@@ -1210,7 +1474,10 @@ mod tests {
         odd.add(&Doc::new(vec!["Colgate Toothpaste", "Colgate", "150"]));
         let mut s = Searcher::new(a);
         s.push(odd.build().unwrap());
-        assert!(!s.facet_config_is_uniform(), "slot 0 means two different fields");
+        assert!(
+            !s.facet_config_is_uniform(),
+            "slot 0 means two different fields"
+        );
     }
 
     fn schema() -> Schema {
@@ -1250,7 +1517,11 @@ mod tests {
         let before = s.search("alpha", 1)[0].doc;
         s.push(build(&["gamma"]));
         s.push(build(&["delta"]));
-        assert_eq!(s.search("alpha", 1)[0].doc, before, "an application may store these");
+        assert_eq!(
+            s.search("alpha", 1)[0].doc,
+            before,
+            "an application may store these"
+        );
         assert_eq!(s.doc_count(), 4);
         assert_eq!(s.segment_count(), 3);
     }
@@ -1280,7 +1551,11 @@ mod tests {
         for x in ["l", "m", "n", "o"] {
             s.push(build(&[x]));
         }
-        assert!(s.needs_compaction(), "5 of 15 outside the base should trip it: {:?}", s);
+        assert!(
+            s.needs_compaction(),
+            "5 of 15 outside the base should trip it: {:?}",
+            s
+        );
     }
 
     /// **The cost of segmentation, measured rather than waved away.**
@@ -1338,7 +1613,11 @@ mod tests {
             let mut sb: Vec<u32> = b.iter().map(|h| h.doc).collect();
             sa.sort_unstable();
             sb.sort_unstable();
-            assert_eq!(sa.len(), sb.len(), "{q:?} returned a different number of hits");
+            assert_eq!(
+                sa.len(),
+                sb.len(),
+                "{q:?} returned a different number of hits"
+            );
             if a[0].doc == b[0].doc {
                 broad_agree += 1;
             }
@@ -1408,7 +1687,11 @@ mod tests {
         // one segment, so a compaction signal that looked only at skew would never fire — and the
         // index would drift arbitrarily far from a clean rebuild while reporting itself healthy.
         let mut sr = Searcher::new(build(&[
-            "alpha one", "alpha two", "alpha three", "alpha four", "alpha five",
+            "alpha one",
+            "alpha two",
+            "alpha three",
+            "alpha four",
+            "alpha five",
         ]));
         assert_eq!(sr.skew(), 0.0);
         assert!(!sr.needs_compaction());
@@ -1485,7 +1768,10 @@ mod tests {
         let mut threaded = assemble();
         threaded.set_force_thread(Some(true));
         assert_eq!(serial.segment_count(), 8);
-        assert!(serial.collection_stat(), "p52's two-pass path is the one under test");
+        assert!(
+            serial.collection_stat(),
+            "p52's two-pass path is the one under test"
+        );
 
         let q = "Toothpaste";
         let value: [&str; 2] = ["Colgate", "Oral B"];
@@ -1502,9 +1788,21 @@ mod tests {
         };
 
         cmp(serial.search(q, 10), threaded.search(q, 10), "search");
-        cmp(serial.search_prefix("Toothp", 10), threaded.search_prefix("Toothp", 10), "prefix");
-        cmp(serial.search_page(q, 3, 5), threaded.search_page(q, 3, 5), "page");
-        cmp(serial.search_facet(q, 10, "Colgate"), threaded.search_facet(q, 10, "Colgate"), "facet");
+        cmp(
+            serial.search_prefix("Toothp", 10),
+            threaded.search_prefix("Toothp", 10),
+            "prefix",
+        );
+        cmp(
+            serial.search_page(q, 3, 5),
+            threaded.search_page(q, 3, 5),
+            "page",
+        );
+        cmp(
+            serial.search_facet(q, 10, "Colgate"),
+            threaded.search_facet(q, 10, "Colgate"),
+            "facet",
+        );
         cmp(
             serial.search_range(q, 10, 0, 50.0, 200.0),
             threaded.search_range(q, 10, 0, 50.0, 200.0),
@@ -1515,12 +1813,28 @@ mod tests {
             threaded.search_clause(q, 5, 1, &clause, &[(0, 30.0, 300.0)]),
             "clause",
         );
-        cmp(serial.search_sorted(q, 10, 0, true), threaded.search_sorted(q, 10, 0, true), "sort up");
-        cmp(serial.search_sorted(q, 4, 0, false), threaded.search_sorted(q, 4, 0, false), "sort dn");
+        cmp(
+            serial.search_sorted(q, 10, 0, true),
+            threaded.search_sorted(q, 10, 0, true),
+            "sort up",
+        );
+        cmp(
+            serial.search_sorted(q, 4, 0, false),
+            threaded.search_sorted(q, 4, 0, false),
+            "sort dn",
+        );
 
-        assert_eq!(serial.facet_tally(q), threaded.facet_tally(q), "facet tally");
+        assert_eq!(
+            serial.facet_tally(q),
+            threaded.facet_tally(q),
+            "facet tally"
+        );
         let edge = [0.0, 100.0, 200.0, 400.0];
-        assert_eq!(serial.range_tally(q, 0, &edge), threaded.range_tally(q, 0, &edge), "histogram");
+        assert_eq!(
+            serial.range_tally(q, 0, &edge),
+            threaded.range_tally(q, 0, &edge),
+            "histogram"
+        );
 
         // Phrase needs positions, which `shop` does not record, so it gets its own segment set.
         let phrase_seg: [&[&str]; 6] = [
@@ -1551,7 +1865,11 @@ mod tests {
         let mut p_threaded = phrase_assemble();
         p_threaded.set_force_thread(Some(true));
         let ph = "Ice Cream";
-        cmp(p_serial.search_phrase(ph, 10), p_threaded.search_phrase(ph, 10), "phrase");
+        cmp(
+            p_serial.search_phrase(ph, 10),
+            p_threaded.search_phrase(ph, 10),
+            "phrase",
+        );
         cmp(
             p_serial.search_phrase_page(ph, 1, 3),
             p_threaded.search_phrase_page(ph, 1, 3),
@@ -1560,8 +1878,16 @@ mod tests {
 
         // Repeatable, not merely equal once: thread scheduling differs from call to call.
         for _ in 0..25 {
-            cmp(serial.search(q, 10), threaded.search(q, 10), "search, repeated");
-            cmp(serial.search_sorted(q, 6, 0, true), threaded.search_sorted(q, 6, 0, true), "sort");
+            cmp(
+                serial.search(q, 10),
+                threaded.search(q, 10),
+                "search, repeated",
+            );
+            cmp(
+                serial.search_sorted(q, 6, 0, true),
+                threaded.search_sorted(q, 6, 0, true),
+                "sort",
+            );
         }
     }
 
@@ -1637,7 +1963,11 @@ mod tests {
                     let ix = sr.segment(i).unwrap();
                     let re = ix.search_with_stat(q, 10, &stat);
                     let handed = ix.search_expanded(q, exi, 10, &stat);
-                    assert_eq!(re.len(), handed.len(), "learn={learn} q={q:?} seg={i}: length");
+                    assert_eq!(
+                        re.len(),
+                        handed.len(),
+                        "learn={learn} q={q:?} seg={i}: length"
+                    );
                     for (a, b) in re.iter().zip(handed.iter()) {
                         assert_eq!(a.doc, b.doc, "learn={learn} q={q:?} seg={i}: doc");
                         assert_eq!(
@@ -1659,27 +1989,45 @@ mod tests {
                 let ix = sr.segment(i).unwrap();
                 let re = ix.search_prefix_with_stat("Toothp", 10, &stat);
                 let handed = ix.search_prefix_expanded("Toothp", exi, 10, &stat);
-                assert_eq!(re.len(), handed.len(), "learn={learn} prefix seg={i}: length");
+                assert_eq!(
+                    re.len(),
+                    handed.len(),
+                    "learn={learn} prefix seg={i}: length"
+                );
                 for (a, b) in re.iter().zip(handed.iter()) {
                     assert_eq!(a.doc, b.doc, "learn={learn} prefix seg={i}: doc");
-                    assert_eq!(a.score.to_bits(), b.score.to_bits(), "learn={learn} prefix seg={i}: bits");
+                    assert_eq!(
+                        a.score.to_bits(),
+                        b.score.to_bits(),
+                        "learn={learn} prefix seg={i}: bits"
+                    );
                 }
                 total += re.len();
             }
-            assert!(total > 0, "learn={learn}: an empty prefix result would prove nothing");
+            assert!(
+                total > 0,
+                "learn={learn}: an empty prefix result would prove nothing"
+            );
 
             // And the stat itself: the hand-off must not change what the df sum sees.
             let q = "colgatetoothpaste";
             let (stat_re, _) = {
-                let per: Vec<_> =
-                    (0..sr.segment_count()).map(|i| sr.segment(i).unwrap().term_stat(q, false)).collect();
+                let per: Vec<_> = (0..sr.segment_count())
+                    .map(|i| sr.segment(i).unwrap().term_stat(q, false))
+                    .collect();
                 let mut df = std::collections::HashMap::new();
                 for pairs in per {
                     for (text, d) in pairs {
                         *df.entry(text).or_insert(0) += d;
                     }
                 }
-                (crate::index::CollectionStat { doc_count: sr.doc_count(), df }, ())
+                (
+                    crate::index::CollectionStat {
+                        doc_count: sr.doc_count(),
+                        df,
+                    },
+                    (),
+                )
             };
             let (stat_ex, _) = sr.stat_for(q, false).unwrap();
             assert_eq!(
@@ -1688,5 +2036,4 @@ mod tests {
             );
         }
     }
-
 }

@@ -1,0 +1,333 @@
+{
+  "mode": "extend",
+  "idea": {
+    "name": "index count ABI",
+    "one_liner": "Export the exact COUNT(*) that p93 already ships in Rust so every host (C ABI, WASM, JS, CLI) can answer how many documents match without ranking.",
+    "north_star": "A count query on the public surface returns the same integer Index::count_any / count_all already pin against a brute-force set.",
+    "non_goal": [
+      "Opening PRs against consumer apps (profstopick, onegrid, presyo, sisia)",
+      "Re-running the 8 GB Wikipedia / 28 GB-peak TIN comparison",
+      "Replacing the engine with Tantivy, Meilisearch, Typesense, or TIN",
+      "Page-level bitmaps or stored per-term counts as a v1 codec change",
+      "A sidecar process, AGPL, or learned-sparse retrieval"
+    ]
+  },
+  "repo": {
+    "path": "C:\\Users\\maran\\code\\index",
+    "branch": "master",
+    "is_dirty": false,
+    "feature_existing": [
+      "typo-tolerant BM25 search over a pipe of rows (CLI build/apply/search/stat)",
+      "C ABI + WASM artifact at ABI 14 (include/index.h, crates/index-wasm, js/index.mjs)",
+      "facets, numeric ranges, phrase, document keys, multi-segment Searcher",
+      "Index::count_any / Index::count_all exact COUNT(*) (Rust-only, p93)",
+      "range-tier HTTP/OPFS readers and Python ctypes host"
+    ],
+    "feature_in_flight": [
+      "count_any / count_all have no C ABI, WASM, JS, Python, or CLI export (CHANGELOG p93)",
+      "Searcher has no count_any / count_all, so a collection of segments cannot count from the CLI",
+      "Deploy an integration (consumer-app PRs) — not this repo",
+      "P3 CI row still labelled not started while .github/workflows/ci.yml exists",
+      "phrase COUNT named by p93 as not done"
+    ],
+    "delta": [
+      "idx_count_any / idx_count_all on the C ABI (additive, ABI 14 stays)",
+      "SearchIndex.countAny / countAll on the JS host",
+      "Searcher::count_any / count_all summing per-segment exact counts",
+      "index search --count any|all QUERY on the CLI",
+      "js/smoke.mjs and cli-smoke.sh assert the integer against a fixture"
+    ],
+    "recheck": [
+      {
+        "section": "customer",
+        "is_still_true": true,
+        "note": "The buyer is still the in-house app developer whose shopper UI already prints a match count; exposing COUNT on the ABI does not change who pays or who uses."
+      },
+      {
+        "section": "product_form",
+        "is_still_true": true,
+        "note": "Still an SDK (one C ABI, one WASM artifact, one CLI) rather than a SaaS; additive COUNT exports keep that form instead of inventing an HTTP count service."
+      },
+      {
+        "section": "competitor",
+        "is_still_true": true,
+        "note": "TIN, Tantivy, Meilisearch, Algolia and Elasticsearch all expose COUNT; the gap is still that this engine has the algorithm and not the host export."
+      },
+      {
+        "section": "money",
+        "is_still_true": true,
+        "note": "The product remains a zero-price embedded library; Algolia still bills every InstantSearch count as a search request, which is the cost this delta refuses to recreate."
+      },
+      {
+        "section": "endgame",
+        "is_still_true": true,
+        "note": "Licence stays MIT OR Apache-2.0; AGPL and sidecar remain rejected, and COUNT-on-ABI does not create a hosted bill to acquire."
+      }
+    ]
+  },
+  "customer": {
+    "primary_persona": {
+      "who": "The engineer wiring search into an in-house PH catalog or grocery app (presyo, profstopick, onegrid, sisia) who already has rows in a database.",
+      "jtbd": "When I show a result list I need the exact number of matching documents so the UI can print '412 snacks' without ranking 412 hits or calling a hosted search API.",
+      "today": "Either take hit.length after a top-k search (wrong once k < matches), run SQL COUNT on pg_trgm, or skip the number."
+    },
+    "secondary_segment": [
+      "A DBA using the CLI over a pipe who wants `index search --count` instead of grepping TSV",
+      "A Python host already on ctypes that can call idx_search but not count"
+    ],
+    "accessibility": [
+      "Low-end Android / OPFS browser hosts that cannot rank the whole match set just to print a count",
+      "Taglish / Filipino product titles already folded by the shipped analyzer",
+      "Offline: the count must work with no network, same as search"
+    ]
+  },
+  "competitor": [
+    {
+      "name": "presyo pg_trgm UNION (in-house, PH)",
+      "kind": "local",
+      "source": "founder",
+      "gap_vs_us": "It already has exact SQL COUNT but takes 17 s to 400 ms on a 7-lane UNION and cannot run in a tab; index already beats it on ranked search and only lacks the count export."
+    },
+    {
+      "name": "PlanetScale TIN",
+      "kind": "global",
+      "source": "https://planetscale.com/blog/introducing-tin",
+      "gap_vs_us": "TIN ships COUNT(*) as a SQL operator with page-level bitmaps; it only lives inside Postgres and cannot be the same .idx in a browser. We already measured the algorithm; this delta ships the host surface TIN has and we do not."
+    },
+    {
+      "name": "Tantivy collector::Count",
+      "kind": "global",
+      "source": "https://docs.rs/tantivy/latest/tantivy/collector/struct.Count.html",
+      "gap_vs_us": "Tantivy counts without scoring, but it is a Rust crate with no wasm32 browser story and no one C ABI; hosts here already speak include/index.h."
+    },
+    {
+      "name": "Meilisearch",
+      "kind": "global",
+      "source": "https://www.meilisearch.com/docs/guides/front_end/pagination",
+      "gap_vs_us": "Default counts are estimates; exhaustive totalHits is a slower opt-in capped by maxTotalHits. An embedded exact count on the ABI does not estimate and does not cap."
+    },
+    {
+      "name": "Algolia",
+      "kind": "substitute",
+      "source": "https://www.algolia.com/pricing",
+      "gap_vs_us": "The shopper UI they sell bills every count and every facet refinement as a search request at USD 0.50 per 1,000 after 10k; an in-process COUNT is unmetered and exact."
+    },
+    {
+      "name": "Elasticsearch track_total_hits",
+      "kind": "global",
+      "source": "https://www.elastic.co/docs/solutions/search/the-search-api",
+      "gap_vs_us": "Exact count is an opt-in that can disable Max WAND and defaults to a 10,000 cap; we already skip ranking in count_any/count_all, so the export should stay exact with no cap."
+    },
+    {
+      "name": "MiniSearch",
+      "kind": "substitute",
+      "source": "https://lucaong.github.io/minisearch/classes/MiniSearch.MiniSearch.html",
+      "gap_vs_us": "It is the in-browser substitute and has no query-match count at all — only documentCount of the corpus — so a host still materializes hits to know how many matched."
+    }
+  ],
+  "moat": [
+    "One .idx file and one C ABI already serve browser, Node, native FFI and CLI; adding COUNT there compounds on that distribution rather than on a hosted bill.",
+    "Exact counts that skip ranking and honour deletions, already pinned against a brute-force set in index-text, are a correctness property hosted engines estimate or cap."
+  ],
+  "product_form": {
+    "choice": "sdk",
+    "rationale": "The customer already integrates by linking include/index.h or importing js/index.mjs; COUNT has to appear on that same SDK, not as a new SaaS meter, because the engine's whole pitch is in-process.",
+    "rejected": [
+      { "form": "saas", "why": "Algolia already sells counted search as a metered API; recreating that bill is the thing this library exists to avoid." },
+      { "form": "service", "why": "A sidecar was rejected in docs/roadmap-rejected.md: codec cost dominates, Meilisearch/Typesense cannot embed, and the consumer box already runs Node plus Postgres." }
+    ]
+  },
+  "v1_cut": {
+    "jtbd": "Ask how many documents match a query (any token or every token) and get an exact integer from the C ABI, JS host, and CLI.",
+    "channel": "Ship on the existing GitHub/mesh repo and the in-house app engineers already consuming the ABI.",
+    "pricing_experiment": "Keep the library free (MIT OR Apache-2.0); the experiment is whether COUNT on the ABI unblocks a consumer without a hosted search invoice.",
+    "deferred": [
+      "Phrase COUNT",
+      "TIN-style stored per-term counts / page-level bitmaps",
+      "Searcher-level C ABI idx_searcher_count_* (CLI uses Searcher in-process; WASM Searcher can follow)",
+      "Consumer-app PRs"
+    ]
+  },
+  "frontend": {
+    "page": ["landing README", "docs/integration.md", "js/browser.html playground", "CLI --help"],
+    "onboarding": {
+      "is_needed": true,
+      "why": "Time-to-first-successful-count is `index search --count any toothpaste` after the existing pipe build, or SearchIndex.countAny in the JS host already used for search."
+    },
+    "headline": "Exact COUNT(*) on the same ABI that already searches.",
+    "brand_brief": {
+      "positioning": "The search library that already lives in your process, now able to say how many matched.",
+      "audience": "Engineers of PH catalog and grocery apps who already pipe rows into index.",
+      "tone": "Measured, terse, no marketing — numbers over adjectives."
+    }
+  },
+  "backend": {
+    "runtime": "Rust 1.74 workspace (index-text + index-wasm cdylib)",
+    "framework": "hand-written C ABI, no wasm-bindgen",
+    "rejected": [
+      { "option": "wasm-bindgen generated bindings", "why": "Every String/Vec copy is O(n) and the binding would not generalize to native FFI; already rejected in roadmap-rejected.md." }
+    ],
+    "api_boundary": [
+      "idx_count_any(handle, q, q_len) -> u32",
+      "idx_count_all(handle, q, q_len) -> u32",
+      "SearchIndex.countAny(query) / countAll(query)",
+      "index search --count any|all QUERY"
+    ],
+    "data_store": "the existing .idx posting lists; COUNT reads them and does not write",
+    "auth": "none — in-process, the host already owns the bytes",
+    "rate_limit": "none — the host's process is the limit",
+    "observability": "js/smoke.mjs and scripts/cli-smoke.sh print PASS/FAIL on the integer; Rust tests pin against brute force",
+    "compute": "customer perimeter (browser tab, Node, native .dll/.so/.dylib, CLI)"
+  },
+  "ai": {
+    "is_used": false,
+    "modality": [],
+    "locality": "local",
+    "locality_rejected": { "option": "cloud", "why": "COUNT is a posting-list walk; a model would add latency and a bill without changing the integer." },
+    "model": [],
+    "fallback": "not applicable — COUNT does not call a model",
+    "retention": "the index stores no query log; the host decides"
+  },
+  "data": {
+    "source": [],
+    "labeling": "not applicable",
+    "edge_case": [],
+    "crowd_source": "not applicable"
+  },
+  "gtm": {
+    "channel": [
+      {
+        "name": "in-house app engineers on this machine",
+        "first_experiment": "Ship COUNT on the ABI and ask the presyo/profstopick owners to print the integer beside a result list they already render.",
+        "is_primary": true
+      },
+      {
+        "name": "Filipino Web Development Peers Discord",
+        "first_experiment": "Deferred: a post in the 7,777-member Filipino Web Development Peers Discord after one consumer actually prints the count.",
+        "is_primary": false
+      }
+    ],
+    "cac_hypothesis": {
+      "value": 0,
+      "currency": "PHP",
+      "unit": "per paying customer",
+      "is_assumed": true
+    }
+  },
+  "money": {
+    "pricing": [
+      {
+        "plan": "library",
+        "value": 0,
+        "currency": "USD",
+        "unit": "per query",
+        "is_assumed": true
+      }
+    ],
+    "build_cost": { "value": 0, "currency": "PHP", "is_assumed": true },
+    "monthly_run_cost": { "value": 0, "currency": "PHP", "is_assumed": true },
+    "breakeven": "Zero price, zero run cost; break-even is adoption inside an app that would otherwise pay Algolia Grow USD 0.50 per 1,000 search requests."
+  },
+  "constraint": [
+    "MIT OR Apache-2.0",
+    "one C ABI, ABI 14 additive (range-facet precedent: new symbols, no version bump)",
+    "nothing traps; UINT32_MAX sentinel",
+    "index-accel stays wasm32-only and out of default-members",
+    "singular identifiers in new public names"
+  ],
+  "edge_case": [
+    "empty query returns 0, matching the existing Rust tests",
+    "deleted documents are not counted",
+    "a token absent from the dictionary: count_any ignores it, count_all returns 0",
+    "null handle returns UINT32_MAX rather than trapping",
+    "multi-segment Searcher must sum per-segment counts (a document lives in one segment)"
+  ],
+  "complaint": [
+    "why is this not on the ABI if the README already talks about COUNT",
+    "the CLI still ranks when I only wanted a number",
+    "the count disagrees with hit.length of a top-k search (that is correct, and must be documented)"
+  ],
+  "bottleneck": [
+    "COUNT still walks postings; TIN's stored per-term counts are the speed lever and are deferred",
+    "consumer adoption is still a PR in someone else's repo",
+    "phrase COUNT is unbuilt"
+  ],
+  "risk": [
+    {
+      "name": "Additive ABI without a host test",
+      "mitigation": "js/smoke.mjs must list the new symbols and assert the integer; the host import path too, not only the raw exports.",
+      "kill_switch": "If smoke.mjs can stay green while idx_count_any is missing from the WASM exports, stop claiming the surface shipped."
+    },
+    {
+      "name": "CLI counts only the first segment",
+      "mitigation": "Implement Searcher::count_any/count_all as a sum over segments before wiring --count.",
+      "kill_switch": "A two-segment fixture whose COUNT disagrees with a rebuilt single segment is a revert, not a changelog line."
+    },
+    {
+      "name": "ABI version bump that breaks every host",
+      "mitigation": "Follow the range-facet precedent: new symbols, ABI_VERSION stays 14, smoke still asserts 14.",
+      "kill_switch": "If js/index.mjs ABI_VERSION and the module disagree, every build() throws; that is already a known class of bug."
+    },
+    {
+      "name": "Hosts treat UINT32_MAX as a huge count",
+      "mitigation": "Document the sentinel; JS coerces with >>> 0 and throws on ERR; Python raises.",
+      "kill_switch": "A test that reads a null-handle count as 4294967295 without treating it as error fails the gate."
+    },
+    {
+      "name": "Scope creeps into TIN bitmaps",
+      "mitigation": "v1 is the export of the existing walk; stored per-term counts stay a later row.",
+      "kill_switch": "If the CHANGELOG for this item mentions a new posting codec, the delta has left the cut line — revert the codec."
+    }
+  ],
+  "timeline": {
+    "ai_multiplier": {
+      "value": 3,
+      "is_assumed": true,
+      "note": "Compresses the wiring and tests, not consumer adoption or a TIN-scale corpus rebuild."
+    },
+    "phase": [
+      {
+        "name": "export",
+        "week_start": 1,
+        "week_end": 1,
+        "deliverable": "idx_count_any/all, JS host, Searcher sum, CLI --count, smoke + cli-smoke green",
+        "cut_line": "A host can print the integer; no new codec."
+      },
+      {
+        "name": "prove",
+        "week_start": 2,
+        "week_end": 2,
+        "deliverable": "CHANGELOG, ROADMAP dated section, quarantined benches for still-unbuilt COUNT follow-ups",
+        "cut_line": "The gate (cargo test --workspace, cli-smoke.sh, js/smoke.mjs) exits 0 on this Windows tree."
+      }
+    ],
+    "team": [
+      { "role": "founder-engineer", "is_hired": false }
+    ]
+  },
+  "endgame": {
+    "exit": "open_core",
+    "acquirer_type": ["database vendors needing a permissive embed", "app platforms that already ship a C ABI socket"],
+    "rationale": "Realm's 100k developers / 350 payers / USD 39M exit is the failure mode; a metered SaaS is Algolia's game. The library stays permissive so a managed cloud can ship it, the same reason TigerData built pg_textsearch beside ParadeDB AGPL."
+  },
+  "open_question": [
+    "Should additive COUNT exports bump ABI_VERSION from 14, or keep 14 as range-facet did when it added four symbols?",
+    "Do Searcher-level C ABI symbols (idx_searcher_count_any) belong in this cut, or is CLI-in-process plus Handle-level WASM enough?",
+    "Is Typesense `found` exact for ordinary keyword search, or only documented as an integer with a 2% caveat on group_by?",
+    "Will any in-house consumer actually print the integer, or does COUNT-on-ABI sit unused like the empty onegrid socket?"
+  ],
+  "handoff": {
+    "setup_preset": "node-cli",
+    "roadmap_p0": [
+      "Export Index::count_any / count_all through idx_count_any / idx_count_all and js/index.mjs",
+      "Add Searcher::count_any / count_all and index search --count",
+      "Gate with js/smoke.mjs plus scripts/cli-smoke.sh on a fixture whose integer is known"
+    ]
+  },
+  "research": {
+    "agent_count": 4,
+    "claim_count": 28,
+    "downgraded_count": 1,
+    "dedupe_count": 9
+  }
+}

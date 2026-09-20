@@ -44,7 +44,9 @@ pub mod searcher;
 
 pub use analyze::{fold, parse_quantity, tokenize, AliasTable, BaseUnit, Quantity, Token};
 pub use dict::{max_edit_for, TermDict, TermMatch};
-pub use format::{encode_posting_offset, posting_span, read_section_table, SectionTable, Span, MAGIC};
+pub use format::{
+    crc32, encode_posting_offset, posting_span, read_section_table, SectionTable, Span, MAGIC,
+};
 pub use fuse::{convex, rrf, RRF_K};
 pub use index::{
     Doc, FacetClause, Field, Hit, Index, IndexBuilder, Schema, MAX_COLUMN, MAX_FIELD,

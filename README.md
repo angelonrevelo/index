@@ -30,6 +30,8 @@ curl -s /api/product | jq -c '.[]'         | index build -d data/ --jsonl ...
 index build -d data/ --sql --table product   --schema 'sku:0:0.6,name:3:0.4,brand:1:0.6' --key sku --facet brand < dump.sql
 
 index search -d data/ 'colgaye tothpaste'  # typo-corrected, from the shell
+index search -d data/ --count any toothpaste
+index search -d data/ --count phrase 'colgate total'   # needs --position at build
 ```
 
 **Keep it current from whatever already emits changes**, rather than rebuilding:
@@ -550,7 +552,8 @@ production corpora. **`index-core` remains dependency-free.**
   comparable. At 1.84 GB this engine measures 3,774 QPS / 6.0 ms, and cost is linear in postings, so
   8.0 GB projects to ~870 QPS / ~26 ms. Building the full 8.0 GB corpus needs ~28 GB of peak memory,
   more than this 24 GB Mac has. Phrase queries are the slowest kind, at 4x the conjunction p99.
-  `count_any` / `count_all` are Rust-only. See [`docs/benchmarks.md`](docs/benchmarks.md) §7.
+  COUNT is on the ABI/CLI (`p94`/`p95`); the Wikipedia COUNT **gap is still ~12x**. The still-open
+  plan is [`p97-tin-parity.md`](bench/roadmap/p97-tin-parity.md). See [`docs/benchmarks.md`](docs/benchmarks.md) §7.
 - **Nothing is deployed.** All four integrations are measurements on throwaway worktree branches; no
   `main` was modified and no PR opened. [`docs/adoption.md`](docs/adoption.md) has the per-app plan,
   gate, cost and rollback so that becomes one decision rather than an investigation.

@@ -120,6 +120,43 @@ export class SearchIndex {
   }
 
   /**
+   * Exact COUNT(*) of live documents containing ANY query token. No typo expansion, no ranking.
+   * An empty query returns 0.
+   */
+  countAny(query) {
+    const n = this.#withStr(query, (qp, ql) =>
+      u32(this.#exports.idx_count_any(this.#handle, qp, ql)),
+    );
+    if (n === ERR) throw new Error('idx_count_any failed (bad handle or non-UTF-8 query)');
+    return n;
+  }
+
+  /**
+   * Exact COUNT(*) of live documents containing EVERY query token. A token absent from the
+   * dictionary makes the answer 0.
+   */
+  countAll(query) {
+    const n = this.#withStr(query, (qp, ql) =>
+      u32(this.#exports.idx_count_all(this.#handle, qp, ql)),
+    );
+    if (n === ERR) throw new Error('idx_count_all failed (bad handle or non-UTF-8 query)');
+    return n;
+  }
+
+  /**
+   * Exact COUNT(*) of live documents containing the query's tokens consecutive and in order in
+   * one field. Requires `build(..., { position: true })`. Without positions this returns 0 and
+   * does not fall back to `countAll`.
+   */
+  countPhrase(query) {
+    const n = this.#withStr(query, (qp, ql) =>
+      u32(this.#exports.idx_count_phrase(this.#handle, qp, ql)),
+    );
+    if (n === ERR) throw new Error('idx_count_phrase failed (bad handle or non-UTF-8 query)');
+    return n;
+  }
+
+  /**
    * Run a query.
    * @param {string} query
    * @param {{k?: number, prefix?: boolean}} opt  `prefix` enables typeahead on the last token.

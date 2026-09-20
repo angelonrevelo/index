@@ -1,3 +1,5 @@
+`public-catalog.*` — 20 DummyJSON products (https://dummyjson.com/products?limit=20), frozen 2026-09-20.
+
 # Fixtures — where the geometry came from
 
 These are not synthetic. Every coordinate here was extracted from **maphy**'s own working tree on

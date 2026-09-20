@@ -26,6 +26,8 @@ const check = (ok, msg) => {
 const want = [
   'memory', 'idx_abi_version', 'idx_alloc', 'idx_free', 'idx_open', 'idx_close',
   'idx_search', 'idx_result_ptr', 'idx_result_len', 'idx_doc_count', 'idx_term_count',
+  'idx_count_any', 'idx_count_all', 'idx_count_phrase',
+  'idx_searcher_count_any', 'idx_searcher_count_all', 'idx_searcher_count_phrase',
   'idx_build_new', 'idx_build_add', 'idx_build_finish', 'idx_build_free', 'idx_serialize',
   'idx_build_facet', 'idx_search_facet', 'idx_search_facet_all', 'idx_facet_tally',
   'idx_facet_count', 'idx_facet_slot_count',
@@ -64,6 +66,12 @@ check(u32(e.idx_doc_count(0)) === 0, 'a null handle returns 0 rather than trappi
 // WASM returns i32: u32::MAX arrives as -1 unless coerced. Asserting the raw value here is the
 // point — it is how the sentinel silently stopped being recognisable in the first draft.
 check(u32(e.idx_search(0, 0, 0, 5, 0)) === 0xffffffff, 'search on a null handle returns the sentinel');
+check(u32(e.idx_count_any(0, 0, 0)) === 0xffffffff, 'count_any on a null handle returns the sentinel');
+check(u32(e.idx_count_all(0, 0, 0)) === 0xffffffff, 'count_all on a null handle returns the sentinel');
+check(u32(e.idx_count_phrase(0, 0, 0)) === 0xffffffff, 'count_phrase on a null handle returns the sentinel');
+check(u32(e.idx_searcher_count_any(0, 0, 0)) === 0xffffffff, 'searcher count_any on a null handle returns the sentinel');
+check(u32(e.idx_searcher_count_all(0, 0, 0)) === 0xffffffff, 'searcher count_all on a null handle returns the sentinel');
+check(u32(e.idx_searcher_count_phrase(0, 0, 0)) === 0xffffffff, 'searcher count_phrase on a null handle returns the sentinel');
 
 // ---- Build an index from JavaScript, then search it -------------------------------------------
 //
@@ -132,6 +140,19 @@ check(topDoc(n) === 0, 'the Colgate document still ranks first with two typos');
 
 n = search('Pancit Canton');
 check(n > 0 && topDoc(n) === 2, 'a different query ranks its own document first');
+
+const count = (sym, q) => {
+  const [qp, ql] = put(q);
+  const c = u32(e[sym](h, qp, ql));
+  e.idx_free(qp, ql);
+  return c;
+};
+check(count('idx_count_any', 'toothpaste') === 1, 'count_any(toothpaste) is 1 on the four-row fixture');
+check(count('idx_count_any', 'colgate soap') === 2, 'count_any unions two brands');
+check(count('idx_count_all', 'colgate toothpaste') === 1, 'count_all requires every token');
+check(count('idx_count_all', 'colgate soap') === 0, 'count_all of two disjoint brands is 0');
+check(count('idx_count_any', '') === 0, 'count_any of an empty query is 0');
+check(count('idx_count_all', 'nosuchword') === 0, 'count_all of an absent token is 0');
 
 // ---- Faceting: the interaction shopping search actually is ------------------------------------
 // Rebuild with a facet on the brand field, then filter and count -- the same three calls a
@@ -395,6 +416,16 @@ e.idx_close(h);
   };
 
   check(sSearch('Toothpaste').length === 4, 'a query reaches every segment');
+
+  const sCount = (sym, q) => {
+    const [qp, ql] = put(q);
+    const c = u32(e[sym](sr, qp, ql));
+    e.idx_free(qp, ql);
+    return c;
+  };
+  check(sCount('idx_searcher_count_any', 'toothpaste') === 4, 'searcher count_any unions both segments');
+  check(sCount('idx_searcher_count_all', 'colgate toothpaste') === 2, 'searcher count_all spans both segments');
+  check(sCount('idx_searcher_count_any', '') === 0, 'searcher count_any of an empty query is 0');
   // The typo lands on a document that lives in the SECOND segment, at a global ordinal.
   const typo = sSearch('Colgte Travel');
   check(typo[0] === 3, 'a typo query finds a row added after the build, at its global ordinal');
@@ -537,6 +568,48 @@ e.idx_close(h);
   e.idx_close(noPos);
 }
 
+// ---- Phrase COUNT(*) ----------------------------------------------------------------------
+//
+// Both rows contain both words, so count_all is 2 either way. A phrase count that fell back
+// to bag-of-words would report 2 for the reversed order and 2 without positions.
+{
+  const spec = 'name:3:0.4';
+  const row = ['Colgate Total Toothpaste', 'Total Colgate Toothpaste'];
+  const mk = (positions) => {
+    const [sp, sl] = put(spec);
+    const b = u32(e.idx_build_new(sp, sl));
+    e.idx_free(sp, sl);
+    if (positions) check(u32(e.idx_build_position(b)) === 1, 'phrase-count fixture records positions');
+    for (const r of row) {
+      const [dp, dl] = put(r);
+      e.idx_build_add(b, dp, dl);
+      e.idx_free(dp, dl);
+    }
+    return u32(e.idx_build_finish(b));
+  };
+  const withPos = mk(true);
+  const noPos = mk(false);
+  const phraseCount = (h, q) => {
+    const [qp, ql] = put(q);
+    const c = u32(e.idx_count_phrase(h, qp, ql));
+    e.idx_free(qp, ql);
+    return c;
+  };
+  const allCount = (h, q) => {
+    const [qp, ql] = put(q);
+    const c = u32(e.idx_count_all(h, qp, ql));
+    e.idx_free(qp, ql);
+    return c;
+  };
+  check(allCount(withPos, 'Colgate Total') === 2, 'count_all of the phrase fixture is 2 either way');
+  check(phraseCount(withPos, 'Colgate Total') === 1, 'count_phrase(Colgate Total) is 1');
+  check(phraseCount(withPos, 'Total Colgate') === 1, 'count_phrase(Total Colgate) is 1 — the reversed row, not 2');
+  check(phraseCount(noPos, 'Colgate Total') === 0, 'without positions count_phrase is 0, not count_all');
+  check(allCount(noPos, 'Colgate Total') === 2, 'without positions count_all is still 2');
+  e.idx_close(withPos);
+  e.idx_close(noPos);
+}
+
 // ---- Application keys: saying WHICH ROW changed ------------------------------------------------
 //
 // A host receiving "row sku-1 changed" has the key and nothing else. Before p53 it could search but
@@ -618,6 +691,10 @@ e.idx_close(h);
   check(ix.docCount === 4, 'the shipped host builds an index at the current ABI');
   const hit = ix.search('Colgate Toothpaste');
   check(hit.length > 0 && hit[0].label !== null, 'the shipped host decodes hits and labels');
+  check(ix.countAny('toothpaste') === 4, 'the shipped host countAny(toothpaste) is 4');
+  check(ix.countAny('colgate') === 2, 'the shipped host countAny(colgate) is 2');
+  check(ix.countAll('colgate toothpaste') === 2, 'the shipped host countAll(colgate toothpaste) is 2');
+  check(ix.countAny('') === 0, 'the shipped host countAny of an empty query is 0');
 
   // The facet field must be declared at build time, so this host's build() cannot filter on one
   // yet -- it exposes no facet hook. Paging needs none, and is checked here in full.
@@ -641,6 +718,9 @@ e.idx_close(h);
   check(px.searchPhrase('Colgate Total').length === 1, 'the shipped host answers a phrase');
   check(px.searchPhrase('Total Colgate').length === 0, 'and refuses the words in the wrong order');
   check(ix.searchPhrase('Colgate Total').length === 0, 'an index built without positions refuses it');
+  check(px.countPhrase('Colgate Total') === 1, 'the shipped host countPhrase(Colgate Total) is 1');
+  check(px.countPhrase('Total Colgate') === 0, 'the shipped host countPhrase(Total Colgate) is 0');
+  check(ix.countPhrase('Colgate Total') === 0, 'the shipped host countPhrase without positions is 0');
   px.close();
 
   let refused = false;

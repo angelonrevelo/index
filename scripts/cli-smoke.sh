@@ -47,6 +47,21 @@ keys() { "$IDX" search -d "$1" -k 50 "$2" 2>/dev/null | cut -f2 | sort | tr '\n'
 
 check "an index is built from a pipe"          "$(keys "$WORK/data" toothpaste)"  "A-1 A-2 A-3 "
 check "typos are corrected"                    "$(keys "$WORK/data" 'colgaye')"   "A-1 A-2 "
+check "count any toothpaste is exact"          "$("$IDX" search -d "$WORK/data" --count any toothpaste 2>/dev/null)" "3"
+check "count all colgate toothpaste is exact"  "$("$IDX" search -d "$WORK/data" --count all 'colgate toothpaste' 2>/dev/null)" "2"
+check "count any of an absent token is 0"      "$("$IDX" search -d "$WORK/data" --count any nosuchword 2>/dev/null)" "0"
+
+# Phrase COUNT needs positions. The second row has both words, not consecutive in reverse order,
+# so a fallback to count_all would report 1 for "total colgate" instead of 0.
+cat > "$WORK/phrase.csv" <<'CSV'
+sku,name,brand,price
+P-1,Colgate Total Toothpaste,Colgate,119.5
+P-2,Total Toothpaste Colgate,Colgate,89.0
+CSV
+"$IDX" build -d "$WORK/phrase" --schema "$SCHEMA" --key sku --position \
+  < "$WORK/phrase.csv" 2>/dev/null
+check "count phrase colgate total is 1"        "$("$IDX" search -d "$WORK/phrase" --count phrase 'colgate total' 2>/dev/null)" "1"
+check "count phrase total colgate is 0"        "$("$IDX" search -d "$WORK/phrase" --count phrase 'total colgate' 2>/dev/null)" "0"
 
 # ---- apply a change stream ---------------------------------------------------------------------
 # Deliberately includes the ordering hazard: A-9 is inserted and deleted in the SAME stream and
@@ -157,6 +172,77 @@ SQL
 check "INSERT rows from a dump are indexed"    "$(keys "$WORK/sqldata" colgate)"   "S-1 S-2 "
 check "a COPY block's rows are indexed"        "$(keys "$WORK/sqldata" aquafresh)" "S-3 "
 check "dump typos are corrected"               "$(keys "$WORK/sqldata" 'colgaye')" "S-1 S-2 "
+
+# ---- public catalog, every printed-row shape (DummyJSON freeze) ---------------------------------
+# The README claim: psql COPY CSV, sqlite3 CSV, mysql -B TSV, mongoexport JSONL, a SQL dump.
+# Live database clients are not assumed; the pipe *shape* is the integration. The 20-row freeze
+# is a real public catalog (dummyjson.com/products), not a synthetic grocery list.
+FIX="bench/fixture"
+PUB_SCHEMA='sku:0:0.6,name:3:0.4,brand:1:0.6,price:0:0.6'
+"$IDX" build -d "$WORK/pc-csv" --schema "$PUB_SCHEMA" --key sku --facet brand --numeric price \
+  < "$FIX/public-catalog.csv" 2>/dev/null
+"$IDX" build -d "$WORK/pc-tsv" --tsv --schema "$PUB_SCHEMA" --key sku --facet brand --numeric price \
+  < "$FIX/public-catalog.tsv" 2>/dev/null
+"$IDX" build -d "$WORK/pc-jsonl" --jsonl --schema "$PUB_SCHEMA" --key sku --facet brand --numeric price \
+  < "$FIX/public-catalog.jsonl" 2>/dev/null
+"$IDX" build -d "$WORK/pc-sql" --sql --table public.product \
+  --schema "$PUB_SCHEMA" --key sku --facet brand --numeric price \
+  < "$FIX/public-catalog.sql" 2>/dev/null
+
+MASCARA=BEA-ESS-ESS-001
+OIL=GRO-BRD-COO-020
+check "csv pipe finds mascara"                 "$(keys "$WORK/pc-csv" mascara)"   "$MASCARA "
+check "tsv pipe (mysql -B) finds mascara"      "$(keys "$WORK/pc-tsv" mascara)"   "$MASCARA "
+check "jsonl pipe (mongoexport) finds mascara" "$(keys "$WORK/pc-jsonl" mascara)" "$MASCARA "
+check "sql dump finds mascara"                 "$(keys "$WORK/pc-sql" mascara)"   "$MASCARA "
+check "public catalog typos still work"        "$(keys "$WORK/pc-csv" 'mascra')"  "$MASCARA "
+check "csv and tsv agree on lipstick"          "$(keys "$WORK/pc-csv" lipstick)"  "$(keys "$WORK/pc-tsv" lipstick)"
+check "csv and jsonl agree on lipstick"        "$(keys "$WORK/pc-csv" lipstick)"  "$(keys "$WORK/pc-jsonl" lipstick)"
+
+# wal2json operation words (insert/update/delete) on that catalog — same membership as rebuild.
+cat > "$WORK/pc-changes.jsonl" <<JSONL
+{"op":"update","after":{"sku":"$MASCARA","name":"Essence Mascara Lash Princess Waterproof","brand":"Essence","price":10.99}}
+{"op":"insert","after":{"sku":"21","name":"Temporary Ghost Oil","brand":"Ghost","price":1.0}}
+{"op":"delete","before":{"sku":"21"}}
+{"op":"delete","before":{"sku":"$OIL"}}
+{"op":"insert","after":{"sku":"22","name":"Sensodyne Repair Toothpaste 75g","brand":"Sensodyne","price":249.0}}
+JSONL
+"$IDX" apply -d "$WORK/pc-csv" --jsonl --key after.sku,before.sku \
+  --field sku=after.sku --field name=after.name --field brand=after.brand --field price=after.price \
+  < "$WORK/pc-changes.jsonl" 2>/dev/null
+check "wal2json update is searchable"          "$(keys "$WORK/pc-csv" waterproof)" "$MASCARA "
+check "wal2json insert+delete ends absent"     "$(keys "$WORK/pc-csv" ghost)"      ""
+check "wal2json delete drops cooking oil"      "$(keys "$WORK/pc-csv" 'cooking oil')" ""
+check "wal2json insert is present"             "$(keys "$WORK/pc-csv" sensodyne)"  "22 "
+
+awk -F, -v OFS=, -v m="$MASCARA" -v oil="$OIL" '
+  NR==1 { print; next }
+  $1==m { $2="Essence Mascara Lash Princess Waterproof"; $4="10.99" }
+  $1==oil { next }
+  { print }
+  END { print "22,Sensodyne Repair Toothpaste 75g,Sensodyne,249.0" }
+' "$FIX/public-catalog.csv" > "$WORK/pc-final.csv"
+"$IDX" build -d "$WORK/pc-rebuilt" --schema "$PUB_SCHEMA" --key sku --facet brand --numeric price \
+  < "$WORK/pc-final.csv" 2>/dev/null
+for q in mascara waterproof lipstick ghost sensodyne 'cooking oil' essence; do
+  check "public apply == rebuild for '$q'" "$(keys "$WORK/pc-csv" "$q")" "$(keys "$WORK/pc-rebuilt" "$q")"
+done
+
+# ---- corrupt .idx is refused, not loaded as plausible garbage ----------------------------------
+mkdir -p "$WORK/bad"
+printf 'IDXTXT12xxxx' > "$WORK/bad/0000.idx"
+if "$IDX" search -d "$WORK/bad" mascara >/dev/null 2>"$WORK/bad-search.err"; then
+  echo "  FAIL  search on a truncated idx must exit non-zero"
+  fail=$((fail + 1))
+else
+  echo "  PASS  search on a truncated idx is refused"
+fi
+if "$IDX" stat -d "$WORK/bad" >/dev/null 2>"$WORK/bad-stat.err"; then
+  echo "  FAIL  stat on a truncated idx must exit non-zero"
+  fail=$((fail + 1))
+else
+  echo "  PASS  stat on a truncated idx is refused"
+fi
 
 # ---- refusals: a tool that silently does the wrong thing is worse than one that stops ------------
 if "$IDX" build -d "$WORK/nokey" --schema "$SCHEMA" < "$WORK/rows.csv" 2>/dev/null; then

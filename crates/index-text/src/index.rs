@@ -23,8 +23,8 @@
 //! sorting, degrades better at large k, and Lucene and PISA converged on it independently.
 
 use crate::analyze::{apply_alias, tokenize, tokenize_into, AliasTable, Token};
-use crate::reorder;
 use crate::dict::TermDict;
+use crate::reorder;
 use std::collections::BTreeMap;
 
 /// Smallest amount of work — postings, documents or terms, whichever the caller is iterating —
@@ -64,7 +64,9 @@ fn parallel_thread(work: usize) -> usize {
     if work < 2 * PARALLEL_MIN_WORK {
         return 1;
     }
-    let cpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let cpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     cpu.min(work / PARALLEL_MIN_WORK).max(1)
 }
 
@@ -235,7 +237,11 @@ pub struct Field {
 
 impl Field {
     pub fn new(name: &str, boost: f32, b: f32) -> Self {
-        Field { name: name.to_string(), boost, b }
+        Field {
+            name: name.to_string(),
+            boost,
+            b,
+        }
     }
 }
 
@@ -260,8 +266,16 @@ pub struct Schema {
 
 impl Schema {
     pub fn new(field: Vec<Field>) -> Self {
-        assert!(!field.is_empty() && field.len() <= MAX_FIELD, "1..={MAX_FIELD} fields");
-        Schema { field, unscored: Vec::new(), k1: 0.9, typo_penalty: 0.6 }
+        assert!(
+            !field.is_empty() && field.len() <= MAX_FIELD,
+            "1..={MAX_FIELD} fields"
+        );
+        Schema {
+            field,
+            unscored: Vec::new(),
+            k1: 0.9,
+            typo_penalty: 0.6,
+        }
     }
 
     /// Declare an **unscored column**: a stored value that can be faceted, ranged or keyed on
@@ -315,7 +329,10 @@ impl Schema {
     pub fn column_name(&self, column: usize) -> Option<&str> {
         match self.field.get(column) {
             Some(f) => Some(f.name.as_str()),
-            None => self.unscored.get(column - self.field.len()).map(String::as_str),
+            None => self
+                .unscored
+                .get(column - self.field.len())
+                .map(String::as_str),
         }
     }
 
@@ -482,7 +499,9 @@ pub struct Doc {
 
 impl Doc {
     pub fn new(field_text: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        Doc { field_text: field_text.into_iter().map(Into::into).collect() }
+        Doc {
+            field_text: field_text.into_iter().map(Into::into).collect(),
+        }
     }
 }
 
@@ -573,7 +592,10 @@ impl IndexBuilder {
     /// Must be set before the first document is added -- positions cannot be recovered afterwards,
     /// because the analyzed tokens are not kept.
     pub fn with_position(mut self) -> Self {
-        assert!(self.set_position(), "positions must be enabled before the first document");
+        assert!(
+            self.set_position(),
+            "positions must be enabled before the first document"
+        );
         self
     }
     /// Toggle recursive graph bisection of the term-document graph at build time (default
@@ -588,7 +610,6 @@ impl IndexBuilder {
         self.reorder_on = on;
         self
     }
-
 
     /// Non-consuming [`IndexBuilder::with_position`], for the C ABI. Returns `false` once a
     /// document has been added, rather than panicking -- a trap kills the whole WASM instance.
@@ -803,7 +824,11 @@ impl IndexBuilder {
     /// `1..=4` and `100..=400` rank identically.
     pub fn add_with_prior(&mut self, doc: &Doc, prior: f32) -> u32 {
         let id = self.add(doc);
-        let p = if prior.is_finite() && prior > 0.0 { prior } else { 1.0 };
+        let p = if prior.is_finite() && prior > 0.0 {
+            prior
+        } else {
+            1.0
+        };
         self.raw_prior[id as usize] = p;
         id
     }
@@ -817,7 +842,12 @@ impl IndexBuilder {
         // Taken out of `self` for the duration so the token buffer, `term_post` and `term_pos` are
         // three plainly disjoint borrows; put back below, so the next document reuses it.
         let mut tok = std::mem::take(&mut self.tok_buf);
-        for (fi, text) in doc.field_text.iter().enumerate().take(self.schema.field_count()) {
+        for (fi, text) in doc
+            .field_text
+            .iter()
+            .enumerate()
+            .take(self.schema.field_count())
+        {
             // The tokens are `tok[..n]`. `tok.len()` is the high-water mark of every field seen so
             // far, retained as scratch on purpose — see [`tokenize_into`].
             let n = tokenize_into(text, &mut tok);
@@ -861,7 +891,10 @@ impl IndexBuilder {
                 if let Some(post) = self.term_post.get_mut(t.text.as_str()) {
                     post.hit(id, fi);
                 } else {
-                    self.term_post.entry(t.text.clone()).or_default().hit(id, fi);
+                    self.term_post
+                        .entry(t.text.clone())
+                        .or_default()
+                        .hit(id, fi);
                 }
             }
         }
@@ -871,13 +904,22 @@ impl IndexBuilder {
         self.first_text.push(first);
         self.facet_text.push(facet);
         if let Some(f) = self.key_field {
-            self.key_store
-                .push(doc.field_text.get(f).map(|t| t.trim().to_string()).unwrap_or_default());
+            self.key_store.push(
+                doc.field_text
+                    .get(f)
+                    .map(|t| t.trim().to_string())
+                    .unwrap_or_default(),
+            );
         }
         self.facet_store.push(
             self.facet_field
                 .iter()
-                .map(|&f| doc.field_text.get(f).map(|t| t.trim().to_string()).unwrap_or_default())
+                .map(|&f| {
+                    doc.field_text
+                        .get(f)
+                        .map(|t| t.trim().to_string())
+                        .unwrap_or_default()
+                })
                 .collect(),
         );
         self.numeric_store.push(
@@ -909,7 +951,9 @@ impl IndexBuilder {
         posting: &[Vec<Posting>],
     ) -> Vec<(String, Vec<u32>)> {
         use std::collections::HashMap;
-        let Some((_, top_k)) = cfg else { return Vec::new() };
+        let Some((_, top_k)) = cfg else {
+            return Vec::new();
+        };
         if top_k == 0 || facet.is_empty() {
             return Vec::new();
         }
@@ -935,7 +979,11 @@ impl IndexBuilder {
                 if f.is_empty() {
                     continue;
                 }
-                *per_value.entry(f).or_default().entry(tid as u32).or_default() += 1;
+                *per_value
+                    .entry(f)
+                    .or_default()
+                    .entry(tid as u32)
+                    .or_default() += 1;
             }
         }
 
@@ -981,7 +1029,9 @@ impl IndexBuilder {
         if max <= 0.0 || raw.iter().all(|&p| p == max) {
             return Vec::new(); // uniform: nothing to store and nothing to apply
         }
-        raw.into_iter().map(|p| (p / max).clamp(f32::MIN_POSITIVE, 1.0)).collect()
+        raw.into_iter()
+            .map(|p| (p / max).clamp(f32::MIN_POSITIVE, 1.0))
+            .collect()
     }
 
     pub fn build(mut self) -> Result<Index, String> {
@@ -1009,8 +1059,10 @@ impl IndexBuilder {
         // per-document quantities; only the doc-id ORDER moves.
         if self.reorder_on {
             let n = self.doc_len.len();
-            let ids: Vec<Vec<u32>> =
-                posting.iter().map(|l| l.iter().map(|p| p.doc).collect()).collect();
+            let ids: Vec<Vec<u32>> = posting
+                .iter()
+                .map(|l| l.iter().map(|p| p.doc).collect())
+                .collect();
             let refs: Vec<&[u32]> = ids.iter().map(|l| &l[..]).collect();
             let perm = reorder::graph_bisect_permutation(n, &refs);
             let identity = (0..n as u32).collect::<Vec<_>>();
@@ -1022,9 +1074,7 @@ impl IndexBuilder {
                         .map(|(p, t)| (perm[p.doc as usize], *t))
                         .collect();
                     joint.sort_unstable_by_key(|(d, _)| *d);
-                    for ((p, tf), (d, t)) in
-                        docs.iter_mut().zip(tfs.iter_mut()).zip(joint)
-                    {
+                    for ((p, tf), (d, t)) in docs.iter_mut().zip(tfs.iter_mut()).zip(joint) {
                         p.doc = d;
                         *tf = t;
                     }
@@ -1169,9 +1219,10 @@ impl IndexBuilder {
                 par_index_map(first_text.len(), first_text.len(), |d| {
                     match first_text[d].is_empty() {
                         true => u32::MAX,
-                        false => {
-                            term.binary_search(&first_text[d]).map(|i| i as u32).unwrap_or(u32::MAX)
-                        }
+                        false => term
+                            .binary_search(&first_text[d])
+                            .map(|i| i as u32)
+                            .unwrap_or(u32::MAX),
                     }
                 })
             },
@@ -1191,6 +1242,9 @@ impl IndexBuilder {
             key_field: self.key_field.unwrap_or(usize::MAX),
             key_order: Vec::new(),
             collection_size: None,
+            term_df: Vec::new(),
+            term_page: Vec::new(),
+            term_page_word: 0,
         };
         ix.rebuild_meta();
         Ok(ix)
@@ -1356,6 +1410,14 @@ pub struct Index {
     /// summing it across segments needs each term's TEXT and the dictionary stores an FST rather
     /// than the strings. That is the remaining gap, and `p52` measures what it leaves behind.
     collection_size: Option<usize>,
+    /// Stored document frequency per term (`posting[t].len()` at build). COUNT of a live,
+    /// undeleted term is this integer — it does not walk the list.
+    term_df: Vec<u32>,
+    /// Page bitmaps for COUNT work-elision: `term_page_word` `u64`s per term, bit `doc / 64`.
+    /// Two terms whose page maps share no bits have disjoint documents, so a disjunction COUNT is
+    /// the sum of stored dfs.
+    term_page: Vec<u64>,
+    term_page_word: usize,
     /// Per numeric slot, every document that HAS a finite value there, ascending by value.
     ///
     /// **Derived, never serialized**, exactly like `block_max`: it is a sort of a column the index
@@ -1381,7 +1443,10 @@ impl Index {
     #[inline]
     fn exact_field_factor(&self, doc: u32, bucket: u32, group_count: usize) -> f32 {
         let exact = bucket == 0
-            && self.doc_len.get(doc as usize).is_some_and(|l| l[0] as usize == group_count);
+            && self
+                .doc_len
+                .get(doc as usize)
+                .is_some_and(|l| l[0] as usize == group_count);
         if exact {
             1.0
         } else {
@@ -1648,12 +1713,20 @@ pub struct FacetClause<'a> {
 impl<'a> FacetClause<'a> {
     /// A clause satisfied by any of `value`.
     pub fn any(slot: usize, value: &'a [&'a str]) -> Self {
-        FacetClause { slot, value, exclude: false }
+        FacetClause {
+            slot,
+            value,
+            exclude: false,
+        }
     }
 
     /// A clause satisfied by documents matching none of `value`.
     pub fn none(slot: usize, value: &'a [&'a str]) -> Self {
-        FacetClause { slot, value, exclude: true }
+        FacetClause {
+            slot,
+            value,
+            exclude: true,
+        }
     }
 }
 
@@ -1780,7 +1853,10 @@ impl Ord for Candidate {
         // entirely. Caught by `block_max_pruning_agrees_with_exhaustive_or_at_scale`, which showed
         // a *missing* document rather than a reordered one — and the block-skip logic was suspected
         // first and was innocent.
-        other.score.total_cmp(&self.score).then(self.doc.cmp(&other.doc))
+        other
+            .score
+            .total_cmp(&self.score)
+            .then(self.doc.cmp(&other.doc))
     }
 }
 
@@ -1801,7 +1877,10 @@ impl PartialOrd for Candidate {
 /// the ranking would have kept. That is the defect `bench/roadmap/p22-prune-consistency.md`
 /// reproduces from 512 decoys and `p23-pool-audit.md` measures at 9.33 % of real presyo queries.
 #[inline]
-fn prune_is_sound(rank_pool: &std::collections::BinaryHeap<RankCandidate>, rank_cap: usize) -> bool {
+fn prune_is_sound(
+    rank_pool: &std::collections::BinaryHeap<RankCandidate>,
+    rank_cap: usize,
+) -> bool {
     rank_pool.len() >= rank_cap && rank_pool.peek().is_some_and(|w| w.0.bucket == 0)
 }
 
@@ -1871,7 +1950,11 @@ impl Ord for RankCandidate {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Root is evicted, so "greater" means "worse by final rank": lower `eff` first, and among
         // equals the HIGHER document id — matching `Candidate` so the two pools agree on ties.
-        other.0.eff.total_cmp(&self.0.eff).then(self.0.doc.cmp(&other.0.doc))
+        other
+            .0
+            .eff
+            .total_cmp(&self.0.eff)
+            .then(self.0.doc.cmp(&other.0.doc))
     }
 }
 
@@ -1971,7 +2054,12 @@ impl Index {
                 .posting
                 .iter()
                 .zip(self.posting_tf.iter())
-                .map(|(l, tfs)| l.iter().zip(tfs.iter()).map(|(p, tf)| (p.doc, *tf)).collect())
+                .map(|(l, tfs)| {
+                    l.iter()
+                        .zip(tfs.iter())
+                        .map(|(p, tf)| (p.doc, *tf))
+                        .collect()
+                })
                 .collect(),
             doc_len: &self.doc_len,
             prior: &self.prior,
@@ -2004,7 +2092,9 @@ impl Index {
             .filter(|&d| !self.doc_key[d as usize].is_empty())
             .collect();
         self.key_order.sort_by(|&a, &b| {
-            self.doc_key[a as usize].cmp(&self.doc_key[b as usize]).then(a.cmp(&b))
+            self.doc_key[a as usize]
+                .cmp(&self.doc_key[b as usize])
+                .then(a.cmp(&b))
         });
     }
 
@@ -2095,6 +2185,9 @@ impl Index {
             doc_len,
             avg_len,
             doc_count,
+            term_df: Vec::new(),
+            term_page: Vec::new(),
+            term_page_word: 0,
         };
         ix.rebuild_meta();
         Ok(ix)
@@ -2113,6 +2206,20 @@ impl Index {
             self.posting_base.push(acc);
         }
 
+        // Stored per-term COUNT + page bitmaps so a live COUNT does not walk postings.
+        let page = self.doc_count.div_ceil(64);
+        let word = page.div_ceil(64).max(1);
+        self.term_page_word = word;
+        self.term_df = self.posting.iter().map(|l| l.len() as u32).collect();
+        self.term_page = vec![0u64; self.posting.len() * word];
+        for (t, list) in self.posting.iter().enumerate() {
+            let base = t * word;
+            for p in list {
+                let pg = p.doc as usize / 64;
+                self.term_page[base + pg / 64] |= 1u64 << (pg % 64);
+            }
+        }
+
         self.rebuild_key_order();
 
         // Value order per numeric column, so a sort can walk documents best-first instead of
@@ -2128,8 +2235,9 @@ impl Index {
         let numeric_work = value.iter().map(Vec::len).sum::<usize>();
         let numeric_order = par_index_map(value.len(), numeric_work, |slot| {
             let column = &value[slot];
-            let mut order: Vec<u32> =
-                (0..column.len() as u32).filter(|&d| column[d as usize].is_finite()).collect();
+            let mut order: Vec<u32> = (0..column.len() as u32)
+                .filter(|&d| column[d as usize].is_finite())
+                .collect();
             order.sort_by(|&a, &b| column[a as usize].total_cmp(&column[b as usize]));
             order
         });
@@ -2188,7 +2296,12 @@ impl Index {
                         idx
                     }
                 };
-                TermMeta { max_sat: term_max, block_last: last, block_max: bmax, champion }
+                TermMeta {
+                    max_sat: term_max,
+                    block_last: last,
+                    block_max: bmax,
+                    champion,
+                }
             })
         };
 
@@ -2310,7 +2423,12 @@ impl Index {
     ///
     /// `prefix_last` applies typeahead semantics to the final token only — Meilisearch's rule, and
     /// the right default for a search-as-you-type box.
-    fn plan(&self, query: &str, prefix_last: bool, cap: usize) -> (Vec<QueryTerm>, Vec<bool>, bool) {
+    fn plan(
+        &self,
+        query: &str,
+        prefix_last: bool,
+        cap: usize,
+    ) -> (Vec<QueryTerm>, Vec<bool>, bool) {
         self.plan_stat(query, prefix_last, cap, None)
     }
 
@@ -2379,7 +2497,12 @@ impl Index {
     /// nothing for the pair. The learned-expansion branch is part of this phase and is flagged
     /// `learned` on its emit entries, because [`Index::term_stat`] has always excluded those terms
     /// from the collection-wide sum while [`Index::weigh`] treats them like any other.
-    pub(crate) fn expand_query(&self, query: &str, prefix_last: bool, want_text: bool) -> QueryExpansion {
+    pub(crate) fn expand_query(
+        &self,
+        query: &str,
+        prefix_last: bool,
+        want_text: bool,
+    ) -> QueryExpansion {
         let mut tok = tokenize(query);
         apply_alias(&mut tok, &self.alias);
         // A group is a "quantity" group when its token parses as a real physical size. A bare
@@ -2405,7 +2528,8 @@ impl Index {
 
         for (ti, t) in tok.iter().enumerate() {
             let is_last = ti + 1 == n;
-            let matches = self.expand_pair(&t.text, t.is_numeric, prefix_last && is_last, want_text);
+            let matches =
+                self.expand_pair(&t.text, t.is_numeric, prefix_last && is_last, want_text);
 
             if matches.is_empty() && t.text.chars().count() >= 4 {
                 if let Some((a, b)) = self.split_compound(&t.text) {
@@ -2415,7 +2539,11 @@ impl Index {
                         group_is_quantity
                             .push(numeric && crate::analyze::parse_quantity(&part).is_some());
                         let m = self.expand_pair(&part, numeric, false, want_text);
-                        emits.push(ExpansionEmit { group: gi, matches: m, learned: false });
+                        emits.push(ExpansionEmit {
+                            group: gi,
+                            matches: m,
+                            learned: false,
+                        });
                     }
                     continue;
                 }
@@ -2424,7 +2552,11 @@ impl Index {
             let gi = group_is_quantity.len() as u16;
             group_is_quantity
                 .push(t.is_numeric && crate::analyze::parse_quantity(&t.text).is_some());
-            emits.push(ExpansionEmit { group: gi, matches, learned: false });
+            emits.push(ExpansionEmit {
+                group: gi,
+                matches,
+                learned: false,
+            });
         }
 
         // --- learned expansion, fired STRICTLY.
@@ -2436,8 +2568,15 @@ impl Index {
         // `bench/roadmap/p17-presyo-expand.md`.
         let mut expanded = false;
         if !self.expansion.is_empty() && !tok.is_empty() {
-            let key = tok.iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
-            if let Ok(at) = self.expansion.binary_search_by(|e| e.0.as_str().cmp(key.as_str())) {
+            let key = tok
+                .iter()
+                .map(|t| t.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if let Ok(at) = self
+                .expansion
+                .binary_search_by(|e| e.0.as_str().cmp(key.as_str()))
+            {
                 // Emitted as an ALTERNATIVE inside every group, not as a group of its own.
                 //
                 // `bucket_of` SUMS a penalty per unsatisfied group, so a group of expansion terms
@@ -2453,7 +2592,13 @@ impl Index {
                     .1
                     .iter()
                     .map(|&term_id| {
-                        (crate::dict::TermMatch { term_id, distance: EXPANSION_DISTANCE }, String::new())
+                        (
+                            crate::dict::TermMatch {
+                                term_id,
+                                distance: EXPANSION_DISTANCE,
+                            },
+                            String::new(),
+                        )
                     })
                     .collect();
                 for gi in 0..group_is_quantity.len() as u16 {
@@ -2467,7 +2612,11 @@ impl Index {
             }
         }
 
-        QueryExpansion { emits, group_is_quantity, expanded }
+        QueryExpansion {
+            emits,
+            group_is_quantity,
+            expanded,
+        }
     }
 
     /// Number of learned facet values, or 0 when expansion was not learned.
@@ -2481,8 +2630,15 @@ impl Index {
     /// direction would need a second structure that nothing else wants.
     pub fn expansion_of(&self, value: &str) -> &[u32] {
         let tok = tokenize(value);
-        let key = tok.iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
-        match self.expansion.binary_search_by(|e| e.0.as_str().cmp(key.as_str())) {
+        let key = tok
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        match self
+            .expansion
+            .binary_search_by(|e| e.0.as_str().cmp(key.as_str()))
+        {
             Ok(at) => &self.expansion[at].1,
             Err(_) => &[],
         }
@@ -2601,7 +2757,10 @@ impl Index {
     ///
     /// Measured tradeoff: `bench/roadmap/p29-expansion-cap.md`.
     pub fn search_capped(&self, query: &str, k: usize, cap: usize) -> Vec<Hit> {
-        self.search_opt(Scan { cap: cap.max(1), ..Scan::new(query, k) })
+        self.search_opt(Scan {
+            cap: cap.max(1),
+            ..Scan::new(query, k)
+        })
     }
 
     /// **Which parts of `text` matched `query`** — byte ranges into `text`, ascending, non-overlapping.
@@ -2638,7 +2797,8 @@ impl Index {
         let mut span: Vec<(usize, usize)> = tok
             .iter()
             .filter(|(t, _, _)| {
-                self.term_id_of(&t.text).is_some_and(|id| want.binary_search(&id).is_ok())
+                self.term_id_of(&t.text)
+                    .is_some_and(|id| want.binary_search(&id).is_ok())
             })
             .map(|(_, a, b)| (*a, *b))
             .collect();
@@ -2705,8 +2865,10 @@ impl Index {
         want: &[(usize, &str)],
         range: &[(usize, f64, f64)],
     ) -> Vec<Hit> {
-        let clause: Vec<FacetClause> =
-            want.iter().map(|(slot, v)| FacetClause::any(*slot, std::slice::from_ref(v))).collect();
+        let clause: Vec<FacetClause> = want
+            .iter()
+            .map(|(slot, v)| FacetClause::any(*slot, std::slice::from_ref(v)))
+            .collect();
         self.search_clause(query, k, 0, &clause, range)
     }
 
@@ -2722,11 +2884,21 @@ impl Index {
         clause: &[FacetClause],
         range: &[(usize, f64, f64)],
     ) -> Vec<Hit> {
-        let Some(filter) = self.resolve_clause(clause) else { return Vec::new() };
-        if range.iter().any(|&(slot, _, _)| slot >= self.numeric_value.len()) {
+        let Some(filter) = self.resolve_clause(clause) else {
+            return Vec::new();
+        };
+        if range
+            .iter()
+            .any(|&(slot, _, _)| slot >= self.numeric_value.len())
+        {
             return Vec::new();
         }
-        self.search_opt(Scan { offset, facet: &filter, range, ..Scan::new(query, k) })
+        self.search_opt(Scan {
+            offset,
+            facet: &filter,
+            range,
+            ..Scan::new(query, k)
+        })
     }
 
     /// [`Index::search`] starting at `offset` — page `n` is `offset = n * k`.
@@ -2736,7 +2908,10 @@ impl Index {
     /// is true of every engine without a stored cursor; it is stated here rather than discovered.
     /// For deep paging, filter instead of paging.
     pub fn search_page(&self, query: &str, offset: usize, k: usize) -> Vec<Hit> {
-        self.search_opt(Scan { offset, ..Scan::new(query, k) })
+        self.search_opt(Scan {
+            offset,
+            ..Scan::new(query, k)
+        })
     }
 
     /// **Sort by a numeric column** instead of by relevance: "price, low to high".
@@ -2772,10 +2947,16 @@ impl Index {
         if k == 0 {
             return Vec::new();
         }
-        let Some(column) = self.numeric_value.get(slot) else { return Vec::new() };
-        let clause: Vec<FacetClause> =
-            want.iter().map(|(slot, v)| FacetClause::any(*slot, std::slice::from_ref(v))).collect();
-        let Some(filter) = self.resolve_clause(&clause) else { return Vec::new() };
+        let Some(column) = self.numeric_value.get(slot) else {
+            return Vec::new();
+        };
+        let clause: Vec<FacetClause> = want
+            .iter()
+            .map(|(slot, v)| FacetClause::any(*slot, std::slice::from_ref(v)))
+            .collect();
+        let Some(filter) = self.resolve_clause(&clause) else {
+            return Vec::new();
+        };
 
         let (term, group_is_quantity, _) = self.plan(query, false, MAX_EXPANSION);
         if term.is_empty() {
@@ -2802,18 +2983,43 @@ impl Index {
         //
         // The two arms must agree exactly, ties included. `sorted_arms_agree_document_for_document`
         // is the differential test that says so, and is the only reason this is safe to ship.
-        let df: usize = term.iter().map(|t| self.posting[t.term_id as usize].len()).sum();
+        let df: usize = term
+            .iter()
+            .map(|t| self.posting[t.term_id as usize].len())
+            .sum();
         let live = self.live_count().max(1);
-        let order = self.numeric_order.get(slot).map(Vec::as_slice).unwrap_or(&[]);
+        let order = self
+            .numeric_order
+            .get(slot)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         let walk_cost = match df {
             0 => usize::MAX,
-            _ => order.len().min(k.saturating_mul(live) / df + k).saturating_mul(term.len().max(1)),
+            _ => order
+                .len()
+                .min(k.saturating_mul(live) / df + k)
+                .saturating_mul(term.len().max(1)),
         };
         match !order.is_empty() && walk_cost < df {
-            true => self
-                .sorted_by_walk(order, k, ascending, &term, &group_is_quantity, column, &filter, range),
-            false => self
-                .sorted_by_scan(k, ascending, &term, &group_is_quantity, column, &filter, range),
+            true => self.sorted_by_walk(
+                order,
+                k,
+                ascending,
+                &term,
+                &group_is_quantity,
+                column,
+                &filter,
+                range,
+            ),
+            false => self.sorted_by_scan(
+                k,
+                ascending,
+                &term,
+                &group_is_quantity,
+                column,
+                &filter,
+                range,
+            ),
         }
     }
 
@@ -2849,7 +3055,9 @@ impl Index {
                 if !column.get(p.doc as usize).is_some_and(|v| v.is_finite()) {
                     continue;
                 }
-                let e = acc.entry(p.doc).or_insert_with(|| (0.0, vec![u8::MAX; group_count]));
+                let e = acc
+                    .entry(p.doc)
+                    .or_insert_with(|| (0.0, vec![u8::MAX; group_count]));
                 e.0 += (t.weight * p.sat) as f64;
                 let g = t.group as usize;
                 e.1[g] = e.1[g].min(t.distance);
@@ -2873,7 +3081,11 @@ impl Index {
         // Ties broken by rank, then by doc id, so a page of equally priced items is still ordered
         // by how well it matches and is stable across runs.
         hit.sort_by(|a, b| {
-            let primary = if ascending { a.0.total_cmp(&b.0) } else { b.0.total_cmp(&a.0) };
+            let primary = if ascending {
+                a.0.total_cmp(&b.0)
+            } else {
+                b.0.total_cmp(&a.0)
+            };
             primary.then_with(|| rank_cmp(&a.1, &b.1))
         });
         hit.truncate(k);
@@ -2966,7 +3178,11 @@ impl Index {
         }
 
         hit.sort_by(|a, b| {
-            let primary = if ascending { a.0.total_cmp(&b.0) } else { b.0.total_cmp(&a.0) };
+            let primary = if ascending {
+                a.0.total_cmp(&b.0)
+            } else {
+                b.0.total_cmp(&a.0)
+            };
             primary.then_with(|| rank_cmp(&a.1, &b.1))
         });
         hit.truncate(k);
@@ -2995,15 +3211,29 @@ impl Index {
         if k == 0 {
             return Vec::new();
         }
-        let Some(column) = self.numeric_value.get(slot) else { return Vec::new() };
+        let Some(column) = self.numeric_value.get(slot) else {
+            return Vec::new();
+        };
         let (term, group_is_quantity, _) = self.plan(query, false, MAX_EXPANSION);
         if term.is_empty() {
             return Vec::new();
         }
-        let order = self.numeric_order.get(slot).map(Vec::as_slice).unwrap_or(&[]);
+        let order = self
+            .numeric_order
+            .get(slot)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         match walk {
-            true => self
-                .sorted_by_walk(order, k, ascending, &term, &group_is_quantity, column, &[], &[]),
+            true => self.sorted_by_walk(
+                order,
+                k,
+                ascending,
+                &term,
+                &group_is_quantity,
+                column,
+                &[],
+                &[],
+            ),
             false => self.sorted_by_scan(k, ascending, &term, &group_is_quantity, column, &[], &[]),
         }
     }
@@ -3031,7 +3261,9 @@ impl Index {
         if edge.len() < 2 {
             return Vec::new();
         }
-        let Some(column) = self.numeric_value.get(slot) else { return Vec::new() };
+        let Some(column) = self.numeric_value.get(slot) else {
+            return Vec::new();
+        };
         let (term, _, _) = self.plan(query, false, MAX_EXPANSION);
         let mut seen = vec![false; self.doc_count];
         let mut count = vec![0usize; edge.len() - 1];
@@ -3098,7 +3330,10 @@ impl Index {
 
     /// The application's key for `doc`, or `None` if it has none.
     pub fn key_of(&self, doc: u32) -> Option<&str> {
-        self.doc_key.get(doc as usize).map(String::as_str).filter(|k| !k.is_empty())
+        self.doc_key
+            .get(doc as usize)
+            .map(String::as_str)
+            .filter(|k| !k.is_empty())
     }
 
     /// The document carrying `key`, or `None`.
@@ -3125,7 +3360,9 @@ impl Index {
     /// Every key in this index, ascending, with the document that owns it. Used by compaction and
     /// by the shadow-tombstoning in [`Searcher::push`].
     pub fn key_iter(&self) -> impl Iterator<Item = (&str, u32)> + '_ {
-        self.key_order.iter().map(move |&d| (self.doc_key[d as usize].as_str(), d))
+        self.key_order
+            .iter()
+            .map(move |&d| (self.doc_key[d as usize].as_str(), d))
     }
 
     /// How many documents carry a key. Less than `doc_count` when some key fields were blank —
@@ -3308,7 +3545,11 @@ impl Index {
 
     /// The numeric value of a document in a given column, if it has a finite one.
     pub fn numeric_of(&self, doc: u32, slot: usize) -> Option<f64> {
-        self.numeric_value.get(slot)?.get(doc as usize).copied().filter(|v| v.is_finite())
+        self.numeric_value
+            .get(slot)?
+            .get(doc as usize)
+            .copied()
+            .filter(|v| v.is_finite())
     }
 
     /// The stored facet value of a document in slot 0, if it has one.
@@ -3319,9 +3560,11 @@ impl Index {
     /// The stored facet value of a document in a given slot, if it has one.
     pub fn facet_of_at(&self, doc: u32, slot: usize) -> Option<&str> {
         match self.facet_id.get(slot)?.get(doc as usize) {
-            Some(&f) if f != u32::MAX => {
-                self.facet_label.get(slot)?.get(f as usize).map(|s| s.as_str())
-            }
+            Some(&f) if f != u32::MAX => self
+                .facet_label
+                .get(slot)?
+                .get(f as usize)
+                .map(|s| s.as_str()),
             _ => None,
         }
     }
@@ -3359,9 +3602,10 @@ impl Index {
             return Vec::new();
         }
         match self.phrase_term(query) {
-            Some(t) if !t.is_empty() => {
-                self.search_opt(Scan { phrase: &t, ..Scan::new(query, k) })
-            }
+            Some(t) if !t.is_empty() => self.search_opt(Scan {
+                phrase: &t,
+                ..Scan::new(query, k)
+            }),
             _ => Vec::new(),
         }
     }
@@ -3373,9 +3617,11 @@ impl Index {
             return Vec::new();
         }
         match self.phrase_term(query) {
-            Some(t) if !t.is_empty() => {
-                self.search_opt(Scan { phrase: &t, offset, ..Scan::new(query, k) })
-            }
+            Some(t) if !t.is_empty() => self.search_opt(Scan {
+                phrase: &t,
+                offset,
+                ..Scan::new(query, k)
+            }),
             _ => Vec::new(),
         }
     }
@@ -3416,7 +3662,10 @@ impl Index {
 
     /// [`Index::search`], scored against collection-wide statistics.
     pub fn search_with_stat(&self, query: &str, k: usize, stat: &CollectionStat) -> Vec<Hit> {
-        self.search_opt(Scan { stat: Some(stat), ..Scan::new(query, k) })
+        self.search_opt(Scan {
+            stat: Some(stat),
+            ..Scan::new(query, k)
+        })
     }
 
     /// [`Index::search_with_stat`], weighed from an expansion the caller already built.
@@ -3433,12 +3682,25 @@ impl Index {
         k: usize,
         stat: &CollectionStat,
     ) -> Vec<Hit> {
-        self.search_opt(Scan { pre: Some(ex), stat: Some(stat), ..Scan::new(query, k) })
+        self.search_opt(Scan {
+            pre: Some(ex),
+            stat: Some(stat),
+            ..Scan::new(query, k)
+        })
     }
 
     /// [`Index::search_prefix`], scored against collection-wide statistics.
-    pub fn search_prefix_with_stat(&self, query: &str, k: usize, stat: &CollectionStat) -> Vec<Hit> {
-        self.search_opt(Scan { prefix_last: true, stat: Some(stat), ..Scan::new(query, k) })
+    pub fn search_prefix_with_stat(
+        &self,
+        query: &str,
+        k: usize,
+        stat: &CollectionStat,
+    ) -> Vec<Hit> {
+        self.search_opt(Scan {
+            prefix_last: true,
+            stat: Some(stat),
+            ..Scan::new(query, k)
+        })
     }
 
     /// [`Index::search_prefix_with_stat`] from a handed-over expansion, for the same reason as
@@ -3460,11 +3722,25 @@ impl Index {
 
     /// [`Index::search`] with typeahead semantics on the last token.
     pub fn search_prefix(&self, query: &str, k: usize) -> Vec<Hit> {
-        self.search_opt(Scan { prefix_last: true, ..Scan::new(query, k) })
+        self.search_opt(Scan {
+            prefix_last: true,
+            ..Scan::new(query, k)
+        })
     }
 
     fn search_opt(&self, scan: Scan) -> Vec<Hit> {
-        let Scan { query, k, offset, prefix_last, cap, facet, range, phrase, stat, pre } = scan;
+        let Scan {
+            query,
+            k,
+            offset,
+            prefix_last,
+            cap,
+            facet,
+            range,
+            phrase,
+            stat,
+            pre,
+        } = scan;
         // Deep paging is served by over-fetching and dropping: rank order is only known once
         // everything above the page has been scored, so the pool must hold `offset + k`. Cost
         // therefore grows with `offset`, which is true of every engine without a stored cursor and
@@ -3489,7 +3765,11 @@ impl Index {
         // almost always is. Empty when the query is a single group, because then the prefix term
         // IS the whole query and anchoring adds nothing that scoring does not already say.
         let anchor: Vec<u32> = match prefix_last && group_is_quantity.len() > 1 {
-            true => term.iter().filter(|t| t.group == 0).map(|t| t.term_id).collect(),
+            true => term
+                .iter()
+                .filter(|t| t.group == 0)
+                .map(|t| t.term_id)
+                .collect(),
             false => Vec::new(),
         };
         // The SCORING pool. **It no longer carries recall, and that is `p47`.**
@@ -3531,7 +3811,11 @@ impl Index {
         let group_count = group_is_quantity.len().max(1);
 
         // MaxScore requires terms ordered by ascending maximum contribution.
-        term.sort_by(|a, b| a.max_score.partial_cmp(&b.max_score).unwrap_or(std::cmp::Ordering::Equal));
+        term.sort_by(|a, b| {
+            a.max_score
+                .partial_cmp(&b.max_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let mut prefix_sum = vec![0.0f32; term.len() + 1];
         for i in 0..term.len() {
             prefix_sum[i + 1] = prefix_sum[i] + term[i].max_score;
@@ -3825,8 +4109,7 @@ impl Index {
                             // almost always EQUAL. Equality is the common case and it is decidable:
                             // on a bucket tie the comparison falls through to score, which is
                             // exactly what `eff` encodes.
-                            can_skip = canon_score(range_bound)
-                                - range_floor as f32 * bucket_scale
+                            can_skip = canon_score(range_bound) - range_floor as f32 * bucket_scale
                                 <= worst_eff;
                         }
                     }
@@ -3925,7 +4208,12 @@ impl Index {
             {
                 continue;
             }
-            let c = Candidate { eff: eff_of(score, bucket), score, doc: candidate, bucket };
+            let c = Candidate {
+                eff: eff_of(score, bucket),
+                score,
+                doc: candidate,
+                bucket,
+            };
             admit(&mut heap, &mut rank_pool, &mut threshold, pool, rank_cap, c);
         }
 
@@ -3941,7 +4229,11 @@ impl Index {
         merged.dedup_by_key(|c| c.doc);
         let mut heap: Vec<Hit> = merged
             .into_iter()
-            .map(|c| Hit { doc: c.doc, score: c.score, typo_bucket: c.bucket })
+            .map(|c| Hit {
+                doc: c.doc,
+                score: c.score,
+                typo_bucket: c.bucket,
+            })
             .collect();
 
         // Stage two: strict typo bucket first, then score, then doc id for a deterministic
@@ -3960,7 +4252,10 @@ impl Index {
     /// attempts were made on hypotheses about where time went, and only measurement settled it.
     pub fn search_stat(&self, query: &str, k: usize) -> (Vec<Hit>, usize, u64) {
         let (term, _, _) = self.plan(query, false, MAX_EXPANSION);
-        let total: u64 = term.iter().map(|t| self.posting[t.term_id as usize].len() as u64).sum();
+        let total: u64 = term
+            .iter()
+            .map(|t| self.posting[t.term_id as usize].len() as u64)
+            .sum();
         (self.search(query, k), term.len(), total)
     }
 
@@ -3971,9 +4266,20 @@ impl Index {
     /// pools, the typo bucket — and reads posting lists only. Tokens absent from the dictionary
     /// contribute nothing. Measured against TIN's published count row in `p93`.
     pub fn count_any(&self, query: &str) -> usize {
+        self.count_any_cost(query).0
+    }
+
+    /// `(count, posting_entry_visited)`. The stored-df / disjoint-page path visits 0 postings.
+    pub fn count_any_cost(&self, query: &str) -> (usize, usize) {
+        let mut id: Vec<u32> = self.count_token(query).into_iter().flatten().collect();
+        id.sort_unstable();
+        id.dedup();
+        if let Some(n) = self.count_union_stored(&id) {
+            return (n, 0);
+        }
         let list = self.count_list(query);
         let total: usize = list.iter().map(|l| l.len()).sum();
-        match list.len() {
+        let n = match list.len() {
             0 => 0,
             1 => list[0].iter().filter(|p| !self.is_deleted(p.doc)).count(),
             // Dense unions go through a bitmap sized to the corpus; sparse ones are merged, so a
@@ -3996,7 +4302,42 @@ impl Index {
                 doc.dedup();
                 doc.iter().filter(|&&d| !self.is_deleted(d)).count()
             }
+        };
+        (n, total)
+    }
+
+    /// Stored-df / disjoint-page COUNT. `None` when deletions or overlapping pages force a walk.
+    fn count_union_stored(&self, id: &[u32]) -> Option<usize> {
+        if self.deleted_count != 0 {
+            return None;
         }
+        if id.is_empty() {
+            return Some(0);
+        }
+        if self.term_df.len() != self.posting.len() {
+            return None;
+        }
+        if id.len() == 1 {
+            return Some(self.term_df[id[0] as usize] as usize);
+        }
+        let w = self.term_page_word;
+        if w == 0 || self.term_page.len() != self.posting.len() * w {
+            return None;
+        }
+        let mut acc = vec![0u64; w];
+        let mut page_sum = 0u32;
+        for &t in id {
+            let sl = &self.term_page[t as usize * w..][..w];
+            for (a, b) in acc.iter_mut().zip(sl) {
+                *a |= *b;
+            }
+            page_sum += sl.iter().map(|x| x.count_ones()).sum::<u32>();
+        }
+        let or_pages: u32 = acc.iter().map(|x| x.count_ones()).sum();
+        if or_pages != page_sum {
+            return None;
+        }
+        Some(id.iter().map(|&t| self.term_df[t as usize] as usize).sum())
     }
 
     /// **`COUNT(*)` of documents containing EVERY query token**, exactly as written. A token absent
@@ -4011,7 +4352,13 @@ impl Index {
         };
         id.sort_unstable();
         id.dedup();
-        let mut list: Vec<&[Posting]> = id.iter().map(|&t| self.posting[t as usize].as_slice()).collect();
+        if self.deleted_count == 0 && id.len() == 1 && self.term_df.len() == self.posting.len() {
+            return self.term_df[id[0] as usize] as usize;
+        }
+        let mut list: Vec<&[Posting]> = id
+            .iter()
+            .map(|&t| self.posting[t as usize].as_slice())
+            .collect();
         // Shortest first: every candidate comes from the rarest list, and each longer list is
         // probed by a forward-only binary search, so the cost follows the rarest term.
         list.sort_unstable_by_key(|l| l.len());
@@ -4035,6 +4382,41 @@ impl Index {
         n
     }
 
+    /// **`COUNT(*)` of documents containing the query's tokens consecutive and in order in one
+    /// field.** Lucene PhraseQuery with slop 0: order matters; reversed is a different phrase.
+    ///
+    /// No ranking, no typo expansion, no bag-of-words fallback. An index built without positions
+    /// returns 0, matching [`Index::search_phrase`]. An empty query or a token absent from the
+    /// dictionary is 0. Deleted documents are not counted.
+    pub fn count_phrase(&self, query: &str) -> usize {
+        if !self.has_position() {
+            return 0;
+        }
+        let Some(phrase) = self.phrase_term(query) else {
+            return 0;
+        };
+        if phrase.is_empty() {
+            return 0;
+        }
+        // Every candidate comes from the rarest term; `phrase_allows` then checks consecutive
+        // in-order positions in one field. Postings are one entry per document.
+        let rarest = phrase
+            .iter()
+            .copied()
+            .min_by_key(|&t| self.posting[t as usize].len())
+            .expect("non-empty");
+        let mut n = 0;
+        for p in &self.posting[rarest as usize] {
+            if self.is_deleted(p.doc) {
+                continue;
+            }
+            if self.phrase_allows(p.doc, &phrase) {
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// The query's tokens through the index's own analysis, resolved to exact term ids.
     fn count_token(&self, query: &str) -> Vec<Option<u32>> {
         let mut tok = crate::analyze::tokenize(query);
@@ -4047,7 +4429,9 @@ impl Index {
         let mut id: Vec<u32> = self.count_token(query).into_iter().flatten().collect();
         id.sort_unstable();
         id.dedup();
-        id.iter().map(|&t| self.posting[t as usize].as_slice()).collect()
+        id.iter()
+            .map(|&t| self.posting[t as usize].as_slice())
+            .collect()
     }
 
     /// Exhaustive OR scoring — **the same algorithm with the pruning removed.**
@@ -4078,7 +4462,9 @@ impl Index {
                 if self.is_deleted(p.doc) {
                     continue;
                 }
-                let e = acc.entry(p.doc).or_insert_with(|| (0.0, vec![u8::MAX; group_count]));
+                let e = acc
+                    .entry(p.doc)
+                    .or_insert_with(|| (0.0, vec![u8::MAX; group_count]));
                 e.0 += (t.weight * p.sat) as f64;
                 let g = t.group as usize;
                 e.1[g] = e.1[g].min(t.distance);
@@ -4108,7 +4494,9 @@ impl Index {
         let mut acc: BTreeMap<u32, (f64, Vec<u8>)> = BTreeMap::new();
         for t in &term {
             for p in &self.posting[t.term_id as usize] {
-                let e = acc.entry(p.doc).or_insert_with(|| (0.0, vec![u8::MAX; group_count]));
+                let e = acc
+                    .entry(p.doc)
+                    .or_insert_with(|| (0.0, vec![u8::MAX; group_count]));
                 e.0 += (t.weight * p.sat) as f64;
                 let g = t.group as usize;
                 e.1[g] = e.1[g].min(t.distance);
@@ -4152,7 +4540,9 @@ mod tests {
     /// A corpus big enough that `build()` crosses [`PARALLEL_MIN_WORK`] on its posting-side
     /// regions, built from a deterministic recombination so the test is reproducible.
     fn wide_corpus() -> Vec<[String; 3]> {
-        let word = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"];
+        let word = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+        ];
         (0..7_000)
             .map(|i| {
                 let w = |k: usize| word[(i * 7 + k * 13) % word.len()];
@@ -4173,7 +4563,11 @@ mod tests {
         ]);
         let mut b = IndexBuilder::new(schema);
         for row in wide_corpus() {
-            b.add(&Doc::new([row[0].as_str(), row[1].as_str(), row[2].as_str()]));
+            b.add(&Doc::new([
+                row[0].as_str(),
+                row[1].as_str(),
+                row[2].as_str(),
+            ]));
         }
         b.build().unwrap()
     }
@@ -4210,10 +4604,15 @@ mod tests {
 
         assert_eq!(par_index_map(n, 40 * PARALLEL_MIN_WORK, f), serial);
         assert_eq!(par_index_map(n, 0, f), serial);
-        assert_eq!(par_index_map(0, 40 * PARALLEL_MIN_WORK, f), Vec::<f32>::new());
+        assert_eq!(
+            par_index_map(0, 40 * PARALLEL_MIN_WORK, f),
+            Vec::<f32>::new()
+        );
 
         let mut in_place: Vec<f32> = vec![0.0; n];
-        par_slice_mut(&mut in_place, 40 * PARALLEL_MIN_WORK, |i, slot| *slot = f(i));
+        par_slice_mut(&mut in_place, 40 * PARALLEL_MIN_WORK, |i, slot| {
+            *slot = f(i)
+        });
         assert_eq!(in_place, serial);
 
         assert_eq!(parallel_thread(0), 1);
@@ -4234,9 +4633,17 @@ mod tests {
             ("Pepsi", "Pepsi Regular 1.5L", "Inumin"),
             ("Bear Brand", "Bear Brand Powdered Milk 300g", "Gatas"),
             ("Bear Brand", "Bear Brand Powdered Milk 900g", "Gatas"),
-            ("Colgate", "Colgate Total Charcoal Deep Clean 80g", "Toothpaste"),
+            (
+                "Colgate",
+                "Colgate Total Charcoal Deep Clean 80g",
+                "Toothpaste",
+            ),
             ("Nescafe", "Nescafe Classic Reseal 200g", "Kape"),
-            ("Lucky Me", "Lucky Me Pancit Canton Chilimansi 60g", "Instant Noodles"),
+            (
+                "Lucky Me",
+                "Lucky Me Pancit Canton Chilimansi 60g",
+                "Instant Noodles",
+            ),
         ] {
             b.add(&Doc::new([brand, title, cat]));
         }
@@ -4323,7 +4730,10 @@ mod tests {
         assert!(h.iter().any(|x| x.doc == 3 || x.doc == 4), "{h:?}");
 
         let h = ix.search("kape", 5);
-        assert!(h.iter().any(|x| x.doc == 6), "`kape` must reach Nescafe: {h:?}");
+        assert!(
+            h.iter().any(|x| x.doc == 6),
+            "`kape` must reach Nescafe: {h:?}"
+        );
     }
 
     /// The `joined` category in presyo's fixture: users type brand names with no space.
@@ -4331,7 +4741,10 @@ mod tests {
     fn prefix_search_supports_typeahead() {
         let ix = grocery();
         let h = ix.search_prefix("nesc", 5);
-        assert!(h.iter().any(|x| x.doc == 6), "typeahead on a partial brand: {h:?}");
+        assert!(
+            h.iter().any(|x| x.doc == 6),
+            "typeahead on a partial brand: {h:?}"
+        );
     }
 
     #[test]
@@ -4345,7 +4758,10 @@ mod tests {
         b.add(&Doc::new(["Generic", "Pepsi mentioned in the title only"]));
         let ix = b.build().unwrap();
         let h = ix.search("pepsi", 2);
-        assert_eq!(h[0].doc, 0, "a boosted brand-field match must outrank a title-only one: {h:?}");
+        assert_eq!(
+            h[0].doc, 0,
+            "a boosted brand-field match must outrank a title-only one: {h:?}"
+        );
     }
 
     /// Exact field lengths are the reason this scorer exists — prove they are not quantized away.
@@ -4353,7 +4769,9 @@ mod tests {
     fn document_length_affects_score() {
         let mut b = IndexBuilder::new(Schema::new(vec![Field::new("title", 1.0, 0.9)]));
         b.add(&Doc::new(["colgate"]));
-        b.add(&Doc::new(["colgate with many many many other additional trailing words here"]));
+        b.add(&Doc::new([
+            "colgate with many many many other additional trailing words here",
+        ]));
         let ix = b.build().unwrap();
         let h = ix.search("colgate", 2);
         assert_eq!(h.len(), 2);
@@ -4432,10 +4850,17 @@ mod tests {
         b.add(&Doc::new(["purefoods honeycured bacon 1000g"]));
         let ix = b.build().unwrap();
         let h = ix.search("purefoods honeycured bacon roll pack 750g", 2);
-        assert_eq!(h.len(), 2, "no size matches, but the query must still be answered: {h:?}");
+        assert_eq!(
+            h.len(),
+            2,
+            "no size matches, but the query must still be answered: {h:?}"
+        );
         // Both documents pay the same quantity penalty, so it cancels and word overlap decides.
         // Document 0 carries all five query words; document 1 is missing `roll` and `pack`.
-        assert_eq!(h[0].doc, 0, "with size unavailable, word overlap decides: {h:?}");
+        assert_eq!(
+            h[0].doc, 0,
+            "with size unavailable, word overlap decides: {h:?}"
+        );
         assert_eq!(
             h[1].typo_bucket - h[0].typo_bucket,
             2 * super::MISSING_TERM_PENALTY,
@@ -4459,23 +4884,46 @@ mod tests {
         let text = "Colgate Total Toothpaste 150g";
 
         let mark = |q: &str| -> Vec<&str> {
-            ix.highlight(q, text).into_iter().map(|(a, b)| &text[a..b]).collect()
+            ix.highlight(q, text)
+                .into_iter()
+                .map(|(a, b)| &text[a..b])
+                .collect()
         };
 
         assert_eq!(mark("Colgate"), vec!["Colgate"]);
-        assert_eq!(mark("Toothpaste Colgate"), vec!["Colgate", "Toothpaste"], "ascending order");
+        assert_eq!(
+            mark("Toothpaste Colgate"),
+            vec!["Colgate", "Toothpaste"],
+            "ascending order"
+        );
         // The point of doing this through the query planner: a typo highlights the real word.
-        assert_eq!(mark("Colgte"), vec!["Colgate"], "a typo marks the corrected word");
-        assert!(mark("Safeguard").is_empty(), "a term that is not in THIS text marks nothing");
+        assert_eq!(
+            mark("Colgte"),
+            vec!["Colgate"],
+            "a typo marks the corrected word"
+        );
+        assert!(
+            mark("Safeguard").is_empty(),
+            "a term that is not in THIS text marks nothing"
+        );
         assert!(mark("").is_empty(), "an empty query marks nothing");
 
         // Spans are usable directly for wrapping, without overlap or reordering.
         let span = ix.highlight("Colgate Toothpaste", text);
-        assert!(span.windows(2).all(|w| w[0].1 <= w[1].0), "non-overlapping and ascending");
+        assert!(
+            span.windows(2).all(|w| w[0].1 <= w[1].0),
+            "non-overlapping and ascending"
+        );
 
         // Highlighting text the index never saw must not panic.
-        assert!(ix.highlight("Colgate", "some other product entirely").is_empty());
-        assert_eq!(ix.highlight("Colgate", "colgate cheap").len(), 1, "case folds");
+        assert!(ix
+            .highlight("Colgate", "some other product entirely")
+            .is_empty());
+        assert_eq!(
+            ix.highlight("Colgate", "colgate cheap").len(),
+            1,
+            "case folds"
+        );
     }
 
     /// The test that would have caught the panic in `p42`.
@@ -4494,12 +4942,20 @@ mod tests {
         // Scores a hair apart, so many adjacent pairs quantize together.
         let mut x = 1.0f32;
         for i in 0..40u32 {
-            hit.push(Hit { doc: i, score: x, typo_bucket: i % 3 });
+            hit.push(Hit {
+                doc: i,
+                score: x,
+                typo_bucket: i % 3,
+            });
             x = f32::from_bits(x.to_bits() + 1);
         }
         // ... plus a few far apart, so the set is not uniformly tied.
         for (i, s) in [0.0f32, 0.5, 2.0, 1e6].iter().enumerate() {
-            hit.push(Hit { doc: 100 + i as u32, score: *s, typo_bucket: i as u32 % 3 });
+            hit.push(Hit {
+                doc: 100 + i as u32,
+                score: *s,
+                typo_bucket: i as u32 % 3,
+            });
         }
 
         // Antisymmetry and totality.
@@ -4596,12 +5052,19 @@ mod tests {
             let fast = ix.search(&q, 10);
             let slow = ix.search_exhaustive(&q, 10);
             assert_eq!(
-                fast.iter().map(|h| (h.doc, h.typo_bucket)).collect::<Vec<_>>(),
-                slow.iter().map(|h| (h.doc, h.typo_bucket)).collect::<Vec<_>>(),
+                fast.iter()
+                    .map(|h| (h.doc, h.typo_bucket))
+                    .collect::<Vec<_>>(),
+                slow.iter()
+                    .map(|h| (h.doc, h.typo_bucket))
+                    .collect::<Vec<_>>(),
                 "pruned and exhaustive disagree on {q:?}"
             );
             for (a, c) in fast.iter().zip(slow.iter()) {
-                assert!((a.score - c.score).abs() < 1e-3, "score mismatch on {q:?}: {a:?} {c:?}");
+                assert!(
+                    (a.score - c.score).abs() < 1e-3,
+                    "score mismatch on {q:?}: {a:?} {c:?}"
+                );
             }
             if !fast.is_empty() {
                 checked_with_pruning += 1;
@@ -4644,7 +5107,10 @@ mod tests {
     #[test]
     fn compound_splitting_does_not_fire_on_unknown_tokens() {
         let ix = grocery();
-        assert!(ix.search("zzzzqqqq", 3).is_empty(), "an unsplittable unknown must stay unknown");
+        assert!(
+            ix.search("zzzzqqqq", 3).is_empty(),
+            "an unsplittable unknown must stay unknown"
+        );
     }
 
     #[test]
@@ -4668,14 +5134,20 @@ mod tests {
         let ix = b.build().unwrap();
 
         let h = ix.search("quezan", 5);
-        assert_eq!(h[0].doc, 1, "the exact match must win regardless of the prior");
+        assert_eq!(
+            h[0].doc, 1,
+            "the exact match must win regardless of the prior"
+        );
         assert_eq!(h[0].typo_bucket, 0);
         // Only the exact match may come back at all: typo expansion is LAZY, so with an exact hit
         // present the fuzzy alternative is never fired. That is the engine being right, and the
         // first version of this test asserted `h[1]` existed and failed for that reason -- the
         // property under test is "the prior did not promote the typo", not "a typo hit exists".
         for x in h.iter().skip(1) {
-            assert!(x.typo_bucket > 0, "an exact match cannot rank below a typo match");
+            assert!(
+                x.typo_bucket > 0,
+                "an exact match cannot rank below a typo match"
+            );
         }
     }
 
@@ -4700,7 +5172,6 @@ mod tests {
         assert_eq!(ra, rc);
     }
 
-
     /// A miniature of the presyo failure: a category whose members share no word with its name.
     fn baking_corpus() -> IndexBuilder {
         let schema = Schema::new(vec![
@@ -4722,7 +5193,11 @@ mod tests {
             b.add(&Doc::new([n, "baking needs"]));
         }
         // A distractor category that DOES contain the word, to make the query ambiguous.
-        for n in ["baking tray steel", "baking sheet paper", "needs assessment binder"] {
+        for n in [
+            "baking tray steel",
+            "baking sheet paper",
+            "needs assessment binder",
+        ] {
             b.add(&Doc::new([n, "kitchen tools"]));
         }
         b
@@ -4736,7 +5211,11 @@ mod tests {
                 Field::new("category", 1.0, 0.75),
             ]);
             let mut b = IndexBuilder::new(schema);
-            for n in ["camote powder 500g", "sago tapioca 200g", "baking tray steel"] {
+            for n in [
+                "camote powder 500g",
+                "sago tapioca 200g",
+                "baking tray steel",
+            ] {
                 b.add(&Doc::new([n, "x"]));
             }
             b.build().unwrap()
@@ -4749,7 +5228,10 @@ mod tests {
         );
 
         let ix = baking_corpus().build().unwrap();
-        assert!(ix.expansion_count() > 0, "expansion should have been learned");
+        assert!(
+            ix.expansion_count() > 0,
+            "expansion should have been learned"
+        );
         assert!(!ix.expansion_of("baking needs").is_empty());
 
         let hit = ix.search("baking needs", 5);
@@ -4779,13 +5261,20 @@ mod tests {
 
     #[test]
     fn expansion_is_absent_unless_it_is_asked_for() {
-        let schema = Schema::new(vec![Field::new("name", 1.0, 0.5), Field::new("cat", 1.0, 0.75)]);
+        let schema = Schema::new(vec![
+            Field::new("name", 1.0, 0.5),
+            Field::new("cat", 1.0, 0.75),
+        ]);
         let mut b = IndexBuilder::new(schema);
         for n in ["camote powder", "sago tapioca"] {
             b.add(&Doc::new([n, "baking needs"]));
         }
         let ix = b.build().unwrap();
-        assert_eq!(ix.expansion_count(), 0, "opt-in only: no learn_expansion, no table");
+        assert_eq!(
+            ix.expansion_count(),
+            0,
+            "opt-in only: no learn_expansion, no table"
+        );
     }
 
     #[test]
@@ -4799,7 +5288,10 @@ mod tests {
             .filter_map(|t| ix.dict.exact(t))
             .collect();
         for o in own {
-            assert!(!ids.contains(&o), "expansion must not contain the value's own words");
+            assert!(
+                !ids.contains(&o),
+                "expansion must not contain the value's own words"
+            );
         }
     }
 
@@ -4807,7 +5299,10 @@ mod tests {
     /// six unscored columns -- builds, facets and ranges, on a `MAX_FIELD` that did not move.
     #[test]
     fn a_seven_column_schema_fits_in_four_scored_fields() {
-        assert_eq!(MAX_FIELD, 4, "p56 must not be paid for by widening the per-posting array");
+        assert_eq!(
+            MAX_FIELD, 4,
+            "p56 must not be paid for by widening the per-posting array"
+        );
 
         let schema = Schema::new(vec![Field::new("path", 1.0, 0.75)])
             .with_column("format")
@@ -4835,8 +5330,24 @@ mod tests {
             "1080",
             "204800",
         ]));
-        b.add(&Doc::new(["cdn/hero icon.png", "png", "square", "cool", "64", "64", "1024"]));
-        b.add(&Doc::new(["cdn/hero strip.webp", "webp", "landscape", "cool", "1600", "400", "5120"]));
+        b.add(&Doc::new([
+            "cdn/hero icon.png",
+            "png",
+            "square",
+            "cool",
+            "64",
+            "64",
+            "1024",
+        ]));
+        b.add(&Doc::new([
+            "cdn/hero strip.webp",
+            "webp",
+            "landscape",
+            "cool",
+            "1600",
+            "400",
+            "5120",
+        ]));
         let ix = b.build().unwrap();
 
         // Nothing but the path is tokenized: "jpeg" is a stored value, not a searchable term.
@@ -4850,14 +5361,20 @@ mod tests {
 
         assert_eq!(ix.facet_slot_count(), 3);
         assert_eq!(ix.facet_label_at(1), ["landscape", "square"]);
-        let landscape: Vec<u32> =
-            ix.search_facet_at("hero", 5, 1, "landscape").iter().map(|h| h.doc).collect();
+        let landscape: Vec<u32> = ix
+            .search_facet_at("hero", 5, 1, "landscape")
+            .iter()
+            .map(|h| h.doc)
+            .collect();
         assert_eq!(landscape.len(), 2);
         assert!(!landscape.contains(&1));
 
         assert_eq!(ix.numeric_of(0, 0), Some(1920.0), "width");
-        let big: Vec<u32> =
-            ix.search_range("hero", 5, 2, 100_000.0, f64::MAX).iter().map(|h| h.doc).collect();
+        let big: Vec<u32> = ix
+            .search_range("hero", 5, 2, 100_000.0, f64::MAX)
+            .iter()
+            .map(|h| h.doc)
+            .collect();
         assert_eq!(big, vec![0], "only the banner is over 100 kB");
     }
 
@@ -4865,8 +5382,10 @@ mod tests {
     /// it. `p65` adds a road, it does not close one.
     #[test]
     fn declaring_a_facet_by_scored_field_index_still_works() {
-        let schema =
-            Schema::new(vec![Field::new("name", 2.0, 0.4), Field::new("category", 1.0, 0.4)]);
+        let schema = Schema::new(vec![
+            Field::new("name", 2.0, 0.4),
+            Field::new("category", 1.0, 0.4),
+        ]);
         let mut b = IndexBuilder::new(schema).with_facet(1);
         b.add(&Doc::new(["bear brand milk", "Dairy"]));
         b.add(&Doc::new(["colgate toothpaste", "Personal Care"]));
@@ -4887,7 +5406,10 @@ mod tests {
         assert!(!schema.add_column("one too many"));
 
         let mut b = IndexBuilder::new(schema);
-        assert!(!b.set_facet_field(MAX_COLUMN), "a column past the end is refused, not stored");
+        assert!(
+            !b.set_facet_field(MAX_COLUMN),
+            "a column past the end is refused, not stored"
+        );
         assert!(b.set_facet_field(MAX_COLUMN - 1));
     }
 
@@ -4895,7 +5417,9 @@ mod tests {
     /// across both the merged and the bitmap union paths.
     #[test]
     fn counts_agree_with_brute_force_sets_including_deleted_documents() {
-        let word = ["red", "blue", "green", "milk", "bread", "soap", "tea", "rice"];
+        let word = [
+            "red", "blue", "green", "milk", "bread", "soap", "tea", "rice",
+        ];
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = move || {
             seed ^= seed << 13;
@@ -4907,7 +5431,9 @@ mod tests {
         let mut b = IndexBuilder::new(Schema::new(vec![Field::new("name", 1.0, 0.4)]));
         for _ in 0..600 {
             let n = 1 + (next() % 4) as usize;
-            let r: Vec<&str> = (0..n).map(|_| word[(next() % word.len() as u64) as usize]).collect();
+            let r: Vec<&str> = (0..n)
+                .map(|_| word[(next() % word.len() as u64) as usize])
+                .collect();
             b.add(&Doc::new([r.join(" ")]));
             row.push(r);
         }
@@ -4915,16 +5441,136 @@ mod tests {
         for d in (0..600u32).step_by(7) {
             ix.delete(d);
         }
-        let query = ["rice", "milk tea", "red blue green", "tea nosuchword", "nosuchword", "soap soap"];
+        let query = [
+            "rice",
+            "milk tea",
+            "red blue green",
+            "tea nosuchword",
+            "nosuchword",
+            "soap soap",
+        ];
         for q in query {
             let tok: Vec<&str> = q.split(' ').collect();
             let live = |i: &usize| *i % 7 != 0;
-            let any = (0..600).filter(live).filter(|&i| tok.iter().any(|t| row[i].contains(t))).count();
-            let all = (0..600).filter(live).filter(|&i| tok.iter().all(|t| row[i].contains(t))).count();
+            let any = (0..600)
+                .filter(live)
+                .filter(|&i| tok.iter().any(|t| row[i].contains(t)))
+                .count();
+            let all = (0..600)
+                .filter(live)
+                .filter(|&i| tok.iter().all(|t| row[i].contains(t)))
+                .count();
             assert_eq!(ix.count_any(q), any, "any {q}");
             assert_eq!(ix.count_all(q), all, "all {q}");
         }
         assert_eq!(ix.count_any(""), 0);
         assert_eq!(ix.count_all(""), 0);
+    }
+
+    /// Stored per-term df: COUNT of a live term does not walk the posting list. List length
+    /// grows; posting visits stay 0; the integer still matches the document count.
+    #[test]
+    fn count_any_of_a_live_term_does_not_walk_postings() {
+        let mk = |n: usize| {
+            let mut b = IndexBuilder::new(Schema::new(vec![Field::new("name", 1.0, 0.4)]));
+            for i in 0..n {
+                b.add(&Doc::new([format!("token{i} shared")]));
+            }
+            b.build().unwrap()
+        };
+        let small = mk(64);
+        let large = mk(4096);
+        assert_eq!(small.count_any("shared"), 64);
+        assert_eq!(large.count_any("shared"), 4096);
+        assert_eq!(small.count_any_cost("shared").1, 0, "must not walk the 64-posting list");
+        assert_eq!(large.count_any_cost("shared").1, 0, "must not walk the 4096-posting list");
+        assert_eq!(large.count_all("shared"), 4096);
+        // Disjoint terms live on disjoint pages (token0 only in doc 0, token4000 only in doc 4000).
+        assert_eq!(large.count_any("token0 token4000"), 2);
+        assert_eq!(large.count_any_cost("token0 token4000").1, 0);
+    }
+
+    fn colgate_pair(position: bool) -> Index {
+        let mut b = IndexBuilder::new(Schema::new(vec![Field::new("name", 1.0, 0.4)]));
+        if position {
+            b = b.with_position();
+        }
+        b.add(&Doc::new(["Colgate Total Toothpaste"]));
+        b.add(&Doc::new(["Total Colgate Toothpaste"]));
+        b.build().unwrap()
+    }
+
+    /// Order matters. Both rows contain both words, so `count_all` is 2 either way; a phrase
+    /// count that called `count_all` would report 2 for each query instead of one document each.
+    #[test]
+    fn count_phrase_is_order_sensitive_and_does_not_fall_back_to_count_all() {
+        let ix = colgate_pair(true);
+        assert_eq!(
+            ix.count_all("Colgate Total"),
+            2,
+            "both rows are a bag-of-words match"
+        );
+        assert_eq!(ix.count_phrase("Colgate Total"), 1);
+        assert_eq!(
+            ix.count_phrase("Total Colgate"),
+            1,
+            "the reversed row is a different phrase"
+        );
+        assert_eq!(
+            ix.search_phrase("Colgate Total", 10)
+                .iter()
+                .map(|h| h.doc)
+                .collect::<Vec<_>>(),
+            [0]
+        );
+        assert_eq!(
+            ix.search_phrase("Total Colgate", 10)
+                .iter()
+                .map(|h| h.doc)
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        assert_eq!(ix.count_phrase(""), 0);
+        assert_eq!(ix.count_phrase("Colgate Nosuchword"), 0);
+    }
+
+    /// Adjacent vs reversed with a gap: `"Total Toothpaste Colgate"` has both words but not
+    /// consecutive in reverse, so `"Total Colgate"` is 0. A `count_all` fallback would be 2.
+    #[test]
+    fn count_phrase_of_a_gapped_reverse_is_zero() {
+        let mut b = IndexBuilder::new(Schema::new(vec![Field::new("name", 1.0, 0.4)])).with_position();
+        b.add(&Doc::new(["Colgate Total Toothpaste"]));
+        b.add(&Doc::new(["Total Toothpaste Colgate"]));
+        let ix = b.build().unwrap();
+        assert_eq!(ix.count_all("Colgate Total"), 2);
+        assert_eq!(ix.count_phrase("Colgate Total"), 1);
+        assert_eq!(ix.count_phrase("Total Colgate"), 0);
+    }
+
+    /// Without positions there is nothing to verify; falling back to `count_all` would return 2.
+    #[test]
+    fn count_phrase_without_positions_is_zero_not_count_all() {
+        let ix = colgate_pair(false);
+        assert!(!ix.has_position());
+        assert_eq!(ix.count_all("Colgate Total"), 2);
+        assert_eq!(ix.count_phrase("Colgate Total"), 0);
+        assert_eq!(ix.count_phrase("Total Colgate"), 0);
+    }
+
+    #[test]
+    fn count_phrase_does_not_count_a_deleted_document() {
+        let mut ix = colgate_pair(true);
+        ix.delete(0);
+        assert_eq!(ix.count_phrase("Colgate Total"), 0);
+        assert_eq!(
+            ix.count_phrase("Total Colgate"),
+            1,
+            "the surviving row is the reversed phrase"
+        );
+        assert_eq!(
+            ix.count_all("Colgate Total"),
+            1,
+            "the surviving row still has both words"
+        );
     }
 }

@@ -75,6 +75,12 @@ def _bind(lib: ctypes.CDLL) -> ctypes.CDLL:
         "idx_close": ([p], None),
         "idx_doc_count": ([p], ctypes.c_uint32),
         "idx_term_count": ([p], ctypes.c_uint32),
+        "idx_count_any": ([p, ctypes.c_char_p, ctypes.c_size_t], ctypes.c_uint32),
+        "idx_count_all": ([p, ctypes.c_char_p, ctypes.c_size_t], ctypes.c_uint32),
+        "idx_count_phrase": ([p, ctypes.c_char_p, ctypes.c_size_t], ctypes.c_uint32),
+        "idx_searcher_count_any": ([p, ctypes.c_char_p, ctypes.c_size_t], ctypes.c_uint32),
+        "idx_searcher_count_all": ([p, ctypes.c_char_p, ctypes.c_size_t], ctypes.c_uint32),
+        "idx_searcher_count_phrase": ([p, ctypes.c_char_p, ctypes.c_size_t], ctypes.c_uint32),
         "idx_search": ([p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32], ctypes.c_uint32),
         "idx_result_ptr": ([p], u8p),
         "idx_result_len": ([p], ctypes.c_size_t),
@@ -302,6 +308,27 @@ class Live:
         raw = ctypes.string_at(self._lib.idx_searcher_result_ptr(self._s), n * HIT_BYTE)
         return [Hit(*struct.unpack_from("<IfI", raw, i * HIT_BYTE)) for i in range(n)]
 
+    def count_any(self, query: str) -> int:
+        q = query.encode()
+        n = self._lib.idx_searcher_count_any(self._s, q, len(q))
+        if n == U32_MAX:
+            raise ValueError(f"count_any failed: {query!r}")
+        return n
+
+    def count_all(self, query: str) -> int:
+        q = query.encode()
+        n = self._lib.idx_searcher_count_all(self._s, q, len(q))
+        if n == U32_MAX:
+            raise ValueError(f"count_all failed: {query!r}")
+        return n
+
+    def count_phrase(self, query: str) -> int:
+        q = query.encode()
+        n = self._lib.idx_searcher_count_phrase(self._s, q, len(q))
+        if n == U32_MAX:
+            raise ValueError(f"count_phrase failed: {query!r}")
+        return n
+
     def search_clause(
         self, query: str, clause: list[Clause], k: int = 10, offset: int = 0
     ) -> list[Hit]:
@@ -502,6 +529,30 @@ class Index:
             return []
         raw = ctypes.string_at(self._lib.idx_result_ptr(self._h), n * HIT_BYTE)
         return [Hit(*struct.unpack_from("<IfI", raw, i * HIT_BYTE)) for i in range(n)]
+
+    def count_any(self, query: str) -> int:
+        """Exact COUNT(*) of live documents containing ANY query token. No ranking."""
+        q = query.encode()
+        n = self._lib.idx_count_any(self._h, q, len(q))
+        if n == U32_MAX:
+            raise ValueError(f"count_any failed: {query!r}")
+        return n
+
+    def count_all(self, query: str) -> int:
+        """Exact COUNT(*) of live documents containing EVERY query token. No ranking."""
+        q = query.encode()
+        n = self._lib.idx_count_all(self._h, q, len(q))
+        if n == U32_MAX:
+            raise ValueError(f"count_all failed: {query!r}")
+        return n
+
+    def count_phrase(self, query: str) -> int:
+        """Exact COUNT(*) of live documents containing the query as a consecutive phrase."""
+        q = query.encode()
+        n = self._lib.idx_count_phrase(self._h, q, len(q))
+        if n == U32_MAX:
+            raise ValueError(f"count_phrase failed: {query!r}")
+        return n
 
     def search_facet(self, query: str, value: str, k: int = 10, slot: int = 0) -> list[Hit]:
         """Filter-then-rank: `k` hits from inside `value`, not `k` global hits that survived it."""
@@ -1137,6 +1188,14 @@ def main() -> int:
             "hits are ordered by typo_bucket first",
         )
 
+        # Exact COUNT(*) through the shipped ABI -- no ranking, no k. Integers match js/smoke.mjs.
+        check(idx.count_any("toothpaste") == 1, "count_any(toothpaste) is 1 on the four-row fixture")
+        check(idx.count_any("colgate soap") == 2, "count_any unions two brands")
+        check(idx.count_all("colgate toothpaste") == 1, "count_all requires every token")
+        check(idx.count_all("colgate soap") == 0, "count_all of two disjoint brands is 0")
+        check(idx.count_any("") == 0, "count_any of an empty query is 0")
+        check(idx.count_all("nosuchword") == 0, "count_all of an absent token is 0")
+
         blob = idx.to_bytes()
         check(len(blob) > 0, "idx_serialize returns bytes")
 
@@ -1302,6 +1361,36 @@ def main() -> int:
     with Index.build(lib, pf, phrase_row) as nopos:
         check(nopos.search_phrase("Ice Cream") == [], "no positions, no phrase results")
         check(len(nopos.search("Ice Cream")) == 4, "its ordinary search is unaffected")
+
+    # Phrase COUNT(*). Both rows contain both words, so count_all is 2 either way; a phrase
+    # count that fell back to bag-of-words would report 2 for the reversed order and 2 without
+    # positions. Order-sensitive integers match js/smoke.mjs and the Rust colgate_pair fixture.
+    pair = [
+        ["Colgate Total Toothpaste"],
+        ["Total Colgate Toothpaste"],
+    ]
+    cf = [("name", 3, 0.4)]
+    with Index.build(lib, cf, pair, position=True) as cx:
+        check(cx.count_all("Colgate Total") == 2, "count_all of the phrase fixture is 2 either way")
+        check(cx.count_phrase("Colgate Total") == 1, "count_phrase(Colgate Total) is 1")
+        check(
+            cx.count_phrase("Total Colgate") == 1,
+            "count_phrase(Total Colgate) is 1 — the reversed row, not 2",
+        )
+        check(
+            [h.doc for h in cx.search_phrase("Colgate Total")] == [0],
+            "search_phrase(Colgate Total) is the first row",
+        )
+        check(
+            [h.doc for h in cx.search_phrase("Total Colgate")] == [1],
+            "search_phrase(Total Colgate) is the reversed row",
+        )
+    with Index.build(lib, cf, pair) as nopos:
+        check(
+            nopos.count_phrase("Colgate Total") == 0,
+            "without positions count_phrase is 0, not count_all",
+        )
+        check(nopos.count_all("Colgate Total") == 2, "without positions count_all is still 2")
 
     try:
         Index.build(lib, [("name", 3, 0.4)], [], facet=99)

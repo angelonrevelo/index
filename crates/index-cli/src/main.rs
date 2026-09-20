@@ -37,7 +37,7 @@ use index_text::{Doc, Field, IndexBuilder, Schema};
 use row::{Format, Record, RowReader};
 use sql::SqlDumpReader;
 use std::collections::HashMap;
-use std::io::{BufWriter, BufRead, Write};
+use std::io::{BufRead, BufWriter, Write};
 use std::path::PathBuf;
 
 const USAGE: &str = "\
@@ -46,7 +46,7 @@ index — build and maintain a search index from any database, over a pipe
 USAGE
   index build  -d DIR --schema SPEC [OPTIONS]   < rows
   index apply  -d DIR [OPTIONS]                 < changes
-  index search -d DIR [-k N] [--prefix] QUERY
+  index search -d DIR [-k N] [--prefix] [--count any|all|phrase] QUERY
   index stat   -d DIR
 
 BUILD  reads rows and writes a fresh collection (replacing any existing one).
@@ -200,16 +200,31 @@ struct Opt {
     reselect: Option<String>,
     k: usize,
     prefix: bool,
+    /// `index search --count any|all|phrase`: print an exact COUNT(*) instead of ranking hits.
+    count: Option<CountOp>,
     rest: Vec<String>,
+}
+
+/// How `index search --count` combines query tokens.
+#[derive(Clone, Copy)]
+enum CountOp {
+    Any,
+    All,
+    Phrase,
 }
 
 impl Opt {
     fn parse(arg: &[String]) -> Result<Opt, String> {
-        let mut o = Opt { k: 10, ..Opt::default() };
+        let mut o = Opt {
+            k: 10,
+            ..Opt::default()
+        };
         let mut i = 0;
         let take = |i: &mut usize, name: &str| -> Result<String, String> {
             *i += 1;
-            arg.get(*i).cloned().ok_or_else(|| format!("{name} needs a value"))
+            arg.get(*i)
+                .cloned()
+                .ok_or_else(|| format!("{name} needs a value"))
         };
         while i < arg.len() {
             match arg[i].as_str() {
@@ -224,6 +239,17 @@ impl Opt {
                 "--position" => o.position = true,
                 "--reorder" => o.reorder = true,
                 "--prefix" => o.prefix = true,
+                "--count" => {
+                    let v = take(&mut i, "--count")?;
+                    o.count = Some(match v.as_str() {
+                        "any" => CountOp::Any,
+                        "all" => CountOp::All,
+                        "phrase" => CountOp::Phrase,
+                        other => {
+                            return Err(format!("--count wants any, all or phrase, got {other:?}"));
+                        }
+                    });
+                }
                 "--csv" => o.format = Some(Format::Csv),
                 "--tsv" => o.format = Some(Format::Tsv),
                 "--jsonl" => o.format = Some(Format::Jsonl),
@@ -233,7 +259,9 @@ impl Opt {
                 "--no-header" => o.header = Some(false),
                 "-k" => {
                     let v = take(&mut i, "-k")?;
-                    o.k = v.parse().map_err(|_| format!("-k wants a number, got {v:?}"))?;
+                    o.k = v
+                        .parse()
+                        .map_err(|_| format!("-k wants a number, got {v:?}"))?;
                 }
                 "--field" => {
                     let v = take(&mut i, "--field")?;
@@ -253,7 +281,9 @@ impl Opt {
     }
 
     fn dir(&self) -> Result<&PathBuf, String> {
-        self.dir.as_ref().ok_or_else(|| "-d DIR is required".to_string())
+        self.dir
+            .as_ref()
+            .ok_or_else(|| "-d DIR is required".to_string())
     }
 
     /// Input framing. JSON has no header line; delimited text is assumed to have one, because every
@@ -262,13 +292,23 @@ impl Opt {
     fn reader(&self) -> Result<Input<std::io::StdinLock<'static>>, String> {
         if self.sql {
             if self.format.is_some() || self.header.is_some() {
-                return Err("--sql is a format of its own; --csv/--tsv/--jsonl/--header do not apply".into());
+                return Err(
+                    "--sql is a format of its own; --csv/--tsv/--jsonl/--header do not apply"
+                        .into(),
+                );
             }
-            return Ok(Input::Sql(SqlDumpReader::new(std::io::stdin().lock(), &self.table)));
+            return Ok(Input::Sql(SqlDumpReader::new(
+                std::io::stdin().lock(),
+                &self.table,
+            )));
         }
         let format = self.format.unwrap_or(Format::Csv);
         let header = self.header.unwrap_or(format != Format::Jsonl);
-        Ok(Input::Rows(RowReader::new(std::io::stdin().lock(), format, header)))
+        Ok(Input::Rows(RowReader::new(
+            std::io::stdin().lock(),
+            format,
+            header,
+        )))
     }
 }
 
@@ -320,7 +360,11 @@ fn parse_schema(spec: &str) -> Result<Vec<(String, Field)>, String> {
         return Err("--schema is empty".into());
     }
     if out.len() > index_text::MAX_FIELD {
-        return Err(format!("{} fields, at most {} are supported", out.len(), index_text::MAX_FIELD));
+        return Err(format!(
+            "{} fields, at most {} are supported",
+            out.len(),
+            index_text::MAX_FIELD
+        ));
     }
     Ok(out)
 }
@@ -351,7 +395,10 @@ fn doc_of(rec: &Record, path: &[String]) -> Doc {
 
 fn cmd_build(o: &Opt) -> Result<(), String> {
     let dir = o.dir()?;
-    let spec = o.schema.as_deref().ok_or("--schema is required for build")?;
+    let spec = o
+        .schema
+        .as_deref()
+        .ok_or("--schema is required for build")?;
     let schema = parse_schema(spec)?;
     let path = mapping(&schema, &o.field);
 
@@ -402,7 +449,10 @@ fn cmd_build(o: &Opt) -> Result<(), String> {
             );
         }
         if s.filtered() > 0 {
-            eprintln!("note: {} rows skipped from tables outside --table", s.filtered());
+            eprintln!(
+                "note: {} rows skipped from tables outside --table",
+                s.filtered()
+            );
         }
     }
 
@@ -473,16 +523,22 @@ fn cmd_apply(o: &Opt) -> Result<(), String> {
     let dir = o.dir()?;
     let (mut searcher, seg_path) = collection::open(dir)?;
     if !searcher.has_key() {
-        return Err("this collection has no key, so a change stream cannot address its rows; \
+        return Err(
+            "this collection has no key, so a change stream cannot address its rows; \
                     rebuild with `index build --key COL`"
-            .into());
+                .into(),
+        );
     }
 
     // The schema comes from the collection, never from flags. A delta segment whose field, facet,
     // numeric or key layout disagrees with the base does not fail — it returns wrong answers.
     let base = searcher.segment(0).ok_or("empty collection")?;
-    let schema: Vec<(String, Field)> =
-        base.schema().field.iter().map(|f| (f.name.clone(), f.clone())).collect();
+    let schema: Vec<(String, Field)> = base
+        .schema()
+        .field
+        .iter()
+        .map(|f| (f.name.clone(), f.clone()))
+        .collect();
     let key_slot = base.key_field().ok_or("base segment has no key field")?;
     let path = mapping(&schema, &o.field);
 
@@ -618,7 +674,13 @@ fn cmd_apply(o: &Opt) -> Result<(), String> {
                 // so accepting it would blank the field and search would quietly stop finding the
                 // row. Refusing is the only correct answer available at this layer.
                 for (slot, p) in &required {
-                    if rec.get(*p).map(String::as_str).unwrap_or("").trim().is_empty() {
+                    if rec
+                        .get(*p)
+                        .map(String::as_str)
+                        .unwrap_or("")
+                        .trim()
+                        .is_empty()
+                    {
                         return Err(format!(
                             "key {key:?}: required field {:?} is empty at {p:?}. A change stream                              cannot express a partial update here -- if this is an unchanged                              TOASTed column, have the producer re-read the row (see                              bench/roadmap/p67-postgres-connector.md)",
                             schema[*slot].0
@@ -707,7 +769,9 @@ fn reselect_row(cmd: &str, key: &str, o: &Opt) -> Result<Option<Record>, String>
     // `sh -c` everywhere it exists (this repo develops under Git Bash and CI is ubuntu), because
     // the template's own quoting — awk's `$1`, SQL's `'…'` — is shell quoting and `cmd` would pass
     // it through literally. `cmd /C` is the fallback for a Windows box with no sh at all.
-    let spawned = std::process::Command::new("sh").args(["-c", &expanded]).output();
+    let spawned = std::process::Command::new("sh")
+        .args(["-c", &expanded])
+        .output();
     let out = match spawned {
         Ok(out) => out,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && cfg!(windows) => {
@@ -763,6 +827,15 @@ fn cmd_search(o: &Opt) -> Result<(), String> {
     if q.trim().is_empty() {
         return Err("no query given".into());
     }
+    if let Some(op) = o.count {
+        let n = match op {
+            CountOp::Any => searcher.count_any(&q),
+            CountOp::All => searcher.count_all(&q),
+            CountOp::Phrase => searcher.count_phrase(&q),
+        };
+        println!("{n}");
+        return Ok(());
+    }
     let hit = match o.prefix {
         true => searcher.search_prefix(&q, o.k),
         false => searcher.search(&q, o.k),
@@ -783,11 +856,19 @@ fn cmd_search(o: &Opt) -> Result<(), String> {
 fn cmd_stat(o: &Opt) -> Result<(), String> {
     let dir = o.dir()?;
     let (s, path) = collection::open(dir)?;
-    let bytes: u64 = path.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
+    let bytes: u64 = path
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
     println!("segments        {}", s.segment_count());
     println!("documents       {}", s.doc_count());
     println!("live            {}", s.live_count());
-    println!("deleted         {} ({:.1}%)", s.deleted_count(), s.deleted_ratio() * 100.0);
+    println!(
+        "deleted         {} ({:.1}%)",
+        s.deleted_count(),
+        s.deleted_ratio() * 100.0
+    );
     println!("keyed (live)    {}", s.keyed_count());
     println!("skew            {:.1}%", s.skew() * 100.0);
     println!("bytes on disk   {bytes}");
@@ -830,12 +911,20 @@ mod tests {
     fn a_delete_after_an_upsert_wins_and_the_reverse_also_wins() {
         let c = vec![up("a"), del("a")];
         let (kept, dropped) = collapse(&c);
-        assert_eq!(shape(&kept), vec!["d:a"], "the delete is last, so the row ends up absent");
+        assert_eq!(
+            shape(&kept),
+            vec!["d:a"],
+            "the delete is last, so the row ends up absent"
+        );
         assert_eq!(dropped, 1);
 
         let c = vec![del("a"), up("a")];
         let (kept, dropped) = collapse(&c);
-        assert_eq!(shape(&kept), vec!["u:a"], "the upsert is last, so the row ends up present");
+        assert_eq!(
+            shape(&kept),
+            vec!["u:a"],
+            "the upsert is last, so the row ends up present"
+        );
         assert_eq!(dropped, 1);
     }
 
@@ -873,7 +962,10 @@ mod tests {
         assert_eq!(op_kind("delete"), Ok(false));
         // case is not significant
         assert_eq!(op_kind("INSERT"), Ok(true));
-        assert!(op_kind("truncate").is_err(), "an unknown op is refused, not guessed");
+        assert!(
+            op_kind("truncate").is_err(),
+            "an unknown op is refused, not guessed"
+        );
         assert!(op_kind("").is_err());
     }
 
@@ -884,8 +976,14 @@ mod tests {
         assert_eq!(s[0].0, "sku");
         assert_eq!(slot_of("name", &s).unwrap(), 1);
         assert!(slot_of("nope", &s).is_err());
-        assert!(parse_schema("name:3").is_err(), "a two-part field is refused");
-        assert!(parse_schema("name:x:0.4").is_err(), "a non-numeric boost is refused");
+        assert!(
+            parse_schema("name:3").is_err(),
+            "a two-part field is refused"
+        );
+        assert!(
+            parse_schema("name:x:0.4").is_err(),
+            "a non-numeric boost is refused"
+        );
         assert!(parse_schema("").is_err());
     }
 

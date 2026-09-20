@@ -40,7 +40,7 @@
 //! [`idx_image_result_len`].
 
 use index_text::{
-    AliasTable, Doc, FacetClause, Field, Index, IndexBuilder, Schema, SectionTable, Searcher, Span,
+    AliasTable, Doc, FacetClause, Field, Index, IndexBuilder, Schema, Searcher, SectionTable, Span,
 };
 use std::alloc::{alloc, dealloc, Layout};
 
@@ -79,7 +79,11 @@ fn parse_clause_spec(text: &str) -> Option<Vec<(usize, bool, Vec<&str>)>> {
             None => (head, false),
         };
         let slot = slot_text.parse::<usize>().ok()?;
-        parsed.push((slot, exclude, value.split('|').filter(|v| !v.is_empty()).collect()));
+        parsed.push((
+            slot,
+            exclude,
+            value.split('|').filter(|v| !v.is_empty()).collect(),
+        ));
     }
     Some(parsed)
 }
@@ -89,7 +93,11 @@ fn parse_clause_spec(text: &str) -> Option<Vec<(usize, bool, Vec<&str>)>> {
 fn borrow_clause<'a>(parsed: &'a [(usize, bool, Vec<&'a str>)]) -> Vec<FacetClause<'a>> {
     parsed
         .iter()
-        .map(|(slot, exclude, value)| FacetClause { slot: *slot, value, exclude: *exclude })
+        .map(|(slot, exclude, value)| FacetClause {
+            slot: *slot,
+            value,
+            exclude: *exclude,
+        })
         .collect()
 }
 
@@ -120,7 +128,9 @@ pub unsafe extern "C" fn idx_search_clause(
     spec: *const u8,
     spec_len: usize,
 ) -> u32 {
-    let Some(handle) = h.as_mut() else { return u32::MAX };
+    let Some(handle) = h.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() || spec.is_null() {
         return u32::MAX;
     }
@@ -131,9 +141,13 @@ pub unsafe extern "C" fn idx_search_clause(
         return u32::MAX;
     };
     // Values are borrowed from `text`, so the parse must outlive the search call.
-    let Some(parsed) = parse_clause_spec(text) else { return u32::MAX };
+    let Some(parsed) = parse_clause_spec(text) else {
+        return u32::MAX;
+    };
     let clause = borrow_clause(&parsed);
-    let hit = handle.index.search_clause(query, k as usize, offset as usize, &clause, &[]);
+    let hit = handle
+        .index
+        .search_clause(query, k as usize, offset as usize, &clause, &[]);
     write_hit(&mut handle.result, &hit);
     hit.len() as u32
 }
@@ -162,14 +176,18 @@ pub unsafe extern "C" fn idx_search_phrase(
     offset: u32,
     k: u32,
 ) -> u32 {
-    let Some(handle) = h.as_mut() else { return u32::MAX };
+    let Some(handle) = h.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() {
         return u32::MAX;
     }
     let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
         return u32::MAX;
     };
-    let hit = handle.index.search_phrase_page(query, offset as usize, k as usize);
+    let hit = handle
+        .index
+        .search_phrase_page(query, offset as usize, k as usize);
     write_hit(&mut handle.result, &hit);
     hit.len() as u32
 }
@@ -189,16 +207,97 @@ pub unsafe extern "C" fn idx_searcher_search_phrase(
     offset: u32,
     k: u32,
 ) -> u32 {
-    let Some(searcher) = s.as_mut() else { return u32::MAX };
+    let Some(searcher) = s.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() {
         return u32::MAX;
     }
     let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
         return u32::MAX;
     };
-    let hit = searcher.inner.search_phrase_page(query, offset as usize, k as usize);
+    let hit = searcher
+        .inner
+        .search_phrase_page(query, offset as usize, k as usize);
     write_hit(&mut searcher.result, &hit);
     hit.len() as u32
+}
+
+/// Exact `COUNT(*)` of live documents containing ANY query token, summed across segments.
+/// Same empty-query / null-handle rules as [`idx_count_any`].
+///
+/// # Safety
+/// `s` must be null or a live searcher; `q` readable for `q_len` bytes when non-null.
+#[no_mangle]
+pub unsafe extern "C" fn idx_searcher_count_any(
+    s: *const SearcherHandle,
+    q: *const u8,
+    q_len: usize,
+) -> u32 {
+    let Some(searcher) = s.as_ref() else {
+        return u32::MAX;
+    };
+    if q_len == 0 {
+        return searcher.inner.count_any("") as u32;
+    }
+    if q.is_null() {
+        return u32::MAX;
+    }
+    let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
+        return u32::MAX;
+    };
+    searcher.inner.count_any(query) as u32
+}
+
+/// Exact `COUNT(*)` of live documents containing EVERY query token, summed across segments.
+///
+/// # Safety
+/// `s` must be null or a live searcher; `q` readable for `q_len` bytes when non-null.
+#[no_mangle]
+pub unsafe extern "C" fn idx_searcher_count_all(
+    s: *const SearcherHandle,
+    q: *const u8,
+    q_len: usize,
+) -> u32 {
+    let Some(searcher) = s.as_ref() else {
+        return u32::MAX;
+    };
+    if q_len == 0 {
+        return searcher.inner.count_all("") as u32;
+    }
+    if q.is_null() {
+        return u32::MAX;
+    }
+    let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
+        return u32::MAX;
+    };
+    searcher.inner.count_all(query) as u32
+}
+
+/// Exact `COUNT(*)` of live documents containing the query as a phrase, summed across segments.
+/// A segment built without positions contributes 0.
+///
+/// # Safety
+/// `s` must be null or a live searcher; `q` readable for `q_len` bytes when non-null.
+#[no_mangle]
+pub unsafe extern "C" fn idx_searcher_count_phrase(
+    s: *const SearcherHandle,
+    q: *const u8,
+    q_len: usize,
+) -> u32 {
+    let Some(searcher) = s.as_ref() else {
+        return u32::MAX;
+    };
+    if q_len == 0 {
+        return searcher.inner.count_phrase("") as u32;
+    }
+    if q.is_null() {
+        return u32::MAX;
+    }
+    let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
+        return u32::MAX;
+    };
+    searcher.inner.count_phrase(query) as u32
 }
 
 /// [`idx_search`] starting at `offset` — page `n` is `offset = n * k`.
@@ -217,7 +316,9 @@ pub unsafe extern "C" fn idx_search_page(
     offset: u32,
     k: u32,
 ) -> u32 {
-    let Some(handle) = h.as_mut() else { return u32::MAX };
+    let Some(handle) = h.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() {
         return u32::MAX;
     }
@@ -250,7 +351,9 @@ pub unsafe extern "C" fn idx_highlight(
     text: *const u8,
     text_len: usize,
 ) -> u32 {
-    let Some(handle) = h.as_mut() else { return u32::MAX };
+    let Some(handle) = h.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() || text.is_null() {
         return u32::MAX;
     }
@@ -352,7 +455,8 @@ pub unsafe extern "C" fn idx_searcher_live_count(s: *const SearcherHandle) -> u3
 /// `s` must be a live searcher.
 #[no_mangle]
 pub unsafe extern "C" fn idx_searcher_needs_compaction(s: *const SearcherHandle) -> u32 {
-    s.as_ref().map_or(0, |x| u32::from(x.inner.needs_compaction()))
+    s.as_ref()
+        .map_or(0, |x| u32::from(x.inner.needs_compaction()))
 }
 
 /// Tombstone a document by GLOBAL ordinal. Returns 1 if it was live and is now deleted.
@@ -378,7 +482,9 @@ pub unsafe extern "C" fn idx_searcher_search(
     k: u32,
     prefix: u32,
 ) -> u32 {
-    let Some(searcher) = s.as_mut() else { return u32::MAX };
+    let Some(searcher) = s.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() {
         return u32::MAX;
     }
@@ -408,7 +514,9 @@ pub unsafe extern "C" fn idx_searcher_search_facet_all(
     spec: *const u8,
     spec_len: usize,
 ) -> u32 {
-    let Some(searcher) = s.as_mut() else { return u32::MAX };
+    let Some(searcher) = s.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() || spec.is_null() {
         return u32::MAX;
     }
@@ -420,8 +528,12 @@ pub unsafe extern "C" fn idx_searcher_search_facet_all(
     };
     let mut want: Vec<(usize, &str)> = Vec::new();
     for part in text.split('\0').filter(|p| !p.is_empty()) {
-        let Some((slot, value)) = part.split_once('=') else { return u32::MAX };
-        let Ok(slot) = slot.parse::<usize>() else { return u32::MAX };
+        let Some((slot, value)) = part.split_once('=') else {
+            return u32::MAX;
+        };
+        let Ok(slot) = slot.parse::<usize>() else {
+            return u32::MAX;
+        };
         want.push((slot, value));
     }
     let hit = searcher.inner.search_facet_all(query, k as usize, &want);
@@ -452,7 +564,9 @@ pub unsafe extern "C" fn idx_searcher_search_clause(
     spec: *const u8,
     spec_len: usize,
 ) -> u32 {
-    let Some(searcher) = s.as_mut() else { return u32::MAX };
+    let Some(searcher) = s.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() || spec.is_null() {
         return u32::MAX;
     }
@@ -462,9 +576,13 @@ pub unsafe extern "C" fn idx_searcher_search_clause(
     let Ok(text) = std::str::from_utf8(std::slice::from_raw_parts(spec, spec_len)) else {
         return u32::MAX;
     };
-    let Some(parsed) = parse_clause_spec(text) else { return u32::MAX };
+    let Some(parsed) = parse_clause_spec(text) else {
+        return u32::MAX;
+    };
     let clause = borrow_clause(&parsed);
-    let hit = searcher.inner.search_clause(query, k as usize, offset as usize, &clause, &[]);
+    let hit = searcher
+        .inner
+        .search_clause(query, k as usize, offset as usize, &clause, &[]);
     write_hit(&mut searcher.result, &hit);
     hit.len() as u32
 }
@@ -485,14 +603,18 @@ pub unsafe extern "C" fn idx_searcher_search_page(
     offset: u32,
     k: u32,
 ) -> u32 {
-    let Some(searcher) = s.as_mut() else { return u32::MAX };
+    let Some(searcher) = s.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() {
         return u32::MAX;
     }
     let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
         return u32::MAX;
     };
-    let hit = searcher.inner.search_page(query, offset as usize, k as usize);
+    let hit = searcher
+        .inner
+        .search_page(query, offset as usize, k as usize);
     write_hit(&mut searcher.result, &hit);
     hit.len() as u32
 }
@@ -511,14 +633,18 @@ pub unsafe extern "C" fn idx_searcher_search_range(
     lo: f64,
     hi: f64,
 ) -> u32 {
-    let Some(searcher) = s.as_mut() else { return u32::MAX };
+    let Some(searcher) = s.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() {
         return u32::MAX;
     }
     let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
         return u32::MAX;
     };
-    let hit = searcher.inner.search_range(query, k as usize, slot as usize, lo, hi);
+    let hit = searcher
+        .inner
+        .search_range(query, k as usize, slot as usize, lo, hi);
     write_hit(&mut searcher.result, &hit);
     hit.len() as u32
 }
@@ -536,14 +662,18 @@ pub unsafe extern "C" fn idx_searcher_search_sorted(
     slot: u32,
     ascending: u32,
 ) -> u32 {
-    let Some(searcher) = s.as_mut() else { return u32::MAX };
+    let Some(searcher) = s.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() {
         return u32::MAX;
     }
     let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
         return u32::MAX;
     };
-    let hit = searcher.inner.search_sorted(query, k as usize, slot as usize, ascending != 0);
+    let hit = searcher
+        .inner
+        .search_sorted(query, k as usize, slot as usize, ascending != 0);
     write_hit(&mut searcher.result, &hit);
     hit.len() as u32
 }
@@ -560,7 +690,9 @@ pub unsafe extern "C" fn idx_searcher_facet_tally(
     q_len: usize,
     slot: u32,
 ) -> u32 {
-    let Some(searcher) = s.as_mut() else { return u32::MAX };
+    let Some(searcher) = s.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() {
         return u32::MAX;
     }
@@ -570,9 +702,13 @@ pub unsafe extern "C" fn idx_searcher_facet_tally(
     let tally = searcher.inner.facet_tally_at(query, slot as usize);
     searcher.result.clear();
     for (label, count) in &tally {
-        searcher.result.extend_from_slice(&(label.len() as u32).to_le_bytes());
+        searcher
+            .result
+            .extend_from_slice(&(label.len() as u32).to_le_bytes());
         searcher.result.extend_from_slice(label.as_bytes());
-        searcher.result.extend_from_slice(&(*count as u32).to_le_bytes());
+        searcher
+            .result
+            .extend_from_slice(&(*count as u32).to_le_bytes());
     }
     tally.len() as u32
 }
@@ -631,8 +767,7 @@ pub unsafe extern "C" fn idx_build_new(ptr: *const u8, len: usize) -> *mut Build
     if field.is_empty() || field.len() > index_text::MAX_FIELD {
         return std::ptr::null_mut();
     }
-    let inner = IndexBuilder::new(Schema::new(field))
-        .with_alias(AliasTable::philippine_grocery());
+    let inner = IndexBuilder::new(Schema::new(field)).with_alias(AliasTable::philippine_grocery());
     Box::into_raw(Box::new(Builder { inner }))
 }
 
@@ -680,7 +815,9 @@ pub unsafe extern "C" fn idx_build_key(b: *mut Builder, field: u32) -> u32 {
 /// `h` must be a live handle; `key` readable for `key_len` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn idx_doc_of_key(h: *const Handle, key: *const u8, key_len: usize) -> u32 {
-    let Some(handle) = h.as_ref() else { return u32::MAX };
+    let Some(handle) = h.as_ref() else {
+        return u32::MAX;
+    };
     if key.is_null() {
         return u32::MAX;
     }
@@ -725,7 +862,9 @@ pub unsafe extern "C" fn idx_searcher_doc_of_key(
     key: *const u8,
     key_len: usize,
 ) -> u32 {
-    let Some(searcher) = s.as_ref() else { return u32::MAX };
+    let Some(searcher) = s.as_ref() else {
+        return u32::MAX;
+    };
     if key.is_null() {
         return u32::MAX;
     }
@@ -770,7 +909,12 @@ pub unsafe extern "C" fn idx_searcher_delete_key(
 #[no_mangle]
 pub unsafe extern "C" fn idx_searcher_key_of(s: *mut SearcherHandle, global: u32) -> usize {
     let Some(searcher) = s.as_mut() else { return 0 };
-    searcher.result = searcher.inner.key_of(global).unwrap_or("").as_bytes().to_vec();
+    searcher.result = searcher
+        .inner
+        .key_of(global)
+        .unwrap_or("")
+        .as_bytes()
+        .to_vec();
     searcher.result.len()
 }
 
@@ -823,7 +967,9 @@ pub unsafe extern "C" fn idx_build_numeric(b: *mut Builder, field: u32) -> u32 {
 /// `b` must be a live builder; `ptr` must be readable for `len` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn idx_build_add(b: *mut Builder, ptr: *const u8, len: usize) -> u32 {
-    let Some(builder) = b.as_mut() else { return u32::MAX };
+    let Some(builder) = b.as_mut() else {
+        return u32::MAX;
+    };
     if ptr.is_null() {
         return u32::MAX;
     }
@@ -846,7 +992,10 @@ pub unsafe extern "C" fn idx_build_finish(b: *mut Builder) -> *mut Handle {
     }
     let builder = Box::from_raw(b);
     match builder.inner.build() {
-        Ok(index) => Box::into_raw(Box::new(Handle { index, result: Vec::new() })),
+        Ok(index) => Box::into_raw(Box::new(Handle {
+            index,
+            result: Vec::new(),
+        })),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -942,7 +1091,10 @@ pub unsafe extern "C" fn idx_open(ptr: *const u8, len: usize) -> *mut Handle {
     }
     let bytes = std::slice::from_raw_parts(ptr, len);
     match Index::from_bytes(bytes) {
-        Ok(index) => Box::into_raw(Box::new(Handle { index, result: Vec::new() })),
+        Ok(index) => Box::into_raw(Box::new(Handle {
+            index,
+            result: Vec::new(),
+        })),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -976,6 +1128,76 @@ pub unsafe extern "C" fn idx_term_count(h: *const Handle) -> u32 {
     h.as_ref().map_or(0, |x| x.index.term_count() as u32)
 }
 
+/// Exact `COUNT(*)` of live documents containing ANY query token. No typo expansion, no ranking.
+/// Returns `u32::MAX` on a null handle, a null query pointer, or invalid UTF-8. An empty query
+/// returns 0.
+///
+/// # Safety
+/// `h` must be null or a live handle; `q` readable for `q_len` bytes when non-null.
+#[no_mangle]
+pub unsafe extern "C" fn idx_count_any(h: *const Handle, q: *const u8, q_len: usize) -> u32 {
+    let Some(handle) = h.as_ref() else {
+        return u32::MAX;
+    };
+    // `idx_alloc(0)` returns null, so a host that forwards an empty query will pass (NULL, 0).
+    // That is the empty string, not a bad pointer.
+    if q_len == 0 {
+        return handle.index.count_any("") as u32;
+    }
+    if q.is_null() {
+        return u32::MAX;
+    }
+    let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
+        return u32::MAX;
+    };
+    handle.index.count_any(query) as u32
+}
+
+/// Exact `COUNT(*)` of live documents containing EVERY query token. A token absent from the
+/// dictionary makes the answer 0.
+///
+/// # Safety
+/// `h` must be null or a live handle; `q` readable for `q_len` bytes when non-null.
+#[no_mangle]
+pub unsafe extern "C" fn idx_count_all(h: *const Handle, q: *const u8, q_len: usize) -> u32 {
+    let Some(handle) = h.as_ref() else {
+        return u32::MAX;
+    };
+    if q_len == 0 {
+        return handle.index.count_all("") as u32;
+    }
+    if q.is_null() {
+        return u32::MAX;
+    }
+    let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
+        return u32::MAX;
+    };
+    handle.index.count_all(query) as u32
+}
+
+/// Exact `COUNT(*)` of live documents containing the query's tokens consecutive and in order in
+/// one field. An index built without positions returns 0 rather than falling back to
+/// [`idx_count_all`]. Same empty-query / null-handle rules as [`idx_count_any`].
+///
+/// # Safety
+/// `h` must be null or a live handle; `q` readable for `q_len` bytes when non-null.
+#[no_mangle]
+pub unsafe extern "C" fn idx_count_phrase(h: *const Handle, q: *const u8, q_len: usize) -> u32 {
+    let Some(handle) = h.as_ref() else {
+        return u32::MAX;
+    };
+    if q_len == 0 {
+        return handle.index.count_phrase("") as u32;
+    }
+    if q.is_null() {
+        return u32::MAX;
+    }
+    let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
+        return u32::MAX;
+    };
+    handle.index.count_phrase(query) as u32
+}
+
 /// Run a query. Returns the number of hits written to the result buffer, or `u32::MAX` on error.
 ///
 /// `prefix` non-zero enables typeahead semantics on the final token — the right default for a
@@ -991,7 +1213,9 @@ pub unsafe extern "C" fn idx_search(
     k: u32,
     prefix: u32,
 ) -> u32 {
-    let Some(handle) = h.as_mut() else { return u32::MAX };
+    let Some(handle) = h.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() {
         return u32::MAX;
     }
@@ -1008,7 +1232,9 @@ pub unsafe extern "C" fn idx_search(
     for x in &hit {
         handle.result.extend_from_slice(&x.doc.to_le_bytes());
         handle.result.extend_from_slice(&x.score.to_le_bytes());
-        handle.result.extend_from_slice(&x.typo_bucket.to_le_bytes());
+        handle
+            .result
+            .extend_from_slice(&x.typo_bucket.to_le_bytes());
     }
     hit.len() as u32
 }
@@ -1029,7 +1255,9 @@ pub unsafe extern "C" fn idx_search_facet(
     v: *const u8,
     v_len: usize,
 ) -> u32 {
-    let Some(handle) = h.as_mut() else { return u32::MAX };
+    let Some(handle) = h.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() || v.is_null() {
         return u32::MAX;
     }
@@ -1039,13 +1267,17 @@ pub unsafe extern "C" fn idx_search_facet(
     let Ok(value) = std::str::from_utf8(std::slice::from_raw_parts(v, v_len)) else {
         return u32::MAX;
     };
-    let hit = handle.index.search_facet_at(query, k as usize, slot as usize, value);
+    let hit = handle
+        .index
+        .search_facet_at(query, k as usize, slot as usize, value);
     handle.result.clear();
     handle.result.reserve(hit.len() * HIT_BYTE);
     for x in &hit {
         handle.result.extend_from_slice(&x.doc.to_le_bytes());
         handle.result.extend_from_slice(&x.score.to_le_bytes());
-        handle.result.extend_from_slice(&x.typo_bucket.to_le_bytes());
+        handle
+            .result
+            .extend_from_slice(&x.typo_bucket.to_le_bytes());
     }
     hit.len() as u32
 }
@@ -1068,7 +1300,9 @@ pub unsafe extern "C" fn idx_facet_tally(
     q_len: usize,
     slot: u32,
 ) -> u32 {
-    let Some(handle) = h.as_mut() else { return u32::MAX };
+    let Some(handle) = h.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() {
         return u32::MAX;
     }
@@ -1098,20 +1332,26 @@ pub unsafe extern "C" fn idx_search_range(
     lo: f64,
     hi: f64,
 ) -> u32 {
-    let Some(handle) = h.as_mut() else { return u32::MAX };
+    let Some(handle) = h.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() {
         return u32::MAX;
     }
     let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
         return u32::MAX;
     };
-    let hit = handle.index.search_range(query, k as usize, slot as usize, lo, hi);
+    let hit = handle
+        .index
+        .search_range(query, k as usize, slot as usize, lo, hi);
     handle.result.clear();
     handle.result.reserve(hit.len() * HIT_BYTE);
     for x in &hit {
         handle.result.extend_from_slice(&x.doc.to_le_bytes());
         handle.result.extend_from_slice(&x.score.to_le_bytes());
-        handle.result.extend_from_slice(&x.typo_bucket.to_le_bytes());
+        handle
+            .result
+            .extend_from_slice(&x.typo_bucket.to_le_bytes());
     }
     hit.len() as u32
 }
@@ -1134,7 +1374,9 @@ pub unsafe extern "C" fn idx_range_tally(
     edge: *const f64,
     edge_n: usize,
 ) -> u32 {
-    let Some(handle) = h.as_mut() else { return u32::MAX };
+    let Some(handle) = h.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() || edge.is_null() || edge_n < 2 {
         return u32::MAX;
     }
@@ -1168,20 +1410,26 @@ pub unsafe extern "C" fn idx_search_sorted(
     slot: u32,
     ascending: u32,
 ) -> u32 {
-    let Some(handle) = h.as_mut() else { return u32::MAX };
+    let Some(handle) = h.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() {
         return u32::MAX;
     }
     let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
         return u32::MAX;
     };
-    let hit = handle.index.search_sorted(query, k as usize, slot as usize, ascending != 0);
+    let hit = handle
+        .index
+        .search_sorted(query, k as usize, slot as usize, ascending != 0);
     handle.result.clear();
     handle.result.reserve(hit.len() * HIT_BYTE);
     for x in &hit {
         handle.result.extend_from_slice(&x.doc.to_le_bytes());
         handle.result.extend_from_slice(&x.score.to_le_bytes());
-        handle.result.extend_from_slice(&x.typo_bucket.to_le_bytes());
+        handle
+            .result
+            .extend_from_slice(&x.typo_bucket.to_le_bytes());
     }
     hit.len() as u32
 }
@@ -1192,7 +1440,8 @@ pub unsafe extern "C" fn idx_search_sorted(
 /// `h` must be a live handle.
 #[no_mangle]
 pub unsafe extern "C" fn idx_numeric_slot_count(h: *const Handle) -> u32 {
-    h.as_ref().map_or(0, |x| x.index.numeric_slot_count() as u32)
+    h.as_ref()
+        .map_or(0, |x| x.index.numeric_slot_count() as u32)
 }
 
 /// Number of distinct values in facet `slot`. 0 when the slot does not exist.
@@ -1201,7 +1450,8 @@ pub unsafe extern "C" fn idx_numeric_slot_count(h: *const Handle) -> u32 {
 /// `h` must be a live handle.
 #[no_mangle]
 pub unsafe extern "C" fn idx_facet_count(h: *const Handle, slot: u32) -> u32 {
-    h.as_ref().map_or(0, |x| x.index.facet_label_at(slot as usize).len() as u32)
+    h.as_ref()
+        .map_or(0, |x| x.index.facet_label_at(slot as usize).len() as u32)
 }
 
 /// How many facet slots the index carries. 0 when it has no facet field.
@@ -1231,7 +1481,9 @@ pub unsafe extern "C" fn idx_search_facet_all(
     spec: *const u8,
     spec_len: usize,
 ) -> u32 {
-    let Some(handle) = h.as_mut() else { return u32::MAX };
+    let Some(handle) = h.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() || spec.is_null() {
         return u32::MAX;
     }
@@ -1243,8 +1495,12 @@ pub unsafe extern "C" fn idx_search_facet_all(
     };
     let mut want: Vec<(usize, &str)> = Vec::new();
     for part in text.split(' ').filter(|p| !p.is_empty()) {
-        let Some((slot, value)) = part.split_once('=') else { return u32::MAX };
-        let Ok(slot) = slot.parse::<usize>() else { return u32::MAX };
+        let Some((slot, value)) = part.split_once('=') else {
+            return u32::MAX;
+        };
+        let Ok(slot) = slot.parse::<usize>() else {
+            return u32::MAX;
+        };
         want.push((slot, value));
     }
     let hit = handle.index.search_facet_all(query, k as usize, &want);
@@ -1253,7 +1509,9 @@ pub unsafe extern "C" fn idx_search_facet_all(
     for x in &hit {
         handle.result.extend_from_slice(&x.doc.to_le_bytes());
         handle.result.extend_from_slice(&x.score.to_le_bytes());
-        handle.result.extend_from_slice(&x.typo_bucket.to_le_bytes());
+        handle
+            .result
+            .extend_from_slice(&x.typo_bucket.to_le_bytes());
     }
     hit.len() as u32
 }
@@ -1538,7 +1796,9 @@ pub unsafe extern "C" fn idx_image_add(
     digest: *const u8,
     digest_len: usize,
 ) -> u32 {
-    let Some(handle) = h.as_mut() else { return u32::MAX };
+    let Some(handle) = h.as_mut() else {
+        return u32::MAX;
+    };
     // Taken unconditionally: a staged vector must not survive a rejected document.
     let pending = handle.pending.take();
     if handle.builder.is_none() || ptr.is_null() {
@@ -1589,7 +1849,9 @@ pub unsafe extern "C" fn idx_image_add(
 #[no_mangle]
 pub unsafe extern "C" fn idx_image_build(h: *mut ImageHandle) -> u32 {
     let Some(handle) = h.as_mut() else { return 0 };
-    let Some(builder) = handle.builder.take() else { return 0 };
+    let Some(builder) = handle.builder.take() else {
+        return 0;
+    };
     match builder.build() {
         Ok(index) => {
             handle.index = Some(index);
@@ -1605,7 +1867,9 @@ pub unsafe extern "C" fn idx_image_build(h: *mut ImageHandle) -> u32 {
 /// `h` must be null or a live handle.
 #[no_mangle]
 pub unsafe extern "C" fn idx_image_doc_count(h: *const ImageHandle) -> u32 {
-    h.as_ref().and_then(|x| x.index.as_ref()).map_or(0, |i| i.doc_count() as u32)
+    h.as_ref()
+        .and_then(|x| x.index.as_ref())
+        .map_or(0, |i| i.doc_count() as u32)
 }
 
 /// **Vector search alone**: the `p58` tiered pipeline — binary popcount shortlist, int8 rerank,
@@ -1635,7 +1899,9 @@ pub unsafe extern "C" fn idx_image_search_vector(
     k: u32,
     oversample: u32,
 ) -> u32 {
-    let Some(handle) = h.as_mut() else { return u32::MAX };
+    let Some(handle) = h.as_mut() else {
+        return u32::MAX;
+    };
     if ptr.is_null() || handle.index.is_none() || handle.dim == 0 || len != handle.dim {
         return u32::MAX;
     }
@@ -1653,7 +1919,10 @@ pub unsafe extern "C" fn idx_image_search_vector(
         // A slot with no document is impossible by construction, so it is dropped rather than
         // defaulted: a silent 0 here would attribute someone else's embedding to document 0.
         .filter_map(|(slot, score)| {
-            handle.doc_of_slot.get(slot as usize).map(|&doc| (doc, score, WHY_VECTOR))
+            handle
+                .doc_of_slot
+                .get(slot as usize)
+                .map(|&doc| (doc, score, WHY_VECTOR))
         })
         .collect();
     handle.write_image_hit(&hit);
@@ -1718,7 +1987,9 @@ pub unsafe extern "C" fn idx_image_search_fused(
     alpha: f32,
     k: u32,
 ) -> u32 {
-    let Some(handle) = h.as_mut() else { return u32::MAX };
+    let Some(handle) = h.as_mut() else {
+        return u32::MAX;
+    };
     if handle.index.is_none() {
         return u32::MAX;
     }
@@ -1741,7 +2012,9 @@ pub unsafe extern "C" fn idx_image_search_fused(
             Err(_) => return u32::MAX,
         }
     };
-    let Some(parsed) = parse_clause_spec(spec_text) else { return u32::MAX };
+    let Some(parsed) = parse_clause_spec(spec_text) else {
+        return u32::MAX;
+    };
     let clause = borrow_clause(&parsed);
 
     let mut bound: Vec<(usize, f64, f64)> = Vec::new();
@@ -1768,8 +2041,12 @@ pub unsafe extern "C" fn idx_image_search_fused(
         Some(std::slice::from_raw_parts(vec, vec_len).to_vec())
     };
 
-    let probe = (hash_present != 0)
-        .then(|| (Hash64((u64::from(hash_hi) << 32) | u64::from(hash_lo)), hash_max));
+    let probe = (hash_present != 0).then(|| {
+        (
+            Hash64((u64::from(hash_hi) << 32) | u64::from(hash_lo)),
+            hash_max,
+        )
+    });
 
     let query = FusedQuery {
         text,
@@ -1820,9 +2097,18 @@ pub unsafe extern "C" fn idx_image_search_fused(
 /// # Safety
 /// `h` must be a live handle.
 #[no_mangle]
-pub unsafe extern "C" fn idx_image_hash_near(h: *mut ImageHandle, hi: u32, lo: u32, max: u32) -> u32 {
-    let Some(handle) = h.as_mut() else { return u32::MAX };
-    let Some(index) = handle.index.as_ref() else { return u32::MAX };
+pub unsafe extern "C" fn idx_image_hash_near(
+    h: *mut ImageHandle,
+    hi: u32,
+    lo: u32,
+    max: u32,
+) -> u32 {
+    let Some(handle) = h.as_mut() else {
+        return u32::MAX;
+    };
+    let Some(index) = handle.index.as_ref() else {
+        return u32::MAX;
+    };
     let near = index.hash_near(Hash64((u64::from(hi) << 32) | u64::from(lo)), max);
     handle.result.clear();
     handle.result.reserve(near.len() * IMAGE_NEAR_BYTE);
@@ -1850,7 +2136,9 @@ pub unsafe extern "C" fn idx_image_hash_near(h: *mut ImageHandle, hi: u32, lo: u
 /// `h` must be a live handle.
 #[no_mangle]
 pub unsafe extern "C" fn idx_image_why(h: *const ImageHandle, hit: u32) -> u32 {
-    h.as_ref().and_then(|x| x.why.get(hit as usize).copied()).unwrap_or(u32::MAX)
+    h.as_ref()
+        .and_then(|x| x.why.get(hit as usize).copied())
+        .unwrap_or(u32::MAX)
 }
 
 /// Pointer to the last image result. Invalidated by the next call on the same handle.
@@ -2027,7 +2315,10 @@ fn section_span(t: &SectionTable, i: usize) -> Span {
 /// numeric columns (filters and tallies). Per query: `posting`, by plan. Never: the two position
 /// sections (a range handle does not answer phrases) and `doc_key` (no range query reads a key).
 fn is_resident(i: usize) -> bool {
-    !matches!(i, SLOT_POSTING | SLOT_POSITION_AT | SLOT_POSITION | SLOT_DOC_KEY)
+    !matches!(
+        i,
+        SLOT_POSTING | SLOT_POSITION_AT | SLOT_POSITION | SLOT_DOC_KEY
+    )
 }
 
 /// Lay eighteen sections out as a valid index file, backfilling the section table.
@@ -2047,6 +2338,8 @@ fn assemble(part: &[Vec<u8>]) -> Vec<u8> {
         table.extend_from_slice(&(p.len() as u64).to_le_bytes());
     }
     out[index_text::MAGIC.len()..RANGE_HEAD_BYTE].copy_from_slice(&table);
+    let crc = index_text::crc32(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
     out
 }
 
@@ -2088,7 +2381,9 @@ impl RangeHandle {
                     let n = span.len as usize;
                     // The caller has already checked that `fetched` is exactly the planned length;
                     // this guard keeps a short buffer from panicking rather than trusting that.
-                    let Some(bytes) = fetched.get(at..at + n) else { break };
+                    let Some(bytes) = fetched.get(at..at + n) else {
+                        break;
+                    };
                     posting.extend_from_slice(bytes);
                     at += n;
                     list_byte.push(n as u64);
@@ -2127,13 +2422,23 @@ impl RangeHandle {
     ///
     /// # Safety
     /// `ptr` must be readable for `len` bytes when `len` is non-zero.
-    unsafe fn answer_image(&self, query: &str, prefix: bool, ptr: *const u8, len: usize) -> Option<Index> {
+    unsafe fn answer_image(
+        &self,
+        query: &str,
+        prefix: bool,
+        ptr: *const u8,
+        len: usize,
+    ) -> Option<Index> {
         self.resident.as_ref()?;
         let want: u64 = self.plan.iter().map(|(_, s)| s.len).sum();
         if want != len as u64 {
             return None;
         }
-        let posting = if len == 0 { Vec::new() } else { std::slice::from_raw_parts(ptr, len).to_vec() };
+        let posting = if len == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(ptr, len).to_vec()
+        };
         let (narrow_posting, offset_array) = self.narrow(&posting);
         let index = self.open_image(narrow_posting, offset_array)?;
 
@@ -2142,7 +2447,9 @@ impl RangeHandle {
         for (text, _) in index.term_stat(query, prefix) {
             let id = index.term_id_of(&text)?;
             // A term with no postings in the FILE either: nothing was owed for it.
-            if index_text::posting_span(&self.table, &self.posting_offset, id).is_ok_and(|s| s.len == 0) {
+            if index_text::posting_span(&self.table, &self.posting_offset, id)
+                .is_ok_and(|s| s.len == 0)
+            {
                 continue;
             }
             if self.plan.binary_search_by_key(&id, |(t, _)| *t).is_err() {
@@ -2200,7 +2507,9 @@ pub unsafe extern "C" fn idx_range_open(ptr: *const u8, len: usize) -> *mut Rang
         return std::ptr::null_mut();
     }
     let head = std::slice::from_raw_parts(ptr, len);
-    let Ok(table) = index_text::read_section_table(head) else { return std::ptr::null_mut() };
+    let Ok(table) = index_text::read_section_table(head) else {
+        return std::ptr::null_mut();
+    };
     Box::into_raw(Box::new(RangeHandle {
         table,
         part: vec![Vec::new(); SECTION_COUNT],
@@ -2224,9 +2533,13 @@ pub unsafe extern "C" fn idx_range_open(ptr: *const u8, len: usize) -> *mut Rang
 /// `rh` must be a live handle from [`idx_range_open`].
 #[no_mangle]
 pub unsafe extern "C" fn idx_range_plan(rh: *mut RangeHandle) -> u32 {
-    let Some(h) = rh.as_mut() else { return u32::MAX };
-    let span: Vec<Span> =
-        (0..SECTION_COUNT).filter(|i| is_resident(*i)).map(|i| section_span(&h.table, i)).collect();
+    let Some(h) = rh.as_mut() else {
+        return u32::MAX;
+    };
+    let span: Vec<Span> = (0..SECTION_COUNT)
+        .filter(|i| is_resident(*i))
+        .map(|i| section_span(&h.table, i))
+        .collect();
     h.write_plan(&span);
     span.len() as u32
 }
@@ -2307,14 +2620,18 @@ pub unsafe extern "C" fn idx_range_plan_query(
     q_len: usize,
     prefix: u32,
 ) -> u32 {
-    let Some(h) = rh.as_mut() else { return u32::MAX };
+    let Some(h) = rh.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() {
         return u32::MAX;
     }
     let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
         return u32::MAX;
     };
-    let Some(index) = h.resident.as_ref() else { return u32::MAX };
+    let Some(index) = h.resident.as_ref() else {
+        return u32::MAX;
+    };
 
     // Two sources, and both are decided by structures that are already resident, which is why a
     // plan can be exact: the dictionary FST decides the expansions, and the learned-expansion table
@@ -2367,14 +2684,18 @@ pub unsafe extern "C" fn idx_range_search(
     ptr: *const u8,
     len: usize,
 ) -> u32 {
-    let Some(h) = rh.as_mut() else { return u32::MAX };
+    let Some(h) = rh.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() || (ptr.is_null() && len != 0) {
         return u32::MAX;
     }
     let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
         return u32::MAX;
     };
-    let Some(index) = h.answer_image(query, prefix != 0, ptr, len) else { return u32::MAX };
+    let Some(index) = h.answer_image(query, prefix != 0, ptr, len) else {
+        return u32::MAX;
+    };
 
     let hit = if prefix != 0 {
         index.search_prefix(query, k as usize)
@@ -2415,7 +2736,9 @@ pub unsafe extern "C" fn idx_range_search_clause(
     ptr: *const u8,
     len: usize,
 ) -> u32 {
-    let Some(h) = rh.as_mut() else { return u32::MAX };
+    let Some(h) = rh.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() || spec.is_null() || (ptr.is_null() && len != 0) {
         return u32::MAX;
     }
@@ -2425,9 +2748,13 @@ pub unsafe extern "C" fn idx_range_search_clause(
     let Ok(text) = std::str::from_utf8(std::slice::from_raw_parts(spec, spec_len)) else {
         return u32::MAX;
     };
-    let Some(parsed) = parse_clause_spec(text) else { return u32::MAX };
+    let Some(parsed) = parse_clause_spec(text) else {
+        return u32::MAX;
+    };
     let clause = borrow_clause(&parsed);
-    let Some(index) = h.answer_image(query, false, ptr, len) else { return u32::MAX };
+    let Some(index) = h.answer_image(query, false, ptr, len) else {
+        return u32::MAX;
+    };
     let hit = index.search_clause(query, k as usize, offset as usize, &clause, &[]);
     write_hit(&mut h.result, &hit);
     hit.len() as u32
@@ -2447,14 +2774,18 @@ pub unsafe extern "C" fn idx_range_facet_tally(
     ptr: *const u8,
     len: usize,
 ) -> u32 {
-    let Some(h) = rh.as_mut() else { return u32::MAX };
+    let Some(h) = rh.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() || (ptr.is_null() && len != 0) {
         return u32::MAX;
     }
     let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
         return u32::MAX;
     };
-    let Some(index) = h.answer_image(query, false, ptr, len) else { return u32::MAX };
+    let Some(index) = h.answer_image(query, false, ptr, len) else {
+        return u32::MAX;
+    };
     let tally = index.facet_tally_at(query, slot as usize);
     write_facet_tally(&mut h.result, &tally);
     tally.len() as u32
@@ -2477,14 +2808,18 @@ pub unsafe extern "C" fn idx_range_search_range(
     ptr: *const u8,
     len: usize,
 ) -> u32 {
-    let Some(h) = rh.as_mut() else { return u32::MAX };
+    let Some(h) = rh.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() || (ptr.is_null() && len != 0) {
         return u32::MAX;
     }
     let Ok(query) = std::str::from_utf8(std::slice::from_raw_parts(q, q_len)) else {
         return u32::MAX;
     };
-    let Some(index) = h.answer_image(query, false, ptr, len) else { return u32::MAX };
+    let Some(index) = h.answer_image(query, false, ptr, len) else {
+        return u32::MAX;
+    };
     let hit = index.search_range(query, k as usize, slot as usize, lo, hi);
     write_hit(&mut h.result, &hit);
     hit.len() as u32
@@ -2507,7 +2842,9 @@ pub unsafe extern "C" fn idx_range_range_tally(
     ptr: *const u8,
     len: usize,
 ) -> u32 {
-    let Some(h) = rh.as_mut() else { return u32::MAX };
+    let Some(h) = rh.as_mut() else {
+        return u32::MAX;
+    };
     if q.is_null() || edge.is_null() || edge_n < 2 || (ptr.is_null() && len != 0) {
         return u32::MAX;
     }
@@ -2515,7 +2852,9 @@ pub unsafe extern "C" fn idx_range_range_tally(
         return u32::MAX;
     };
     let edge = std::slice::from_raw_parts(edge, edge_n);
-    let Some(index) = h.answer_image(query, false, ptr, len) else { return u32::MAX };
+    let Some(index) = h.answer_image(query, false, ptr, len) else {
+        return u32::MAX;
+    };
     let count = index.range_tally(query, slot as usize, edge);
     write_bucket_count(&mut h.result, &count);
     count.len() as u32
@@ -2527,7 +2866,9 @@ pub unsafe extern "C" fn idx_range_range_tally(
 /// `rh` must be null or a live handle.
 #[no_mangle]
 pub unsafe extern "C" fn idx_range_doc_count(rh: *const RangeHandle) -> u32 {
-    rh.as_ref().and_then(|h| h.resident.as_ref()).map_or(0, |x| x.doc_count() as u32)
+    rh.as_ref()
+        .and_then(|h| h.resident.as_ref())
+        .map_or(0, |x| x.doc_count() as u32)
 }
 
 /// Distinct terms in the file `rh` was opened from, or 0 before [`idx_range_load`]. Known from the
@@ -2605,7 +2946,10 @@ mod tests {
             std::ptr::copy_nonoverlapping(q.as_ptr(), qp, q.len());
             let n = idx_search(h, qp, q.len(), 5, 0);
             idx_free(qp, q.len());
-            assert!(n > 0 && n != u32::MAX, "typo query must return hits, got {n}");
+            assert!(
+                n > 0 && n != u32::MAX,
+                "typo query must return hits, got {n}"
+            );
 
             let rp = idx_result_ptr(h);
             assert_eq!(idx_result_len(h), n as usize * HIT_BYTE);
@@ -2621,8 +2965,14 @@ mod tests {
     fn bad_input_returns_sentinels_rather_than_trapping() {
         unsafe {
             assert!(idx_open(std::ptr::null(), 10).is_null());
-            assert!(idx_open(b"garbage!".as_ptr(), 8).is_null(), "bad magic must not open");
-            assert_eq!(idx_search(std::ptr::null_mut(), b"x".as_ptr(), 1, 5, 0), u32::MAX);
+            assert!(
+                idx_open(b"garbage!".as_ptr(), 8).is_null(),
+                "bad magic must not open"
+            );
+            assert_eq!(
+                idx_search(std::ptr::null_mut(), b"x".as_ptr(), 1, 5, 0),
+                u32::MAX
+            );
             assert_eq!(idx_doc_count(std::ptr::null()), 0);
             assert_eq!(idx_result_len(std::ptr::null()), 0);
             assert!(idx_alloc(0).is_null());
@@ -2655,7 +3005,11 @@ mod tests {
             idx_free(sp, spec.len());
             assert!(!b.is_null());
             assert_eq!(idx_build_facet(b, 1), 1, "field 1 is a valid facet");
-            assert_eq!(idx_build_facet(b, 99), 0, "out of range is refused, not trapped");
+            assert_eq!(
+                idx_build_facet(b, 99),
+                0,
+                "out of range is refused, not trapped"
+            );
 
             for row in [
                 &b"Colgate Total Toothpaste 150g Colgate"[..],
@@ -2767,7 +3121,8 @@ mod tests {
     /// Read the searcher's result buffer back as document ordinals, as a host would.
     unsafe fn searcher_doc(s: *const SearcherHandle, n: u32) -> Vec<u32> {
         assert_ne!(n, u32::MAX, "the call must not have errored");
-        let raw = std::slice::from_raw_parts(idx_searcher_result_ptr(s), idx_searcher_result_len(s));
+        let raw =
+            std::slice::from_raw_parts(idx_searcher_result_ptr(s), idx_searcher_result_len(s));
         assert_eq!(raw.len(), n as usize * HIT_BYTE);
         raw.chunks_exact(HIT_BYTE)
             .map(|c| u32::from_le_bytes(c[..4].try_into().unwrap()))
@@ -2802,14 +3157,22 @@ mod tests {
                 let n = with_bytes(spec, |sp, sn| {
                     idx_searcher_search_clause(s, qp, qn, 10, 0, sp, sn)
                 });
-                assert_eq!(searcher_doc(s, n).len(), 4, "the OR must reach both segments");
+                assert_eq!(
+                    searcher_doc(s, n).len(),
+                    4,
+                    "the OR must reach both segments"
+                );
 
                 // Exclude removes only its own segment's rows, never the other's.
                 let spec = b"0!=Colgate";
                 let n = with_bytes(spec, |sp, sn| {
                     idx_searcher_search_clause(s, qp, qn, 10, 0, sp, sn)
                 });
-                assert_eq!(searcher_doc(s, n), vec![2, 3], "not Colgate leaves the Oral B segment");
+                assert_eq!(
+                    searcher_doc(s, n),
+                    vec![2, 3],
+                    "not Colgate leaves the Oral B segment"
+                );
 
                 // Include, unknown to EVERY segment: nobody can satisfy it.
                 let spec = b"0=Nestle";
@@ -2823,7 +3186,11 @@ mod tests {
                 let n = with_bytes(spec, |sp, sn| {
                     idx_searcher_search_clause(s, qp, qn, 10, 0, sp, sn)
                 });
-                assert_eq!(searcher_doc(s, n).len(), 4, "an all-unknown exclude removes nothing");
+                assert_eq!(
+                    searcher_doc(s, n).len(),
+                    4,
+                    "an all-unknown exclude removes nothing"
+                );
 
                 // Malformed spec is an error, not a match-everything.
                 let spec = b"notanumber=Colgate";
@@ -2839,7 +3206,11 @@ mod tests {
                 let mut paged = searcher_doc(s, idx_searcher_search_page(s, qp, qn, 0, 2));
                 paged.extend(searcher_doc(s, idx_searcher_search_page(s, qp, qn, 2, 2)));
                 assert_eq!(paged, all, "pages partition the merged ranking");
-                assert_eq!(idx_searcher_search_page(s, qp, qn, 99, 2), 0, "past the end is empty");
+                assert_eq!(
+                    idx_searcher_search_page(s, qp, qn, 99, 2),
+                    0,
+                    "past the end is empty"
+                );
             });
 
             idx_searcher_close(s);
@@ -2864,7 +3235,11 @@ mod tests {
                 let b = idx_build_new(sp, spec.len());
                 idx_free(sp, spec.len());
                 if positions {
-                    assert_eq!(idx_build_position(b), 1, "positions must be accepted before any row");
+                    assert_eq!(
+                        idx_build_position(b),
+                        1,
+                        "positions must be accepted before any row"
+                    );
                 }
                 for raw in row {
                     let p = idx_alloc(raw.len());
@@ -2887,7 +3262,10 @@ mod tests {
             assert_eq!(idx_search(with, qp, q.len(), 10, 0), 4);
 
             let n = idx_search_phrase(with, qp, q.len(), 0, 10);
-            assert_eq!(n, 1, "only the adjacent, in-order, same-field document matches");
+            assert_eq!(
+                n, 1,
+                "only the adjacent, in-order, same-field document matches"
+            );
             let raw = std::slice::from_raw_parts(idx_result_ptr(with), idx_result_len(with));
             assert_eq!(u32::from_le_bytes(raw[..4].try_into().unwrap()), 0);
 
@@ -2897,7 +3275,11 @@ mod tests {
                 0,
                 "an index without positions refuses the phrase rather than answering a different query"
             );
-            assert_eq!(idx_search(without, qp, q.len(), 10, 0), 4, "its term search is unaffected");
+            assert_eq!(
+                idx_search(without, qp, q.len(), 10, 0),
+                4,
+                "its term search is unaffected"
+            );
             idx_free(qp, q.len());
 
             // A word no document has: nothing, never everything.
@@ -2917,8 +3299,16 @@ mod tests {
             std::ptr::copy_nonoverlapping(one.as_ptr(), p, one.len());
             idx_build_add(late, p, one.len());
             idx_free(p, one.len());
-            assert_eq!(idx_build_position(late), 0, "too late is refused, not accepted or trapped");
-            assert_eq!(idx_build_position(std::ptr::null_mut()), 0, "a null builder does not trap");
+            assert_eq!(
+                idx_build_position(late),
+                0,
+                "too late is refused, not accepted or trapped"
+            );
+            assert_eq!(
+                idx_build_position(std::ptr::null_mut()),
+                0,
+                "a null builder does not trap"
+            );
             idx_build_free(late);
 
             idx_close(with);
@@ -2940,7 +3330,11 @@ mod tests {
                 std::ptr::copy_nonoverlapping(spec.as_ptr(), sp, spec.len());
                 let b = idx_build_new(sp, spec.len());
                 idx_free(sp, spec.len());
-                assert_eq!(idx_build_key(b, 0), 1, "the key field is accepted before any row");
+                assert_eq!(
+                    idx_build_key(b, 0),
+                    1,
+                    "the key field is accepted before any row"
+                );
                 for text in row {
                     let raw = text.as_bytes();
                     let p = idx_alloc(raw.len());
@@ -2959,7 +3353,10 @@ mod tests {
                 out
             };
 
-            let base = seg(&["sku-1\0Colgate Total Toothpaste 150g", "sku-2\0Aquafresh Mini 50g"]);
+            let base = seg(&[
+                "sku-1\0Colgate Total Toothpaste 150g",
+                "sku-2\0Aquafresh Mini 50g",
+            ]);
             assert_eq!(idx_keyed_count(base), 2);
             assert_eq!(with_key("sku-1", &|p, n| idx_doc_of_key(base, p, n)), 0);
             assert_eq!(
@@ -2969,25 +3366,41 @@ mod tests {
             );
             // Read a key back out of the result buffer, as a host would.
             let n = idx_key_of(base, 1);
-            assert_eq!(std::str::from_utf8(std::slice::from_raw_parts(idx_result_ptr(base), n)), Ok("sku-2"));
+            assert_eq!(
+                std::str::from_utf8(std::slice::from_raw_parts(idx_result_ptr(base), n)),
+                Ok("sku-2")
+            );
 
             let s = idx_searcher_new(base); // CONSUMES base
             assert_eq!(idx_searcher_has_key(s), 1);
 
             // sku-1 is UPDATED: append the new version, and `push` retires the old one.
-            let delta = seg(&["sku-1\0Colgate Total Charcoal 200g", "sku-3\0Oral B Pro 120g"]);
+            let delta = seg(&[
+                "sku-1\0Colgate Total Charcoal 200g",
+                "sku-3\0Oral B Pro 120g",
+            ]);
             assert_eq!(idx_searcher_push(s, delta), 1);
             assert_eq!(idx_searcher_doc_count(s), 4);
-            assert_eq!(idx_searcher_live_count(s), 3, "the superseded row was retired");
-            assert_eq!(with_key("sku-1", &|p, n| idx_searcher_doc_of_key(s, p, n)), 2,
-                "the LIVE sku-1 is the new one");
+            assert_eq!(
+                idx_searcher_live_count(s),
+                3,
+                "the superseded row was retired"
+            );
+            assert_eq!(
+                with_key("sku-1", &|p, n| idx_searcher_doc_of_key(s, p, n)),
+                2,
+                "the LIVE sku-1 is the new one"
+            );
 
             let n = idx_searcher_key_of(s, 2);
             let raw = std::slice::from_raw_parts(idx_searcher_result_ptr(s), n);
             assert_eq!(std::str::from_utf8(raw), Ok("sku-1"));
 
             // A delete arriving from a change stream, expressed the only way a host can.
-            assert_eq!(with_key("sku-2", &|p, n| idx_searcher_delete_key(s, p, n)), 1);
+            assert_eq!(
+                with_key("sku-2", &|p, n| idx_searcher_delete_key(s, p, n)),
+                1
+            );
             assert_eq!(
                 with_key("sku-2", &|p, n| idx_searcher_delete_key(s, p, n)),
                 0,
@@ -2999,11 +3412,17 @@ mod tests {
                 "deleting a key that never existed reports 0 rather than trapping"
             );
             assert_eq!(idx_searcher_live_count(s), 2);
-            assert_eq!(with_key("sku-2", &|p, n| idx_searcher_doc_of_key(s, p, n)), u32::MAX);
+            assert_eq!(
+                with_key("sku-2", &|p, n| idx_searcher_doc_of_key(s, p, n)),
+                u32::MAX
+            );
 
             // Null and non-UTF-8 must return sentinels, never trap.
             assert_eq!(idx_doc_of_key(std::ptr::null(), b"x".as_ptr(), 1), u32::MAX);
-            assert_eq!(idx_searcher_delete_key(std::ptr::null_mut(), b"x".as_ptr(), 1), 0);
+            assert_eq!(
+                idx_searcher_delete_key(std::ptr::null_mut(), b"x".as_ptr(), 1),
+                0
+            );
             assert_eq!(idx_searcher_doc_of_key(s, std::ptr::null(), 0), u32::MAX);
             assert_eq!(idx_keyed_count(std::ptr::null()), 0);
             assert_eq!(idx_build_key(std::ptr::null_mut(), 0), 0);
@@ -3077,7 +3496,11 @@ mod tests {
         for (at, len) in plan_of(rh, n) {
             buf.extend_from_slice(&host.read(at, len));
         }
-        assert_eq!(idx_range_load(rh, buf.as_ptr(), buf.len()), 1, "resident sections must load");
+        assert_eq!(
+            idx_range_load(rh, buf.as_ptr(), buf.len()),
+            1,
+            "resident sections must load"
+        );
         rh
     }
 
@@ -3096,9 +3519,31 @@ mod tests {
     /// A corpus big enough that the posting section is the bulk of the file, which is the whole
     /// premise: the sections a range open skips have to be worth skipping.
     fn corpus_blob() -> Vec<u8> {
-        let brand = ["Colgate", "Nescafe", "Bear Brand", "Lucky Me", "Oral B", "Milo", "Argentina"];
-        let kind = ["Toothpaste", "Coffee", "Powdered Milk", "Instant Noodle", "Corned Beef"];
-        let note = ["Charcoal", "Classic", "Reseal", "Fortified", "Original", "Advanced", "Pro"];
+        let brand = [
+            "Colgate",
+            "Nescafe",
+            "Bear Brand",
+            "Lucky Me",
+            "Oral B",
+            "Milo",
+            "Argentina",
+        ];
+        let kind = [
+            "Toothpaste",
+            "Coffee",
+            "Powdered Milk",
+            "Instant Noodle",
+            "Corned Beef",
+        ];
+        let note = [
+            "Charcoal",
+            "Classic",
+            "Reseal",
+            "Fortified",
+            "Original",
+            "Advanced",
+            "Pro",
+        ];
         let mut b = IndexBuilder::new(Schema::new(vec![
             Field::new("name", 3.0, 0.4),
             Field::new("detail", 1.0, 0.6),
@@ -3121,7 +3566,10 @@ mod tests {
     #[test]
     fn a_range_query_answers_from_a_fraction_of_the_file() {
         let file = corpus_blob();
-        let mut host = RangeHost { file: file.clone(), read_byte: 0 };
+        let mut host = RangeHost {
+            file: file.clone(),
+            read_byte: 0,
+        };
         unsafe {
             let rh = range_open(&mut host);
             let after_open = host.read_byte;
@@ -3149,7 +3597,10 @@ mod tests {
                 file.len(),
                 table.posting.len
             );
-            assert!(after_open < host.read_byte, "the query must read something of its own");
+            assert!(
+                after_open < host.read_byte,
+                "the query must read something of its own"
+            );
             idx_range_close(rh);
         }
     }
@@ -3166,16 +3617,19 @@ mod tests {
             idx_free(p, file.len());
             assert!(!full.is_null());
 
-            let mut host = RangeHost { file: file.clone(), read_byte: 0 };
+            let mut host = RangeHost {
+                file: file.clone(),
+                read_byte: 0,
+            };
             let rh = range_open(&mut host);
 
             for q in [
                 "colgate",
-                "colgaye",          // a typo, so the plan must cover the fuzzy expansion
-                "nescafe classic",  // two tokens
-                "bearbrand",        // a compound split
+                "colgaye",         // a typo, so the plan must cover the fuzzy expansion
+                "nescafe classic", // two tokens
+                "bearbrand",       // a compound split
                 "powdered milk 200g",
-                "zzzznothing",      // nothing in the dictionary at all
+                "zzzznothing", // nothing in the dictionary at all
             ] {
                 let want = {
                     let n = idx_search(full, q.as_ptr(), q.len(), 10, 0);
@@ -3219,9 +3673,20 @@ mod tests {
             assert!(idx_range_open(b"garbage!garbage!".as_ptr(), 16).is_null());
             assert_eq!(idx_range_plan(std::ptr::null_mut()), u32::MAX);
             assert_eq!(idx_range_load(std::ptr::null_mut(), file.as_ptr(), 4), 0);
-            assert_eq!(idx_range_plan_query(std::ptr::null_mut(), b"x".as_ptr(), 1, 0), u32::MAX);
             assert_eq!(
-                idx_range_search(std::ptr::null_mut(), b"x".as_ptr(), 1, 5, 0, file.as_ptr(), 1),
+                idx_range_plan_query(std::ptr::null_mut(), b"x".as_ptr(), 1, 0),
+                u32::MAX
+            );
+            assert_eq!(
+                idx_range_search(
+                    std::ptr::null_mut(),
+                    b"x".as_ptr(),
+                    1,
+                    5,
+                    0,
+                    file.as_ptr(),
+                    1
+                ),
                 u32::MAX
             );
             assert_eq!(idx_range_doc_count(std::ptr::null()), 0);
@@ -3234,11 +3699,22 @@ mod tests {
             let rh = idx_range_open(file.as_ptr(), file.len());
             assert!(!rh.is_null());
             assert_eq!(idx_range_doc_count(rh), 0, "nothing is loaded yet");
-            assert_eq!(idx_range_plan_query(rh, b"x".as_ptr(), 1, 0), u32::MAX, "not loaded");
-            assert_eq!(idx_range_load(rh, file.as_ptr(), 3), 0, "a short resident buffer");
+            assert_eq!(
+                idx_range_plan_query(rh, b"x".as_ptr(), 1, 0),
+                u32::MAX,
+                "not loaded"
+            );
+            assert_eq!(
+                idx_range_load(rh, file.as_ptr(), 3),
+                0,
+                "a short resident buffer"
+            );
             assert_eq!(idx_range_load(rh, std::ptr::null(), 0), 0);
 
-            let mut host = RangeHost { file: file.clone(), read_byte: 0 };
+            let mut host = RangeHost {
+                file: file.clone(),
+                read_byte: 0,
+            };
             let rh2 = range_open(&mut host);
             let q = b"colgate";
             assert_ne!(idx_range_plan_query(rh2, q.as_ptr(), q.len(), 0), u32::MAX);
@@ -3259,7 +3735,14 @@ mod tests {
     /// A corpus with one facet (`brand`) and one numeric column (`size`), some sizes unparseable,
     /// so facet clauses, tallies and half-open ranges all have something non-trivial to decide.
     fn filtered_blob() -> Vec<u8> {
-        let brand = ["Colgate", "Nescafe", "Bear Brand", "Lucky Me", "Oral B", "Milo"];
+        let brand = [
+            "Colgate",
+            "Nescafe",
+            "Bear Brand",
+            "Lucky Me",
+            "Oral B",
+            "Milo",
+        ];
         let kind = ["Toothpaste", "Coffee", "Powdered Milk", "Instant Noodle"];
         let mut b = IndexBuilder::new(Schema::new(vec![
             Field::new("name", 3.0, 0.4),
@@ -3270,8 +3753,16 @@ mod tests {
         .with_numeric(2);
         for i in 0..600usize {
             let grams = 50 + (i % 40) * 5;
-            let name = format!("{} {} {grams}g", brand[i % brand.len()], kind[i % kind.len()]);
-            let size = if i % 29 == 0 { "n/a".to_string() } else { grams.to_string() };
+            let name = format!(
+                "{} {} {grams}g",
+                brand[i % brand.len()],
+                kind[i % kind.len()]
+            );
+            let size = if i % 29 == 0 {
+                "n/a".to_string()
+            } else {
+                grams.to_string()
+            };
             b.add(&Doc::new([name, brand[i % brand.len()].to_string(), size]));
         }
         b.build().unwrap().to_bytes()
@@ -3299,48 +3790,138 @@ mod tests {
             idx_free(p, file.len());
             assert!(!full.is_null());
             let full_out = |n: u32| -> (u32, Vec<u8>) {
-                (n, std::slice::from_raw_parts(idx_result_ptr(full), idx_result_len(full)).to_vec())
+                (
+                    n,
+                    std::slice::from_raw_parts(idx_result_ptr(full), idx_result_len(full)).to_vec(),
+                )
             };
 
-            let mut host = RangeHost { file: file.clone(), read_byte: 0 };
+            let mut host = RangeHost {
+                file: file.clone(),
+                read_byte: 0,
+            };
             let rh = range_open(&mut host);
             let range_out = |n: u32| -> (u32, Vec<u8>) {
                 assert_ne!(n, u32::MAX, "a planned filtered query must not be refused");
-                (n, std::slice::from_raw_parts(idx_range_result_ptr(rh), idx_range_result_len(rh)).to_vec())
+                (
+                    n,
+                    std::slice::from_raw_parts(idx_range_result_ptr(rh), idx_range_result_len(rh))
+                        .to_vec(),
+                )
             };
 
-            let spec: [&[u8]; 5] = [b"0=Colgate", b"0=Colgate|Milo", b"0!=Nescafe", b"0=Nobody", b""];
+            let spec: [&[u8]; 5] = [
+                b"0=Colgate",
+                b"0=Colgate|Milo",
+                b"0!=Nescafe",
+                b"0=Nobody",
+                b"",
+            ];
             let edge = [0.0f64, 100.0, 150.0, 400.0];
             let mut nonempty = 0;
-            for q in ["toothpaste", "colgaye", "coffee 100g", "powdered milk", "bearbrand", "milo", "zzzznothing"] {
+            for q in [
+                "toothpaste",
+                "colgaye",
+                "coffee 100g",
+                "powdered milk",
+                "bearbrand",
+                "milo",
+                "zzzznothing",
+            ] {
                 let buf = fetch_plan(&mut host, rh, q);
                 let (bp, bl) = (buf.as_ptr(), buf.len());
 
                 for s in spec {
                     for (k, offset) in [(10u32, 0u32), (5, 3)] {
-                        let want = full_out(idx_search_clause(full, q.as_ptr(), q.len(), k, offset, s.as_ptr(), s.len()));
-                        let got = range_out(idx_range_search_clause(rh, q.as_ptr(), q.len(), k, offset, s.as_ptr(), s.len(), bp, bl));
-                        assert_eq!(got, want, "clause {:?} disagrees for {q:?}", std::str::from_utf8(s));
+                        let want = full_out(idx_search_clause(
+                            full,
+                            q.as_ptr(),
+                            q.len(),
+                            k,
+                            offset,
+                            s.as_ptr(),
+                            s.len(),
+                        ));
+                        let got = range_out(idx_range_search_clause(
+                            rh,
+                            q.as_ptr(),
+                            q.len(),
+                            k,
+                            offset,
+                            s.as_ptr(),
+                            s.len(),
+                            bp,
+                            bl,
+                        ));
+                        assert_eq!(
+                            got,
+                            want,
+                            "clause {:?} disagrees for {q:?}",
+                            std::str::from_utf8(s)
+                        );
                         nonempty += usize::from(got.0 > 0);
                     }
                 }
                 for slot in [0u32, 3] {
                     let want = full_out(idx_facet_tally(full, q.as_ptr(), q.len(), slot));
-                    let got = range_out(idx_range_facet_tally(rh, q.as_ptr(), q.len(), slot, bp, bl));
+                    let got =
+                        range_out(idx_range_facet_tally(rh, q.as_ptr(), q.len(), slot, bp, bl));
                     assert_eq!(got, want, "facet tally slot {slot} disagrees for {q:?}");
                 }
-                for (slot, lo, hi) in [(0u32, 100.0, 200.0), (0, -1e308, 1e308), (0, 150.0, 150.0), (7, 0.0, 1.0)] {
-                    let want = full_out(idx_search_range(full, q.as_ptr(), q.len(), 10, slot, lo, hi));
-                    let got = range_out(idx_range_search_range(rh, q.as_ptr(), q.len(), 10, slot, lo, hi, bp, bl));
+                for (slot, lo, hi) in [
+                    (0u32, 100.0, 200.0),
+                    (0, -1e308, 1e308),
+                    (0, 150.0, 150.0),
+                    (7, 0.0, 1.0),
+                ] {
+                    let want = full_out(idx_search_range(
+                        full,
+                        q.as_ptr(),
+                        q.len(),
+                        10,
+                        slot,
+                        lo,
+                        hi,
+                    ));
+                    let got = range_out(idx_range_search_range(
+                        rh,
+                        q.as_ptr(),
+                        q.len(),
+                        10,
+                        slot,
+                        lo,
+                        hi,
+                        bp,
+                        bl,
+                    ));
                     assert_eq!(got, want, "range {slot} [{lo}, {hi}) disagrees for {q:?}");
                 }
                 for slot in [0u32, 7] {
-                    let want = full_out(idx_range_tally(full, q.as_ptr(), q.len(), slot, edge.as_ptr(), edge.len()));
-                    let got = range_out(idx_range_range_tally(rh, q.as_ptr(), q.len(), slot, edge.as_ptr(), edge.len(), bp, bl));
+                    let want = full_out(idx_range_tally(
+                        full,
+                        q.as_ptr(),
+                        q.len(),
+                        slot,
+                        edge.as_ptr(),
+                        edge.len(),
+                    ));
+                    let got = range_out(idx_range_range_tally(
+                        rh,
+                        q.as_ptr(),
+                        q.len(),
+                        slot,
+                        edge.as_ptr(),
+                        edge.len(),
+                        bp,
+                        bl,
+                    ));
                     assert_eq!(got, want, "histogram slot {slot} disagrees for {q:?}");
                 }
             }
-            assert!(nonempty > 10, "the comparison must not be vacuous: {nonempty} non-empty clause answers");
+            assert!(
+                nonempty > 10,
+                "the comparison must not be vacuous: {nonempty} non-empty clause answers"
+            );
             idx_range_close(rh);
             idx_close(full);
         }
@@ -3354,16 +3935,25 @@ mod tests {
         let file = filtered_blob();
         let t = index_text::read_section_table(&file).expect("fixture has a section table");
         for slot in 11..=14 {
-            assert!(is_resident(slot), "slot {slot} must be fetched at open, not per query");
+            assert!(
+                is_resident(slot),
+                "slot {slot} must be fetched at open, not per query"
+            );
         }
         let filter = t.facet_label.len + t.facet_id.len + t.numeric_field.len + t.numeric_value.len;
-        let resident: u64 = (0..SECTION_COUNT).filter(|i| is_resident(*i)).map(|i| section_span(&t, i).len).sum();
+        let resident: u64 = (0..SECTION_COUNT)
+            .filter(|i| is_resident(*i))
+            .map(|i| section_span(&t, i).len)
+            .sum();
         eprintln!(
             "filtered_blob: file {} B | resident at open {resident} B, of which facet+numeric {filter} B | posting {} B",
             file.len(),
             t.posting.len
         );
-        assert!(filter > 0, "the fixture must actually carry facet and numeric bytes");
+        assert!(
+            filter > 0,
+            "the fixture must actually carry facet and numeric bytes"
+        );
 
         let mut host = RangeHost { file, read_byte: 0 };
         unsafe {
@@ -3374,11 +3964,56 @@ mod tests {
             assert_eq!(host.read_byte - before, buf.len());
             let spec = b"0=Colgate";
             let edge = [0.0f64, 200.0, 400.0];
-            assert_ne!(idx_range_search_clause(rh, q.as_ptr(), q.len(), 10, 0, spec.as_ptr(), spec.len(), buf.as_ptr(), buf.len()), u32::MAX);
-            assert_ne!(idx_range_facet_tally(rh, q.as_ptr(), q.len(), 0, buf.as_ptr(), buf.len()), u32::MAX);
-            assert_ne!(idx_range_search_range(rh, q.as_ptr(), q.len(), 10, 0, 100.0, 200.0, buf.as_ptr(), buf.len()), u32::MAX);
-            assert_ne!(idx_range_range_tally(rh, q.as_ptr(), q.len(), 0, edge.as_ptr(), edge.len(), buf.as_ptr(), buf.len()), u32::MAX);
-            assert_eq!(host.read_byte - before, buf.len(), "a filter must not need bytes beyond the posting plan");
+            assert_ne!(
+                idx_range_search_clause(
+                    rh,
+                    q.as_ptr(),
+                    q.len(),
+                    10,
+                    0,
+                    spec.as_ptr(),
+                    spec.len(),
+                    buf.as_ptr(),
+                    buf.len()
+                ),
+                u32::MAX
+            );
+            assert_ne!(
+                idx_range_facet_tally(rh, q.as_ptr(), q.len(), 0, buf.as_ptr(), buf.len()),
+                u32::MAX
+            );
+            assert_ne!(
+                idx_range_search_range(
+                    rh,
+                    q.as_ptr(),
+                    q.len(),
+                    10,
+                    0,
+                    100.0,
+                    200.0,
+                    buf.as_ptr(),
+                    buf.len()
+                ),
+                u32::MAX
+            );
+            assert_ne!(
+                idx_range_range_tally(
+                    rh,
+                    q.as_ptr(),
+                    q.len(),
+                    0,
+                    edge.as_ptr(),
+                    edge.len(),
+                    buf.as_ptr(),
+                    buf.len()
+                ),
+                u32::MAX
+            );
+            assert_eq!(
+                host.read_byte - before,
+                buf.len(),
+                "a filter must not need bytes beyond the posting plan"
+            );
             idx_range_close(rh);
         }
     }
@@ -3394,44 +4029,158 @@ mod tests {
         let none = std::ptr::null::<u8>();
         unsafe {
             let null = std::ptr::null_mut::<RangeHandle>();
-            assert_eq!(idx_range_search_clause(null, q.as_ptr(), q.len(), 10, 0, spec.as_ptr(), spec.len(), none, 0), u32::MAX);
-            assert_eq!(idx_range_facet_tally(null, q.as_ptr(), q.len(), 0, none, 0), u32::MAX);
-            assert_eq!(idx_range_search_range(null, q.as_ptr(), q.len(), 10, 0, 0.0, 1.0, none, 0), u32::MAX);
-            assert_eq!(idx_range_range_tally(null, q.as_ptr(), q.len(), 0, edge.as_ptr(), edge.len(), none, 0), u32::MAX);
+            assert_eq!(
+                idx_range_search_clause(
+                    null,
+                    q.as_ptr(),
+                    q.len(),
+                    10,
+                    0,
+                    spec.as_ptr(),
+                    spec.len(),
+                    none,
+                    0
+                ),
+                u32::MAX
+            );
+            assert_eq!(
+                idx_range_facet_tally(null, q.as_ptr(), q.len(), 0, none, 0),
+                u32::MAX
+            );
+            assert_eq!(
+                idx_range_search_range(null, q.as_ptr(), q.len(), 10, 0, 0.0, 1.0, none, 0),
+                u32::MAX
+            );
+            assert_eq!(
+                idx_range_range_tally(
+                    null,
+                    q.as_ptr(),
+                    q.len(),
+                    0,
+                    edge.as_ptr(),
+                    edge.len(),
+                    none,
+                    0
+                ),
+                u32::MAX
+            );
 
             // Opened from the head but never loaded: nothing can be answered yet.
             let cold = idx_range_open(file.as_ptr(), file.len());
             assert!(!cold.is_null());
-            assert_eq!(idx_range_facet_tally(cold, q.as_ptr(), q.len(), 0, none, 0), u32::MAX, "not loaded");
-            assert_eq!(idx_range_search_range(cold, q.as_ptr(), q.len(), 10, 0, 0.0, 1.0, none, 0), u32::MAX, "not loaded");
+            assert_eq!(
+                idx_range_facet_tally(cold, q.as_ptr(), q.len(), 0, none, 0),
+                u32::MAX,
+                "not loaded"
+            );
+            assert_eq!(
+                idx_range_search_range(cold, q.as_ptr(), q.len(), 10, 0, 0.0, 1.0, none, 0),
+                u32::MAX,
+                "not loaded"
+            );
             idx_range_close(cold);
 
-            let mut host = RangeHost { file: file.clone(), read_byte: 0 };
+            let mut host = RangeHost {
+                file: file.clone(),
+                read_byte: 0,
+            };
             let rh = range_open(&mut host);
             let buf = fetch_plan(&mut host, rh, "toothpaste");
             assert!(buf.len() > 1);
             let (bp, bl) = (buf.as_ptr(), buf.len());
 
             // The plan said N bytes; one fewer is a sentinel, not a guess.
-            assert_eq!(idx_range_search_clause(rh, q.as_ptr(), q.len(), 10, 0, spec.as_ptr(), spec.len(), bp, bl - 1), u32::MAX);
-            assert_eq!(idx_range_facet_tally(rh, q.as_ptr(), q.len(), 0, bp, bl - 1), u32::MAX);
-            assert_eq!(idx_range_search_range(rh, q.as_ptr(), q.len(), 10, 0, 0.0, 1e9, bp, bl - 1), u32::MAX);
-            assert_eq!(idx_range_range_tally(rh, q.as_ptr(), q.len(), 0, edge.as_ptr(), edge.len(), bp, bl - 1), u32::MAX);
+            assert_eq!(
+                idx_range_search_clause(
+                    rh,
+                    q.as_ptr(),
+                    q.len(),
+                    10,
+                    0,
+                    spec.as_ptr(),
+                    spec.len(),
+                    bp,
+                    bl - 1
+                ),
+                u32::MAX
+            );
+            assert_eq!(
+                idx_range_facet_tally(rh, q.as_ptr(), q.len(), 0, bp, bl - 1),
+                u32::MAX
+            );
+            assert_eq!(
+                idx_range_search_range(rh, q.as_ptr(), q.len(), 10, 0, 0.0, 1e9, bp, bl - 1),
+                u32::MAX
+            );
+            assert_eq!(
+                idx_range_range_tally(
+                    rh,
+                    q.as_ptr(),
+                    q.len(),
+                    0,
+                    edge.as_ptr(),
+                    edge.len(),
+                    bp,
+                    bl - 1
+                ),
+                u32::MAX
+            );
             // A null posting pointer with a non-zero length.
-            assert_eq!(idx_range_facet_tally(rh, q.as_ptr(), q.len(), 0, none, bl), u32::MAX);
+            assert_eq!(
+                idx_range_facet_tally(rh, q.as_ptr(), q.len(), 0, none, bl),
+                u32::MAX
+            );
             // Malformed spec, too few edges, a null edge array, a non-UTF-8 query.
             let bad_spec = b"Colgate";
-            assert_eq!(idx_range_search_clause(rh, q.as_ptr(), q.len(), 10, 0, bad_spec.as_ptr(), bad_spec.len(), bp, bl), u32::MAX);
-            assert_eq!(idx_range_range_tally(rh, q.as_ptr(), q.len(), 0, edge.as_ptr(), 1, bp, bl), u32::MAX);
-            assert_eq!(idx_range_range_tally(rh, q.as_ptr(), q.len(), 0, std::ptr::null(), 3, bp, bl), u32::MAX);
+            assert_eq!(
+                idx_range_search_clause(
+                    rh,
+                    q.as_ptr(),
+                    q.len(),
+                    10,
+                    0,
+                    bad_spec.as_ptr(),
+                    bad_spec.len(),
+                    bp,
+                    bl
+                ),
+                u32::MAX
+            );
+            assert_eq!(
+                idx_range_range_tally(rh, q.as_ptr(), q.len(), 0, edge.as_ptr(), 1, bp, bl),
+                u32::MAX
+            );
+            assert_eq!(
+                idx_range_range_tally(rh, q.as_ptr(), q.len(), 0, std::ptr::null(), 3, bp, bl),
+                u32::MAX
+            );
             let bad = [0xffu8, 0xfe];
-            assert_eq!(idx_range_facet_tally(rh, bad.as_ptr(), bad.len(), 0, bp, bl), u32::MAX);
+            assert_eq!(
+                idx_range_facet_tally(rh, bad.as_ptr(), bad.len(), 0, bp, bl),
+                u32::MAX
+            );
 
             // The right number of bytes for the WRONG query: "coffee" was never planned, so its
             // lists are empty in the image and answering would under-count. Refused.
             let other = b"coffee";
-            assert_eq!(idx_range_facet_tally(rh, other.as_ptr(), other.len(), 0, bp, bl), u32::MAX);
-            assert_eq!(idx_range_search_range(rh, other.as_ptr(), other.len(), 10, 0, -1e308, 1e308, bp, bl), u32::MAX);
+            assert_eq!(
+                idx_range_facet_tally(rh, other.as_ptr(), other.len(), 0, bp, bl),
+                u32::MAX
+            );
+            assert_eq!(
+                idx_range_search_range(
+                    rh,
+                    other.as_ptr(),
+                    other.len(),
+                    10,
+                    0,
+                    -1e308,
+                    1e308,
+                    bp,
+                    bl
+                ),
+                u32::MAX
+            );
             idx_range_close(rh);
         }
     }
@@ -3441,7 +4190,14 @@ mod tests {
     /// query (text, clause, tally, range, histogram) still answers byte-for-byte like a full open.
     #[test]
     fn a_keyed_index_answers_without_ever_fetching_doc_key() {
-        let brand = ["Colgate", "Nescafe", "Bear Brand", "Lucky Me", "Oral B", "Milo"];
+        let brand = [
+            "Colgate",
+            "Nescafe",
+            "Bear Brand",
+            "Lucky Me",
+            "Oral B",
+            "Milo",
+        ];
         let kind = ["Toothpaste", "Coffee", "Powdered Milk", "Instant Noodle"];
         let mut b = IndexBuilder::new(Schema::new(vec![
             Field::new("name", 3.0, 0.4),
@@ -3454,14 +4210,26 @@ mod tests {
         .with_key(3);
         for i in 0..600usize {
             let grams = 50 + (i % 40) * 5;
-            let name = format!("{} {} {grams}g", brand[i % brand.len()], kind[i % kind.len()]);
-            b.add(&Doc::new([name, brand[i % brand.len()].to_string(), grams.to_string(), format!("SKU-{i:05}")]));
+            let name = format!(
+                "{} {} {grams}g",
+                brand[i % brand.len()],
+                kind[i % kind.len()]
+            );
+            b.add(&Doc::new([
+                name,
+                brand[i % brand.len()].to_string(),
+                grams.to_string(),
+                format!("SKU-{i:05}"),
+            ]));
         }
         let file = b.build().unwrap().to_bytes();
         let t = index_text::read_section_table(&file).expect("fixture has a section table");
         assert!(t.doc_key.len > 0, "the fixture must actually carry keys");
         assert!(!is_resident(SLOT_DOC_KEY));
-        let resident: u64 = (0..SECTION_COUNT).filter(|i| is_resident(*i)).map(|i| section_span(&t, i).len).sum();
+        let resident: u64 = (0..SECTION_COUNT)
+            .filter(|i| is_resident(*i))
+            .map(|i| section_span(&t, i).len)
+            .sum();
 
         unsafe {
             let p = idx_alloc(file.len());
@@ -3470,10 +4238,16 @@ mod tests {
             idx_free(p, file.len());
             assert!(!full.is_null());
             let full_out = |n: u32| -> (u32, Vec<u8>) {
-                (n, std::slice::from_raw_parts(idx_result_ptr(full), idx_result_len(full)).to_vec())
+                (
+                    n,
+                    std::slice::from_raw_parts(idx_result_ptr(full), idx_result_len(full)).to_vec(),
+                )
             };
 
-            let mut host = RangeHost { file: file.clone(), read_byte: 0 };
+            let mut host = RangeHost {
+                file: file.clone(),
+                read_byte: 0,
+            };
             let rh = range_open(&mut host);
             assert_eq!(
                 host.read_byte as u64,
@@ -3483,7 +4257,11 @@ mod tests {
             );
             let range_out = |n: u32| -> (u32, Vec<u8>) {
                 assert_ne!(n, u32::MAX, "a planned query must not be refused");
-                (n, std::slice::from_raw_parts(idx_range_result_ptr(rh), idx_range_result_len(rh)).to_vec())
+                (
+                    n,
+                    std::slice::from_raw_parts(idx_range_result_ptr(rh), idx_range_result_len(rh))
+                        .to_vec(),
+                )
             };
 
             let spec = b"0=Colgate|Milo";
@@ -3498,8 +4276,26 @@ mod tests {
                     "text search disagrees for {q:?}"
                 );
                 assert_eq!(
-                    range_out(idx_range_search_clause(rh, q.as_ptr(), q.len(), 10, 0, spec.as_ptr(), spec.len(), bp, bl)),
-                    full_out(idx_search_clause(full, q.as_ptr(), q.len(), 10, 0, spec.as_ptr(), spec.len())),
+                    range_out(idx_range_search_clause(
+                        rh,
+                        q.as_ptr(),
+                        q.len(),
+                        10,
+                        0,
+                        spec.as_ptr(),
+                        spec.len(),
+                        bp,
+                        bl
+                    )),
+                    full_out(idx_search_clause(
+                        full,
+                        q.as_ptr(),
+                        q.len(),
+                        10,
+                        0,
+                        spec.as_ptr(),
+                        spec.len()
+                    )),
                     "clause disagrees for {q:?}"
                 );
                 assert_eq!(
@@ -3508,19 +4304,212 @@ mod tests {
                     "facet tally disagrees for {q:?}"
                 );
                 assert_eq!(
-                    range_out(idx_range_search_range(rh, q.as_ptr(), q.len(), 10, 0, 100.0, 200.0, bp, bl)),
-                    full_out(idx_search_range(full, q.as_ptr(), q.len(), 10, 0, 100.0, 200.0)),
+                    range_out(idx_range_search_range(
+                        rh,
+                        q.as_ptr(),
+                        q.len(),
+                        10,
+                        0,
+                        100.0,
+                        200.0,
+                        bp,
+                        bl
+                    )),
+                    full_out(idx_search_range(
+                        full,
+                        q.as_ptr(),
+                        q.len(),
+                        10,
+                        0,
+                        100.0,
+                        200.0
+                    )),
                     "numeric range disagrees for {q:?}"
                 );
                 assert_eq!(
-                    range_out(idx_range_range_tally(rh, q.as_ptr(), q.len(), 0, edge.as_ptr(), edge.len(), bp, bl)),
-                    full_out(idx_range_tally(full, q.as_ptr(), q.len(), 0, edge.as_ptr(), edge.len())),
+                    range_out(idx_range_range_tally(
+                        rh,
+                        q.as_ptr(),
+                        q.len(),
+                        0,
+                        edge.as_ptr(),
+                        edge.len(),
+                        bp,
+                        bl
+                    )),
+                    full_out(idx_range_tally(
+                        full,
+                        q.as_ptr(),
+                        q.len(),
+                        0,
+                        edge.as_ptr(),
+                        edge.len()
+                    )),
                     "histogram disagrees for {q:?}"
                 );
-                assert_eq!(host.read_byte - before, buf.len(), "a query reads its posting plan and nothing else");
+                assert_eq!(
+                    host.read_byte - before,
+                    buf.len(),
+                    "a query reads its posting plan and nothing else"
+                );
             }
             idx_range_close(rh);
             idx_close(full);
+        }
+    }
+
+    /// COUNT(*) through the shipped C ABI, not a copy of `Index::count_any`.
+    #[test]
+    fn idx_count_any_and_count_all_drive_the_rust_integer() {
+        unsafe {
+            let spec = b"name:3:0.4";
+            let sp = idx_alloc(spec.len());
+            std::ptr::copy_nonoverlapping(spec.as_ptr(), sp, spec.len());
+            let b = idx_build_new(sp, spec.len());
+            idx_free(sp, spec.len());
+            for row in [
+                &b"Colgate Total Toothpaste"[..],
+                &b"Safeguard Pure White Soap"[..],
+                &b"Lucky Me Pancit Canton"[..],
+            ] {
+                let p = idx_alloc(row.len());
+                std::ptr::copy_nonoverlapping(row.as_ptr(), p, row.len());
+                assert_ne!(idx_build_add(b, p, row.len()), u32::MAX);
+                idx_free(p, row.len());
+            }
+            let h = idx_build_finish(b);
+            assert!(!h.is_null());
+
+            let q = b"toothpaste";
+            let qp = idx_alloc(q.len());
+            std::ptr::copy_nonoverlapping(q.as_ptr(), qp, q.len());
+            assert_eq!(idx_count_any(h, qp, q.len()), 1);
+            idx_free(qp, q.len());
+
+            let q = b"colgate soap";
+            let qp = idx_alloc(q.len());
+            std::ptr::copy_nonoverlapping(q.as_ptr(), qp, q.len());
+            assert_eq!(idx_count_any(h, qp, q.len()), 2);
+            assert_eq!(idx_count_all(h, qp, q.len()), 0);
+            idx_free(qp, q.len());
+
+            let ep = idx_alloc(1);
+            assert_eq!(idx_count_any(h, ep, 0), 0);
+            idx_free(ep, 1);
+            assert_eq!(
+                idx_count_any(h, std::ptr::null(), 0),
+                0,
+                "idx_alloc(0) is NULL; q_len 0 is still empty"
+            );
+
+            assert_eq!(
+                idx_count_any(std::ptr::null(), q.as_ptr(), q.len()),
+                u32::MAX
+            );
+            assert_eq!(
+                idx_count_all(std::ptr::null(), q.as_ptr(), q.len()),
+                u32::MAX
+            );
+            assert_eq!(
+                idx_count_phrase(std::ptr::null(), q.as_ptr(), q.len()),
+                u32::MAX
+            );
+            assert_eq!(
+                idx_searcher_count_any(std::ptr::null(), q.as_ptr(), q.len()),
+                u32::MAX
+            );
+            assert_eq!(
+                idx_searcher_count_all(std::ptr::null(), q.as_ptr(), q.len()),
+                u32::MAX
+            );
+            assert_eq!(
+                idx_searcher_count_phrase(std::ptr::null(), q.as_ptr(), q.len()),
+                u32::MAX
+            );
+            idx_close(h);
+        }
+    }
+
+    /// Phrase COUNT through the shipped C ABI: order-sensitive, 0 without positions, and the
+    /// searcher sum agrees with a single index.
+    #[test]
+    fn idx_count_phrase_is_order_sensitive_and_refuses_without_positions() {
+        unsafe {
+            let spec = b"name:3:0.4";
+            let sp = idx_alloc(spec.len());
+            std::ptr::copy_nonoverlapping(spec.as_ptr(), sp, spec.len());
+            let b = idx_build_new(sp, spec.len());
+            idx_free(sp, spec.len());
+            assert_eq!(idx_build_position(b), 1);
+            for row in [
+                &b"Colgate Total Toothpaste"[..],
+                &b"Total Colgate Toothpaste"[..],
+            ] {
+                let p = idx_alloc(row.len());
+                std::ptr::copy_nonoverlapping(row.as_ptr(), p, row.len());
+                assert_ne!(idx_build_add(b, p, row.len()), u32::MAX);
+                idx_free(p, row.len());
+            }
+            let with = idx_build_finish(b);
+            assert!(!with.is_null());
+
+            let q = b"Colgate Total";
+            let qp = idx_alloc(q.len());
+            std::ptr::copy_nonoverlapping(q.as_ptr(), qp, q.len());
+            assert_eq!(idx_count_phrase(with, qp, q.len()), 1);
+            idx_free(qp, q.len());
+
+            let q = b"Total Colgate";
+            let qp = idx_alloc(q.len());
+            std::ptr::copy_nonoverlapping(q.as_ptr(), qp, q.len());
+            assert_eq!(
+                idx_count_phrase(with, qp, q.len()),
+                1,
+                "the reversed row is a different phrase"
+            );
+            idx_free(qp, q.len());
+            assert_eq!(idx_count_phrase(with, std::ptr::null(), 0), 0);
+
+            let s = idx_searcher_new(with);
+            let q = b"Colgate Total";
+            let qp = idx_alloc(q.len());
+            std::ptr::copy_nonoverlapping(q.as_ptr(), qp, q.len());
+            assert_eq!(idx_searcher_count_phrase(s, qp, q.len()), 1);
+            assert_eq!(idx_searcher_count_any(s, qp, q.len()), 2);
+            idx_free(qp, q.len());
+            let q = b"Total Colgate";
+            let qp = idx_alloc(q.len());
+            std::ptr::copy_nonoverlapping(q.as_ptr(), qp, q.len());
+            assert_eq!(idx_searcher_count_phrase(s, qp, q.len()), 1);
+            idx_free(qp, q.len());
+            idx_searcher_close(s);
+
+            let sp = idx_alloc(spec.len());
+            std::ptr::copy_nonoverlapping(spec.as_ptr(), sp, spec.len());
+            let b = idx_build_new(sp, spec.len());
+            idx_free(sp, spec.len());
+            for row in [
+                &b"Colgate Total Toothpaste"[..],
+                &b"Total Colgate Toothpaste"[..],
+            ] {
+                let p = idx_alloc(row.len());
+                std::ptr::copy_nonoverlapping(row.as_ptr(), p, row.len());
+                assert_ne!(idx_build_add(b, p, row.len()), u32::MAX);
+                idx_free(p, row.len());
+            }
+            let without = idx_build_finish(b);
+            assert!(!without.is_null());
+            let q = b"Colgate Total";
+            let qp = idx_alloc(q.len());
+            std::ptr::copy_nonoverlapping(q.as_ptr(), qp, q.len());
+            assert_eq!(idx_count_phrase(without, qp, q.len()), 0);
+            assert_eq!(
+                idx_count_all(without, qp, q.len()),
+                2,
+                "bag-of-words is still 2"
+            );
+            idx_free(qp, q.len());
+            idx_close(without);
         }
     }
 }

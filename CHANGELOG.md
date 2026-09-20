@@ -6,6 +6,12 @@ All notable changes to `index`. The project is pre-release and unversioned, so e
 [ROADMAP.md](ROADMAP.md) for the tiered plan and [docs/roadmap-rejected.md](docs/roadmap-rejected.md)
 for what was deliberately ruled out.
 
+## p97 -- stored COUNT df / page bits, concurrent snapshot, CRC footer (2026-09-20)
+
+Live count_any of an undeleted term no longer walks postings. Concurrent Searcher
+push/delete then matches a rebuilt COUNT. CRC32 footer refuses truncated/flipped .idx.
+Not TIN 10260 QPS on 8.0 GB. GitHub check-run still unobserved.
+
 ## p93 — TIN's published workload, at the size this machine holds (2026-09-17)
 
 PlanetScale published TIN on 2026-09-16 with QPS / p99 tables for conjunction, disjunction and
