@@ -3,8 +3,8 @@
 # Open since 2026-06-19; the ROADMAP's P3 row and this file's own comments (`scripts/build-wasm.sh`
 # says "js/smoke.mjs and CI both read target/wasm32-unknown-unknown/release/"; `scripts/cli-smoke.sh`
 # says "this is the end-to-end version that runs in CI") have been describing this file since before
-# it existed. Until it runs, "green gate" means "green on one Windows box" — the honest gap the
-# ROADMAP carries.
+# it existed. GitHub Actions is disabled for this user. The same job is
+# `bash scripts/gate.sh`; that is the observed gate. A GitHub check-run is not claimed.
 #
 # What is deliberately NOT here:
 #   - `cargo fmt --check`: the tree is not rustfmt-clean (index-accel), and formatting was never a

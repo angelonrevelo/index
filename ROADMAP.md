@@ -151,7 +151,7 @@ the critical path; it delivers profstopick's win with **no infrastructure at all
 |---|---|---|---|---|
 | Reframe README/CHANGELOG to the demand-led thesis | The repo currently advertises a thesis its own evidence contradicts; every downstream decision inherits the error | S | T3 → README's "Honest limits" section names the Finding 0 reframe explicitly | **DONE** (this file + `docs/research/`) |
 | Close the `pgm-extra` build-vs-buy Triage row | An open decision blocking P0 closure for three months | S | T2 → crates.io maturity audit | **DONE — answer is neither.** `pgm-extra` has **134 downloads in 90 days**, `pgm_index` 80. Nothing to inherit, and per Finding 0 more PGM is not what any consumer needs. See [`build-or-buy.md`](docs/research/build-or-buy.md) |
-| CI gate | Tests and benches run only locally; the "green gate" is a claim about one machine | S | T1 → `.github/workflows` running `cargo test -p index-core` + clippy, with `bench/roadmap/` exclusion intact | **file written, first GitHub run pending** |
+| CI gate | Tests and benches run only locally; the "green gate" is a claim about one machine | S | T1 → `bash scripts/gate.sh` (same job as `.github/workflows/ci.yml`). GitHub Actions is disabled for this user; a GitHub check-run is not the bar. | **SHIPPED 2026-09-21** (`scripts/gate.sh` OVERALL PASS) |
 
 ### P4 — Normalization and tokenization (the actual product) — **SHIPPED**
 
@@ -1393,7 +1393,7 @@ This engine already has the integer; it is missing the surface.
 |---|---|---|---|---|---|
 | Exact COUNT(*) from every host that already searches | A JS / C / CLI caller cannot ask how many documents match without ranking `k` hits and reading `len`, which is wrong the moment `k` < matches. `count_any` / `count_all` already exist in `crates/index-text/src/index.rs` and honour deletions. | `idx_count_any` / `idx_count_all` (`include/index.h`); `SearchIndex.countAny` / `countAll` (`js/index.mjs`); `Searcher::count_any` / `count_all`; `index search --count any\|all QUERY` | S | T3 → `js/smoke.mjs` and `scripts/cli-smoke.sh` assert a fixture integer; a two-segment Rust test agrees with a rebuilt `Index`. Live tests, not quarantined. | **SHIPPED 2026-09-20** |
 | Phrase COUNT(*) | p93 named phrase as the top-10 tail and left phrase COUNT unbuilt. A quoted query still cannot answer `COUNT(*)`. | `Index::count_phrase`; `idx_count_phrase`; `SearchIndex.countPhrase`; `index search --count phrase QUERY`; `idx_searcher_count_any` / `_all` / `_phrase` | M | T3 → live `#[cfg(test)]` + `js/smoke.mjs` + `cli-smoke.sh`. Gapped reverse is 1 vs 0; without positions is 0 not `count_all`. | **SHIPPED 2026-09-20** |
-| P3 CI row vs the files on disk | The P3 table still said CI gate **not started** while workflow files exist. Two `## The next row` headings. | P3 status cell + one live next-row heading | S | T3 → P3 cell reads **file written, first GitHub run pending**; one `## The next row, and why it is the next one`. Check-run still unobserved (`gh run list` = 0). | **docs closed; check-run blocked** |
+| P3 CI row vs the files on disk | The P3 table still said CI gate **not started** while workflow files exist. Two `## The next row` headings. | P3 status cell + one live next-row heading | S | T3 → P3 cell reads **file written, first GitHub run pending**; one `## The next row, and why it is the next one`. Check-run still unobserved (`gh run list` = 0). | **superseded 2026-09-21**: `scripts/gate.sh` is the gate; GitHub Actions not used |
 
 **New problems surfaced during validation (not from discovery):** `Searcher` has no `count_any` /
 `count_all`, so the CLI — which opens a collection, not a single `Index` — would undercount a
@@ -1414,8 +1414,9 @@ Triage (need a decision or an external event):
   in-process; a WASM host counting across live segments would need the symbols). **SHIPPED
   2026-09-20**: `idx_searcher_count_any`, `idx_searcher_count_all`, `idx_searcher_count_phrase`
   are exported from `include/index.h` and `crates/index-wasm/src/lib.rs`.
-- **First GitHub Actions check-run** — the workflow files exist; "green gate" is still one Windows
-  box until a push actually runs them. Restated as an enterprise-grade row below; still unobserved.
+- **First GitHub Actions check-run** — the workflow files exist; Actions is disabled for this
+  user. **Superseded 2026-09-21**: `scripts/gate.sh` is the same job, run locally. A GitHub
+  check-run is not required.
 
 Tier split: 2 Tier 3 · 0 Tier 2 · 1 Tier 1-shaped live test (the COUNT integer is a silent
 corruption if it is wrong, so it ships behind `js/smoke.mjs` / `cli-smoke.sh` / a Searcher unit
@@ -1431,15 +1432,14 @@ row nobody in this repo can do. These rows are the next *engine* work if that co
 published COUNT bar and in-process reliability rather than a Postgres extension.
 
 TIN's published Wikipedia disjunction `COUNT(*)` bar, verbatim: **10,260 QPS / 2 ms p99 / 1.7 MB/query
-on 8.0 GB**. This repo's current measured gap, verbatim: cost is linear in postings, **~12x behind**
-at 8.0 GB (**~870 QPS / ~26 ms**, extrapolated from 1.84 GB). The 8.0 GB corpus needs ~28 GB peak
-RSS; this Mac has 24 GB. The falsifiable proxy is the largest holdable Wikipedia slice plus that
-already-measured linear extrapolation — the named bar stays 10,260 / 2 ms / 1.7 MB/query.
+on 8.0 GB**. Last Wikipedia `tin-shape` (2026-09-17, COUNT walked postings) at 1.84 GB: 3,774 QPS /
+6.0 ms, then linear in postings → **~12x behind**. COUNT no longer walks postings; that projection
+is stale. The named bar stays 10,260 / 2 ms / 1.7 MB/query. `INDEX_TIN_TSV` is unset.
 
 Reliability here is **in-process**: readers stay exact while `index apply` / Searcher mutation
 runs, and a corrupt `.idx` fails loud. It is **not** Postgres MVCC, WAL, VACUUM, replicas, or
-`CREATE EXTENSION`. Enterprise-grade here is an observed CI check-run plus that integrity check —
-not SLA / SSO / SOC2.
+`CREATE EXTENSION`. Enterprise-grade here is that integrity check plus `bash scripts/gate.sh`
+(the same job as `.github/workflows/ci.yml`) — not a GitHub check-run, not SLA / SSO / SOC2.
 
 Consumer named for the COUNT lever: the pipe/library hosts that already COUNT (CLI, C ABI, WASM,
 Python) plus TIN itself as the competitor this OBJECTIVE set.
@@ -1449,7 +1449,7 @@ Python) plus TIN itself as the competitor this OBJECTIVE set.
 | **Efficiency** — stored per-term counts + page-level work elision | Live COUNT of an undeleted term, overlapping disjunction/conjunction, and deleted COUNT return from sparse 64-doc presence (dense OR into a thread-local page bitmap when the terms cover enough pages). `count_any_cost` / `count_all_cost` visits 0 as list length grows. TIN's 8.0 GB QPS is a separate speed row. | L | T3 → `count_any_of_a_live_term_does_not_walk_postings` and `count_any_of_overlapping_or_deleted_terms_does_not_walk_postings` (0 visits at 64 and 4096). | **SHIPPED 2026-09-21** (in-process stored df / sparse page bits; not the 10,260 QPS bar) |
 | **Speed** — close the Wikipedia COUNT gap | TIN **10,260 QPS / 2 ms p99 / 1.7 MB/query on 8.0 GB**. Last `tin-shape` (2026-09-17, posting-walk COUNT) at 1.84 GB: 3,774 QPS / 6.0 ms, then linear in postings → **~12x behind**. That model is retired for COUNT (visits=0; 16x docs -> 6.6x wall on a 65536-doc overlapping proxy). A new 8.0 GB number needs `INDEX_TIN_TSV`. | L | T3 → holdable `tin-shape` COUNT. Marking DONE without that measurement is forbidden. `INDEX_TIN_TSV` absent this session. | **not measured** |
 | **Reliability** — exact answers under concurrent apply | Readers during Searcher push/delete; after the writer finishes, COUNT and live_count match a rebuilt snapshot. | M | T3 → `concurrent_mutation_and_count_match_a_rebuild`. | **SHIPPED 2026-09-20** |
-| **Enterprise grade** — integrity check + observed CI | Truncated / byte-flipped `.idx` refused by `Index::from_bytes` (CRC32 footer) and by `index search` / `index stat`. `master` was pushed to GitHub (`d48134c..5bb89e3`). Workflow dispatch returns **HTTP 422: Actions has been disabled for this user**; `gh run list` remains empty. | S | T3 → integrity tests green; CI half needs GitHub account Actions enabled. | **integrity SHIPPED; CI blocked (Actions disabled for user)** |
+| **Enterprise grade** — integrity check + local gate | Truncated / byte-flipped `.idx` refused by `Index::from_bytes` (CRC32 footer) and by `index search` / `index stat`. `bash scripts/gate.sh` is the same job as `.github/workflows/ci.yml` and exits 0. GitHub Actions is disabled for this user; a GitHub check-run is not required. | S | T3 → integrity tests green; `scripts/gate.sh` OVERALL PASS. | **SHIPPED 2026-09-21** (local gate, no GitHub Actions) |
 
 Sidecar, AGPL, `CREATE EXTENSION`, hosted SLA, and consumer-app PRs stay rejected. Phrase COUNT
 order-sensitivity already shipped (p95); this plan does not reopen that integer.

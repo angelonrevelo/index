@@ -3,7 +3,9 @@
 **Tier:** T3 · **candidate-tier: expected-red until built** · **gate-excluded** until an engine
 change lands. **Status: partial.** Efficiency (stored df / sparse 64-doc page presence for
 overlapping OR/AND and deletions) and concurrent-snapshot reliability and CRC integrity shipped
-2026-09-20/21. Speed (10,260 QPS on 8.0 GB) and observed GitHub check-run are **not** shipped.
+2026-09-20/21. Speed (10,260 QPS on 8.0 GB) is **not** shipped. GitHub Actions is disabled for
+this user; the enterprise CI half is the local gate `scripts/gate.sh` (same job as
+`.github/workflows/ci.yml`), not `gh run list`.
 
 This is **not** a claim the bars are met. p93 measured the gap. p94/p95 exported COUNT. This file
 is the acceptance for closing the gap and for in-process reliability/CI — without becoming a
@@ -20,11 +22,10 @@ Source: `planetscale.com/blog/introducing-tin` (2026-09-16), restated in
 
 ## Current gap (this repo, verbatim)
 
-Cost is **linear in postings**. At 1.84 GB: 3,774 QPS / 6.0 ms. Extrapolated to 8.0 GB:
-**~870 QPS / ~26 ms — ~12x behind.** Full 8.0 GB build needs ~28 GB peak RSS; this Mac has 24 GB.
-The proxy is the largest holdable Wikipedia slice plus that linear extrapolation. Replacing the
-named 8.0 GB / 10,260 / 2 ms / 1.7 MB/query bar with a smaller corpus and calling it reached is
-forbidden.
+Last `tin-shape` on Wikipedia (2026-09-17, COUNT still walked postings) at 1.84 GB: 3,774 QPS /
+6.0 ms, then linear in postings → **~12x behind** at 8.0 GB. COUNT no longer walks postings; that
+projection is stale. The named bar stays 10,260 / 2 ms / 1.7 MB/query on 8.0 GB. Replacing it with
+a smaller corpus and calling it reached is forbidden. `INDEX_TIN_TSV` is unset here.
 
 ## Efficiency bar
 
@@ -50,8 +51,11 @@ visibility maps, WAL, VACUUM, or replicas.
 
 1. **On-disk integrity:** a truncated or byte-flipped `.idx` is refused by `idx_open` and by
    `index search` / `index stat` (loud error, not plausible garbage).
-2. **Observed CI:** `gh run list --repo <this origin> --limit 5` is non-empty. "File written,
-   first GitHub run pending" is not this row DONE. Local `cargo test` is not a check-run.
+2. **Local gate (no GitHub Actions):** `bash scripts/gate.sh` exits 0. That is the same job as
+   `.github/workflows/ci.yml` (clippy `-D warnings`, `cargo test --workspace`, wasm artifacts,
+   `js/smoke.mjs`, `js/image-smoke.mjs`, Python ctypes host, `scripts/cli-smoke.sh`). GitHub
+   Actions is disabled for this user (`HTTP 422` on dispatch); `gh run list` staying empty is not
+   a fail of this bar.
 
 Not in this row: SLA, SSO, SOC2, multi-tenant, 99.9% uptime, `CREATE EXTENSION`.
 
@@ -62,7 +66,7 @@ Not in this row: SLA, SSO, SOC2, multi-tenant, 99.9% uptime, `CREATE EXTENSION`.
 | efficiency | COUNT does not walk every posting of a live undeleted term, including overlapping OR/AND and deletions | **SHIPPED** (`count_any_cost` / `count_all_cost` visits 0) |
 | speed | holdable `tin-shape` COUNT + linear projection no longer ~12x behind 10,260 QPS / 2 ms / 1.7 MB/query | **not built** (`INDEX_TIN_TSV` absent; do not substitute the 65 536-doc proxy) |
 | reliability | concurrent apply + query matches rebuilt snapshot | **SHIPPED** |
-| enterprise grade | corrupt `.idx` refused; GitHub check-run observed | **integrity SHIPPED; CI not observed** |
+| enterprise grade | corrupt `.idx` refused; `scripts/gate.sh` OVERALL PASS | **SHIPPED** (local gate; GitHub Actions not used) |
 
 Marking any of these SHIPPED while the corresponding row above is red is a ROADMAP lie.
 

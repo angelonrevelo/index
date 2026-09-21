@@ -12,8 +12,9 @@ Live count_any of an undeleted term no longer walks postings. Concurrent Searche
 push/delete then matches a rebuilt COUNT. CRC32 footer refuses truncated/flipped .idx.
 2026-09-21: overlapping OR/AND and deleted COUNT also visit 0 postings (sparse 64-doc
 presence; dense OR into a thread-local page bitmap). Not TIN 10260 QPS on 8.0 GB.
-GitHub check-run still unobserved. tin-shape phrase COUNT is Index::count_phrase
+tin-shape phrase COUNT is Index::count_phrase
 (no longer unreachable!); 20k-doc overlapping proxy is not 8.0 GB Wikipedia.
+scripts/gate.sh is the local enterprise gate (same job as ci.yml); GitHub Actions not used.
 
 ## p93 — TIN's published workload, at the size this machine holds (2026-09-17)
 

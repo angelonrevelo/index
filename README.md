@@ -430,6 +430,7 @@ which the library itself consults. They are documented in [`bench/README.md`](be
 ## Build & test
 
 ```sh
+bash scripts/gate.sh                # the enterprise gate: clippy, workspace tests, wasm, JS/Python hosts, CLI smoke
 cargo test --workspace              # engine + learned-index invariants + image tier + CLI
 bash scripts/cli-smoke.sh           # the `index` CLI end to end: build, apply, search, over a pipe
 node js/opfs-check.mjs              # the OPFS tier: persists in a real browser, answers offline
@@ -554,8 +555,9 @@ production corpora. **`index-core` remains dependency-free.**
   (overlapping OR/AND and deletions included; visits=0). That retires the linear-in-postings
   projection; it does **not** replace it with 10,260 QPS. Building the full 8.0 GB corpus needs
   ~28 GB of peak memory, more than this 24 GB Mac has, and `INDEX_TIN_TSV` is unset here. Phrase
-  queries are the slowest kind, at 4x the conjunction p99. The still-open speed/CI plan is
-  [`p97-tin-parity.md`](bench/roadmap/p97-tin-parity.md). See [`docs/benchmarks.md`](docs/benchmarks.md) §7.
+  queries are the slowest kind, at 4x the conjunction p99. The still-open speed plan is
+  [`p97-tin-parity.md`](bench/roadmap/p97-tin-parity.md). The local gate is `bash scripts/gate.sh`
+  (GitHub Actions is not used). See [`docs/benchmarks.md`](docs/benchmarks.md) §7.
 - **Nothing is deployed.** All four integrations are measurements on throwaway worktree branches; no
   `main` was modified and no PR opened. [`docs/adoption.md`](docs/adoption.md) has the per-app plan,
   gate, cost and rollback so that becomes one decision rather than an investigation.
