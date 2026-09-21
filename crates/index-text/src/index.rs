@@ -2775,32 +2775,29 @@ impl Index {
     /// bag, when the index has no positions). A leading `-` clause drops documents that contain
     /// those tokens. A query equal to a live application key is rank-1 and is not fused away.
     pub fn search(&self, query: &str, k: usize) -> Vec<Hit> {
-        self.search_planned(query, k, None, None)
+        self.search_planned(query, k, None, None, false)
     }
 
-    /// [`Index::search`] with an optional pre-built expansion and collection-wide IDF.
+    /// [`Index::search`] (or, with `prefix_last`, [`Index::search_prefix`]) with an optional
+    /// pre-built expansion and collection-wide IDF.
     ///
-    /// `pre` must be the expansion of the **scoring** query (unquoted terms plus phrase tokens,
-    /// exclude tokens stripped). [`crate::Searcher`] computes that string, stats it, and hands
-    /// each segment's expansion back here so the weigh phase is not walked twice.
+    /// `pre` must be the expansion of [`Index::scoring_plan`]'s string at its prefix setting.
+    /// [`crate::Searcher`] computes that string, stats it, and hands each segment's expansion back
+    /// here so the weigh phase is not walked twice.
     pub(crate) fn search_planned(
         &self,
         query: &str,
         k: usize,
         pre: Option<&QueryExpansion>,
         stat: Option<&CollectionStat>,
+        prefix_last: bool,
     ) -> Vec<Hit> {
         let parsed = crate::query::parse(query);
         if parsed.is_empty() {
             return Vec::new();
         }
-        let scoring_buf;
-        let scoring = if parsed.phrase.is_empty() && parsed.exclude.is_empty() {
-            query
-        } else {
-            scoring_buf = parsed.scoring_query();
-            scoring_buf.as_str()
-        };
+        let (scoring, prefix_last) = Self::scoring_plan(query, &parsed, prefix_last);
+        let scoring: &str = &scoring;
         if scoring.is_empty() {
             return Vec::new();
         }
@@ -2810,23 +2807,25 @@ impl Index {
         let exclude_term = self.resolve_exclude_term(&parsed);
         let mut hit = if query_phrase.is_empty() && exclude_term.is_empty() {
             // Same scorer, no extra filter: the existing BM25 walk, including the handed-over
-            // expansion [`crate::Searcher`] already paid for.
+            // expansion [`crate::Searcher`] already paid for. For a plain query this is, call for
+            // call, the body `search` / `search_prefix` had before the planner.
             match (pre, stat) {
+                (Some(ex), Some(s)) if prefix_last => {
+                    self.search_prefix_expanded(scoring, ex, k, s)
+                }
                 (Some(ex), Some(s)) => self.search_expanded(scoring, ex, k, s),
                 _ => self.search_opt(Scan {
-                    query: scoring,
-                    k,
                     pre,
                     stat,
+                    prefix_last,
                     ..Scan::new(scoring, k)
                 }),
             }
         } else {
             self.search_opt(Scan {
-                query: scoring,
-                k,
                 pre,
                 stat,
+                prefix_last,
                 query_phrase: &query_phrase,
                 exclude_term: &exclude_term,
                 ..Scan::new(scoring, k)
@@ -2834,6 +2833,29 @@ impl Index {
         };
         self.promote_key(query, &mut hit, k);
         hit
+    }
+
+    /// The string the bag-of-words arm scores, and whether its last token is prefix-expanded.
+    ///
+    /// A query with no quote and no exclusion scores the RAW string at the caller's prefix
+    /// setting, untouched — the byte-identity [`Index::search_prefix`] promises plain queries.
+    /// Otherwise a full search scores [`crate::query::Query::scoring_query`] with no prefix, and a
+    /// typeahead scores [`crate::query::typeahead_scoring_query`]: typed order, exclusions
+    /// dropped, and a prefix only on a trailing unquoted term — never inside a closed quote.
+    pub(crate) fn scoring_plan<'q>(
+        query: &'q str,
+        parsed: &crate::query::Query,
+        prefix_last: bool,
+    ) -> (std::borrow::Cow<'q, str>, bool) {
+        use std::borrow::Cow;
+        if parsed.phrase.is_empty() && parsed.exclude.is_empty() {
+            (Cow::Borrowed(query), prefix_last)
+        } else if prefix_last {
+            let (s, open) = crate::query::typeahead_scoring_query(query);
+            (Cow::Owned(s), open)
+        } else {
+            (Cow::Owned(parsed.scoring_query()), false)
+        }
     }
 
     /// Move a live keyed document to rank-1 when the raw query string equals its key.
@@ -3905,11 +3927,7 @@ impl Index {
         k: usize,
         stat: &CollectionStat,
     ) -> Vec<Hit> {
-        self.search_opt(Scan {
-            prefix_last: true,
-            stat: Some(stat),
-            ..Scan::new(query, k)
-        })
+        self.search_planned(query, k, None, Some(stat), true)
     }
 
     /// [`Index::search_prefix_with_stat`] from a handed-over expansion, for the same reason as
@@ -3930,11 +3948,15 @@ impl Index {
     }
 
     /// [`Index::search`] with typeahead semantics on the last token.
+    ///
+    /// Runs the same [`crate::query::parse`] plan as [`Index::search`] — phrase, exclude,
+    /// exact-key rank-1, emoji, alias, size identity, `typo_bucket` primary. The prefix goes to the
+    /// last token only when that token is an unquoted term (an exclusion after it is skipped); a
+    /// closed quoted run and an `-exclude` are exact and never prefix-expanded. A query with no
+    /// quote and no `-` clause returns exactly what it did before the planner ran here — asserted
+    /// score-bit for score-bit over 2,253 real titles.
     pub fn search_prefix(&self, query: &str, k: usize) -> Vec<Hit> {
-        self.search_opt(Scan {
-            prefix_last: true,
-            ..Scan::new(query, k)
-        })
+        self.search_planned(query, k, None, None, true)
     }
 
     fn search_opt(&self, scan: Scan) -> Vec<Hit> {
@@ -6182,5 +6204,187 @@ mod tests {
             typo[0].typo_bucket > 0,
             "a typo query is a worse bucket: {typo:?}"
         );
+    }
+
+    /// The profstopick label fixture: one field, `label:3:0.4`, the five rows its typeahead
+    /// measured p98 against.
+    fn cruz_fixture(position: bool) -> Index {
+        let mut b = IndexBuilder::new(Schema::new(vec![Field::new("label", 3.0, 0.4)]));
+        if position {
+            b = b.with_position();
+        }
+        for row in [
+            "Cruz, Juan",
+            "Cruz, Maria Santos",
+            "Santos, Pedro",
+            "Dela Cruz, Ana",
+            "Reyes, Jose",
+        ] {
+            b.add(&Doc::new([row]));
+        }
+        b.build().unwrap()
+    }
+
+    fn doc_of(hit: &[Hit]) -> Vec<u32> {
+        hit.iter().map(|h| h.doc).collect()
+    }
+
+    fn sorted_doc(hit: &[Hit]) -> Vec<u32> {
+        let mut d = doc_of(hit);
+        d.sort_unstable();
+        d
+    }
+
+    /// `search_prefix` is what every typeahead calls, so p98 has to run there too: exclude,
+    /// phrase, and prefix expansion only on the word still being typed.
+    #[test]
+    fn search_prefix_runs_the_query_axis_plan() {
+        let ix = cruz_fixture(true);
+        assert_eq!(
+            sorted_doc(&ix.search_prefix("cruz -santos", 10)),
+            vec![0, 3],
+            "-santos drops rows 1 and 2 in typeahead too"
+        );
+        assert_eq!(
+            sorted_doc(&ix.search_prefix("cru -santos", 10)),
+            vec![0, 3],
+            "the last unquoted term is still prefix-expanded when an exclude trails it"
+        );
+        assert_eq!(doc_of(&ix.search_prefix("\"dela cruz\"", 10)), vec![3]);
+        assert_eq!(
+            doc_of(&ix.search_prefix("\"dela cruz\" an", 10)),
+            vec![3],
+            "a term typed after a phrase is the one being typed"
+        );
+        assert!(
+            ix.search_prefix("\"dela cr\"", 10).is_empty(),
+            "a closed quote is exact: its last token is never prefix-expanded"
+        );
+        assert_eq!(
+            ix.search_prefix("\"dela cr", 10).first().map(|h| h.doc),
+            Some(3),
+            "an UNCLOSED quote is still being typed (rule 2): bag-of-words terms, last one a prefix"
+        );
+        assert_eq!(
+            sorted_doc(&ix.search_prefix("cruz -sant", 10)),
+            vec![0, 1, 3],
+            "an exclude is exact and never prefix-expanded: -sant removes nothing"
+        );
+        assert!(ix.search_prefix("-santos", 10).is_empty(), "exclude-only is empty");
+        assert!(ix.search_prefix("", 10).is_empty());
+        assert!(
+            ix.search_prefix("cruz -santos", 0).is_empty(),
+            "k = 0 stays empty through the planner"
+        );
+    }
+
+    /// Exact-key, emoji, alias and size identity reach the typeahead path as well.
+    #[test]
+    fn search_prefix_carries_key_emoji_alias_and_size() {
+        let mut b = IndexBuilder::new(Schema::new(vec![
+            Field::new("sku", 1.0, 0.4),
+            Field::new("name", 3.0, 0.4),
+        ]))
+        .with_key(0);
+        b.add(&Doc::new(["K99", "short"]));
+        b.add(&Doc::new([
+            "OTHER",
+            "K99 K99 K99 deluxe extra matching product name",
+        ]));
+        let ix = b.build().unwrap();
+        assert_eq!(ix.search_prefix("K99", 5)[0].doc, 0, "live key is rank-1");
+
+        let mut b = IndexBuilder::new(Schema::new(vec![Field::new("name", 1.0, 0.4)]))
+            .with_alias(crate::AliasTable::philippine_grocery());
+        b.add(&Doc::new(["Jasmine Rice 5kg"]));
+        b.add(&Doc::new(["Bear Brand Powdered Milk 300g"]));
+        b.add(&Doc::new(["Bear Brand Powdered Milk 800g"]));
+        b.add(&Doc::new(["happy \u{1f600} soap"]));
+        let ix = b.build().unwrap();
+        assert_eq!(ix.search_prefix("bigas", 5)[0].doc, 0, "bigas → rice");
+        assert_eq!(doc_of(&ix.search_prefix("\u{1f600}", 5)), vec![3]);
+        let size = ix.search_prefix("300g", 10);
+        assert!(size.iter().all(|h| h.doc != 2), "300g never 800g: {size:?}");
+        assert!(size.iter().any(|h| h.doc == 1), "{size:?}");
+        let bear = ix.search_prefix("bear -800g", 10);
+        assert_eq!(doc_of(&bear), vec![1], "exclude a size in typeahead: {bear:?}");
+    }
+
+    /// **The guard consumers rely on.** For a query with no quote and no `-` clause,
+    /// `search_prefix` must return exactly what it returned before the planner ran there: same
+    /// documents, same order, same score BITS, same bucket. The reference is the pre-planner
+    /// body itself (`search_opt` with `prefix_last`), over every typed prefix of the first three
+    /// words of 2,253 real course titles, with and without positions, local and collection stats.
+    #[test]
+    fn search_prefix_of_a_plain_query_is_byte_identical_to_the_pre_planner_path() {
+        let text = include_str!("../../../bench/fixture/profstopick-course.tsv");
+        let row: Vec<Vec<&str>> = text
+            .lines()
+            .skip(1)
+            .map(|l| l.split('\t').collect())
+            .collect();
+        let mut query: Vec<String> = Vec::new();
+        for r in row.iter().step_by(7) {
+            let word: Vec<&str> = r[0].split_whitespace().take(3).collect();
+            for w in 1..=word.len() {
+                let head = word[..w - 1].join(" ");
+                let last = word[w - 1];
+                for cut in [1, 2, 3, last.len()] {
+                    let Some(part) = last.get(..cut.min(last.len())) else {
+                        continue;
+                    };
+                    let q = if head.is_empty() {
+                        part.to_lowercase()
+                    } else {
+                        format!("{} {}", head.to_lowercase(), part.to_lowercase())
+                    };
+                    query.push(q);
+                }
+            }
+        }
+        query.extend(["acct 11", "accountng", "math30", "e-mail", "- ice", "red \"ice"].map(String::from));
+        for position in [false, true] {
+            let mut b = IndexBuilder::new(Schema::new(vec![
+                Field::new("title", 3.0, 0.4),
+                Field::new("dept", 1.0, 0.6),
+                Field::new("code", 2.0, 0.4),
+            ]));
+            if position {
+                b = b.with_position();
+            }
+            for r in &row {
+                b.add(&Doc::new([r[0], r[1], r[2]]));
+            }
+            let ix = b.build().unwrap();
+            let bits = |h: &[Hit]| -> Vec<(u32, u32, u32)> {
+                h.iter().map(|x| (x.doc, x.score.to_bits(), x.typo_bucket)).collect()
+            };
+            let stat = CollectionStat {
+                doc_count: ix.doc_count() * 3,
+                df: ix
+                    .term_stat("accounting", true)
+                    .into_iter()
+                    .map(|(t, d)| (t, d * 2))
+                    .collect(),
+            };
+            for q in &query {
+                let legacy = ix.search_opt(Scan {
+                    prefix_last: true,
+                    ..Scan::new(q, 10)
+                });
+                assert_eq!(bits(&ix.search_prefix(q, 10)), bits(&legacy), "{q:?}");
+                let legacy = ix.search_opt(Scan {
+                    prefix_last: true,
+                    stat: Some(&stat),
+                    ..Scan::new(q, 10)
+                });
+                assert_eq!(
+                    bits(&ix.search_prefix_with_stat(q, 10, &stat)),
+                    bits(&legacy),
+                    "{q:?} with stat"
+                );
+            }
+        }
+        assert!(query.len() > 1000, "{} queries", query.len());
     }
 }

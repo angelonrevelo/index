@@ -40,6 +40,9 @@ export class SearchIndex {
    * `field` is `[{name, boost, b}, ...]`; `doc` is an array of arrays of field strings,
    * positionally aligned with `field`. Use this when the host has the data but no build step —
    * `open()` is for a prebuilt artifact.
+   *
+   * Token positions are always recorded (the module's builder default), so quoted phrases answer;
+   * `position: true` is accepted and changes nothing.
    */
   static async build(wasmBytes, field, doc, { label = null, position = false, key = null } = {}) {
     const { instance } = await WebAssembly.instantiate(wasmBytes, {});
@@ -145,8 +148,8 @@ export class SearchIndex {
 
   /**
    * Exact COUNT(*) of live documents containing the query's tokens consecutive and in order in
-   * one field. Requires `build(..., { position: true })`. Without positions this returns 0 and
-   * does not fall back to `countAll`.
+   * one field. Needs positions — every `build()` records them; an `open()`ed artifact built
+   * without them returns 0 and does not fall back to `countAll`.
    */
   countPhrase(query) {
     const n = this.#withStr(query, (qp, ql) =>
@@ -275,7 +278,8 @@ export class SearchIndex {
   /**
    * **Phrase query**: the query's tokens, consecutive and in order, within ONE field.
    *
-   * Requires `build(..., { position: true })`. Without positions this returns `[]` and does **not**
+   * Needs positions — every `build()` records them. An `open()`ed artifact built without them
+   * returns `[]` and does **not**
    * fall back to an ordinary term search — a fallback would hand back bag-of-words rows that are
    * indistinguishable from phrase rows once they are in the array.
    *

@@ -1477,6 +1477,7 @@ Already shipped, not re-listed as work: typo FST + `typo_bucket`; `analyze::fold
 | **Emoji tokens** | Tokenizer drops non-alphanumeric Unicode (`analyze.rs` `tokenize_folded`). 😀 and 🇵🇭 in the demanding corpus never index. | same emoji in field and query retrieves the row | S | T3 → index `emoji 😀 name`, `search("😀")` hits; fold still used at both ends. | **SHIPPED 2026-09-21** |
 | **Filipino↔English alias rows** | P4 listed `bigas`/`gatas`/`gamot sa ubo`/`sabon panlaba` as spec. No production Filipino stemmer; a few hundred curated rows beat Snowball. | existing `AliasTable`, loaded rows, no new crate | S | T3 → those four queries retrieve the rice/milk/cough-medicine/laundry-soap fixture rows without an LLM. | **SHIPPED 2026-09-21** |
 | **Size/unit negative stays** | P4: stripping size cost −4.6 pp; `300g` fuzzy-matching `800g` is a price-comparison bug. Numeric tokens already skip fuzzy. | keep the exemption; add the explicit negative if missing | S | T3 → `300g` does not retrieve an 800g-only row at any edit distance. | **SHIPPED 2026-09-21** (300g search negative; canonical `1.5L ≡ 1500ml` still P4 spec) |
+| **Planner on the typeahead path** | `search_prefix` (every typeahead host, `idx_search` prefix=1) skipped the planner: `cruz -santos` kept Santos rows. And `idx_build_new` stored no positions, so `"dela cruz"` was refused (empty) even at prefix=0. | `Index::search_prefix` / `search_prefix_with_stat` / `Searcher::search_prefix` run `query::parse`; `idx_build_new` records positions | S | T3 → profstopick label fixture through the ABI at prefix 0 and 1; plain typeahead byte-identical (Rust score-bit guard; 0/15,966 wasm result buffers differ). | **SHIPPED 2026-09-21** (+37.1 % serialized bytes on 2,253 short labels) |
 
 Rejected this sweep (logged, do not rebuild):
 
@@ -1485,5 +1486,5 @@ Rejected this sweep (logged, do not rebuild):
 
 New problem surfaced during validation: the planner is the compose point. Shipping emoji or Filipino aliases as extra `search_*` methods without an executor repeats the COUNT-was-Rust-only failure.
 
-Tier split: 5 Tier 3 · 0 Tier 2 · 0 Tier 1. Rows with a named surface: 5/5.
+Tier split: 6 Tier 3 · 0 Tier 2 · 0 Tier 1. Rows with a named surface: 6/6.
 

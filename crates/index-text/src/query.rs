@@ -101,6 +101,64 @@ impl Query {
 /// ```
 pub fn parse(query: &str) -> Query {
     let mut q = Query::default();
+    walk(query, |clause, token| match clause {
+        Clause::Term => q.term.extend(token),
+        Clause::Phrase => q.phrase.push(token),
+        Clause::Exclude => q.exclude.extend(token),
+    });
+    q
+}
+
+/// The string a **typeahead** scores, and whether its last token is the one still being typed.
+///
+/// [`Query::scoring_query`] files terms before phrases because order does not matter to a
+/// bag-of-words score. In typeahead it matters twice: the engine prefix-expands the LAST token
+/// only, and anchors on the FIRST. So this keeps the positive clauses (terms and phrase runs, never
+/// exclusions) in the order they were typed, and prefix-expands the last one only when it is an
+/// unquoted term:
+///
+/// - `cruz -sant` → `("cruz", true)`: an exclusion is exact and is skipped, so the term before it
+///   is still the word being completed.
+/// - `"dela cruz" an` → `("dela cruz an", true)`.
+/// - `"dela cr"` → `("dela cr", false)`: a CLOSED quote is exact (`p45`), so nothing in it is
+///   expanded, and neither is a term the phrase follows.
+/// - `"dela cr` → `("dela cr", true)`: an unclosed quote is ordinary terms (rule 2).
+///
+/// ```
+/// use index_text::query::typeahead_scoring_query;
+///
+/// assert_eq!(typeahead_scoring_query("cru -santos"), ("cru".to_string(), true));
+/// assert_eq!(typeahead_scoring_query("red \"ice cream\""), ("red ice cream".to_string(), false));
+/// ```
+pub fn typeahead_scoring_query(query: &str) -> (String, bool) {
+    let mut out = String::new();
+    let mut last_is_term = false;
+    walk(query, |clause, token| {
+        if clause == Clause::Exclude {
+            return;
+        }
+        for t in token {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(&t);
+        }
+        last_is_term = clause == Clause::Term;
+    });
+    (out, last_is_term)
+}
+
+/// What a flushed clause is. Private: [`Query`] is the public shape; the order clauses arrive in
+/// is only needed by [`typeahead_scoring_query`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Clause {
+    Term,
+    Phrase,
+    Exclude,
+}
+
+/// The parse loop, handing each non-empty clause to `sink` in the order it was typed.
+fn walk(query: &str, mut sink: impl FnMut(Clause, Vec<String>)) {
     // The clause being accumulated: one unquoted word, or the text between two quotes.
     let mut buf = String::new();
     // True while `buf` is gathering the inside of a quoted run.
@@ -114,7 +172,7 @@ pub fn parse(query: &str) -> Query {
             // A quote both closes the run being gathered and opens the next one, so the flush is
             // of whatever shape the run *was*; `in_phrase` then flips.
             '"' => {
-                flush(&mut q, &mut buf, &mut negated, in_phrase);
+                flush(&mut sink, &mut buf, &mut negated, in_phrase);
                 in_phrase = !in_phrase;
             }
             // Whitespace ends an unquoted clause and is ordinary text inside a quoted run, which
@@ -123,7 +181,7 @@ pub fn parse(query: &str) -> Query {
                 if in_phrase {
                     buf.push(c);
                 } else {
-                    flush(&mut q, &mut buf, &mut negated, false);
+                    flush(&mut sink, &mut buf, &mut negated, false);
                     // A marker separated from its clause by a space marks nothing: `- ice` is the
                     // term `ice`. Cleared HERE rather than inside `flush`, because an opening quote
                     // also flushes and the marker must survive that one -- `-"ice cream"`.
@@ -139,27 +197,32 @@ pub fn parse(query: &str) -> Query {
     // End of input closes the last clause — as a phrase only if its quote was closed. An
     // unterminated run is flushed as terms (rule 2), which costs nothing here: the flush is
     // already "tokenize what was gathered", and the only thing a phrase adds is adjacency.
-    flush(&mut q, &mut buf, &mut negated, false);
-    q
+    flush(&mut sink, &mut buf, &mut negated, false);
 }
 
-/// Tokenize the accumulated clause and file it under `term`, `phrase` or `exclude`.
+/// Tokenize the accumulated clause and hand it to `sink` as a term, phrase or exclusion.
 ///
 /// `negated` is consumed by whatever clause it files, and only then: an EMPTY flush is the opening
 /// quote of `-"ice cream"` and must carry the negation into the quoted run. The whitespace arm
 /// clears it separately, which is what makes `- ice` the term `ice` rather than an exclusion.
-fn flush(q: &mut Query, buf: &mut String, negated: &mut bool, phrase: bool) {
+fn flush(
+    sink: &mut impl FnMut(Clause, Vec<String>),
+    buf: &mut String,
+    negated: &mut bool,
+    phrase: bool,
+) {
     if !buf.is_empty() {
         let token: Vec<String> = tokenize(buf).into_iter().map(|t| t.text).collect();
         // Rule 4: a clause of nothing but punctuation is not a clause.
         if !token.is_empty() {
-            if *negated {
-                q.exclude.extend(token);
+            let clause = if *negated {
+                Clause::Exclude
             } else if phrase {
-                q.phrase.push(token);
+                Clause::Phrase
             } else {
-                q.term.extend(token);
-            }
+                Clause::Term
+            };
+            sink(clause, token);
         }
         buf.clear();
         // Only a clause that actually filed consumes the marker. An empty flush is the opening
@@ -318,5 +381,30 @@ mod tests {
             // The same string must parse the same way every time — no hidden state.
             assert_eq!(q, parse(&s), "parse is not deterministic for {s:?}");
         }
+    }
+
+    /// The typeahead string keeps typed order, drops exclusions, and prefixes only a trailing
+    /// unquoted term.
+    #[test]
+    fn typeahead_scoring_keeps_typed_order_and_prefixes_only_an_open_term() {
+        let t = |q: &str| typeahead_scoring_query(q);
+        assert_eq!(t("cruz -santos"), ("cruz".into(), true));
+        assert_eq!(t("\"dela cruz\" an"), ("dela cruz an".into(), true));
+        assert_eq!(t("\"dela cr\""), ("dela cr".into(), false));
+        assert_eq!(t("\"dela cr"), ("dela cr".into(), true));
+        assert_eq!(t("red \"ice cream\" -x"), ("red ice cream".into(), false));
+        assert_eq!(t("-x"), (String::new(), false));
+        assert_eq!(t(""), (String::new(), false));
+        // Same tokens as the full parse, only reordered: nothing is folded twice.
+        let q = parse("\"Dela Cruz\" Ana -santos");
+        let mut a: Vec<String> = t("\"Dela Cruz\" Ana -santos")
+            .0
+            .split(' ')
+            .map(String::from)
+            .collect();
+        let mut b: Vec<String> = q.scoring_query().split(' ').map(String::from).collect();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
     }
 }

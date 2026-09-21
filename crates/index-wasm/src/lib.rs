@@ -154,7 +154,8 @@ pub unsafe extern "C" fn idx_search_clause(
 
 /// **Phrase query**: the query's tokens, consecutive and in order, within ONE field.
 ///
-/// Requires an index built with [`idx_build_position`]. Without positions this returns **0 hits**
+/// Requires positions ([`idx_build_new`] records them; an artifact built without them may still be
+/// opened with [`idx_open`]). Without positions this returns **0 hits**
 /// rather than falling back to an ordinary term search — a silent fallback would return
 /// bag-of-words results that look like phrase results, which is the failure this refuses to have.
 ///
@@ -743,6 +744,9 @@ fn write_hit(out: &mut Vec<u8>, hit: &[index_text::Hit]) {
 /// Create a builder. `field_spec` is a NUL-separated list of `name:boost:b` triples, e.g.
 /// `"label:3:0.4\0sublabel:1:0.6"`. Returns null on a malformed spec.
 ///
+/// The builder records token positions, so every query [`idx_search`] parses — a quoted phrase
+/// included — is answerable on the index it finishes into. See [`idx_build_position`].
+///
 /// # Safety
 /// `ptr` must be readable for `len` bytes.
 #[no_mangle]
@@ -767,7 +771,16 @@ pub unsafe extern "C" fn idx_build_new(ptr: *const u8, len: usize) -> *mut Build
     if field.is_empty() || field.len() > index_text::MAX_FIELD {
         return std::ptr::null_mut();
     }
-    let inner = IndexBuilder::new(Schema::new(field)).with_alias(AliasTable::philippine_grocery());
+    // Positions are ON for every ABI-built index. `idx_search` parses quotes (p98), and a builder
+    // whose default made one of its own query operators return nothing is a trap a host only finds
+    // by measuring: profstopick's `"label:3:0.4"` answered `"dela cruz"` with zero rows, because
+    // [`index_text::Index`] refuses a phrase it cannot verify rather than answering a bag of words.
+    // The refusal is right; the default was wrong. The cost is the position sections (`p54`:
+    // +15.9 % of artifact bytes on 25,979 real rows). A positionless index still exists — the CLI
+    // without `--position`, the Rust builder — and still refuses phrases when opened here.
+    let inner = IndexBuilder::new(Schema::new(field))
+        .with_alias(AliasTable::philippine_grocery())
+        .with_position();
     Box::into_raw(Box::new(Builder { inner }))
 }
 
@@ -930,12 +943,14 @@ pub unsafe extern "C" fn idx_searcher_has_key(s: *const SearcherHandle) -> u32 {
     s.as_ref().map_or(0, |x| u32::from(x.inner.has_key()))
 }
 
-/// Record **token positions**, before any document is added. Required for [`idx_search_phrase`]
-/// and used by nothing else. Returns 1 on success, 0 if the builder is null or a document has
-/// already been added.
+/// Record **token positions**, before any document is added. Required for [`idx_search_phrase`],
+/// [`idx_count_phrase`] and a quoted run inside [`idx_search`]. Returns 1 on success, 0 if the
+/// builder is null or a document has already been added.
 ///
-/// Opt-in because it is the only build option that costs one `u32` per token OCCURRENCE rather
-/// than per document. An index that answers no phrase query stores no positions at all.
+/// **Already the default of [`idx_build_new`]**, so this is now a no-op kept for hosts that call
+/// it; the return contract is unchanged. It was opt-in because it is the only build option that
+/// costs per token OCCURRENCE; it stopped being opt-in once `idx_search` parsed quotes (p98) and a
+/// builder left at its default answered every quoted query with zero rows.
 ///
 /// # Safety
 /// `b` must be a live builder from [`idx_build_new`].
@@ -1202,6 +1217,11 @@ pub unsafe extern "C" fn idx_count_phrase(h: *const Handle, q: *const u8, q_len:
 ///
 /// `prefix` non-zero enables typeahead semantics on the final token — the right default for a
 /// search-as-you-type box, and Meilisearch's rule.
+///
+/// Both settings run the same p98 plan: `"quoted phrase"`, `-exclude`, a live key at rank-1,
+/// emoji, the Filipino alias table and size identity. With `prefix`, only a trailing UNQUOTED term
+/// is prefix-expanded; a closed quote and an exclusion stay exact. A query with no quote and no
+/// `-` clause returns exactly what it did before the plan reached `prefix` = 1.
 ///
 /// # Safety
 /// `h` must be a live handle; `q` must be readable for `q_len` bytes and be valid UTF-8.
@@ -3118,6 +3138,29 @@ mod tests {
         out
     }
 
+    /// A positionless handle, through `idx_open`. `idx_build_new` records positions, so the ABI
+    /// builder can no longer produce one; an artifact built without them (the CLI without
+    /// `--position`, the Rust builder, any `.idx` from before this default) still opens here, and
+    /// the refusal it owes a phrase is asserted against that.
+    unsafe fn positionless(spec: &[u8], row: &[&[u8]]) -> *mut Handle {
+        let field: Vec<Field> = std::str::from_utf8(spec)
+            .unwrap()
+            .split('\0')
+            .map(|f| {
+                let v: Vec<&str> = f.split(':').collect();
+                Field::new(v[0], v[1].parse().unwrap(), v[2].parse().unwrap())
+            })
+            .collect();
+        let mut b = IndexBuilder::new(Schema::new(field)).with_alias(AliasTable::philippine_grocery());
+        for r in row {
+            b.add(&Doc::new(std::str::from_utf8(r).unwrap().split('\0')));
+        }
+        let bytes = b.build().unwrap().to_bytes();
+        let h = with_bytes(&bytes, |p, n| idx_open(p, n));
+        assert!(!h.is_null());
+        h
+    }
+
     /// Read the searcher's result buffer back as document ordinals, as a host would.
     unsafe fn searcher_doc(s: *const SearcherHandle, n: u32) -> Vec<u32> {
         assert_ne!(n, u32::MAX, "the call must not have errored");
@@ -3228,19 +3271,21 @@ mod tests {
                 b"Cream Ice Bar\0Selecta",
                 b"Chocolate Ice\0Cream Co", // adjacent only ACROSS the field boundary
             ];
-            // Build twice from identical rows: once with positions, once without.
+            // Build twice from identical rows: once through the ABI builder (positions on by
+            // default; asking again is accepted), once opened from a positionless artifact.
             let build = |positions: bool| -> *mut Handle {
+                if !positions {
+                    return positionless(spec, &row);
+                }
                 let sp = idx_alloc(spec.len());
                 std::ptr::copy_nonoverlapping(spec.as_ptr(), sp, spec.len());
                 let b = idx_build_new(sp, spec.len());
                 idx_free(sp, spec.len());
-                if positions {
-                    assert_eq!(
-                        idx_build_position(b),
-                        1,
-                        "positions must be accepted before any row"
-                    );
-                }
+                assert_eq!(
+                    idx_build_position(b),
+                    1,
+                    "asking for positions before any row is accepted (and already the default)"
+                );
                 for raw in row {
                     let p = idx_alloc(raw.len());
                     std::ptr::copy_nonoverlapping(raw.as_ptr(), p, raw.len());
@@ -4484,21 +4529,10 @@ mod tests {
             idx_free(qp, q.len());
             idx_searcher_close(s);
 
-            let sp = idx_alloc(spec.len());
-            std::ptr::copy_nonoverlapping(spec.as_ptr(), sp, spec.len());
-            let b = idx_build_new(sp, spec.len());
-            idx_free(sp, spec.len());
-            for row in [
-                &b"Colgate Total Toothpaste"[..],
-                &b"Total Colgate Toothpaste"[..],
-            ] {
-                let p = idx_alloc(row.len());
-                std::ptr::copy_nonoverlapping(row.as_ptr(), p, row.len());
-                assert_ne!(idx_build_add(b, p, row.len()), u32::MAX);
-                idx_free(p, row.len());
-            }
-            let without = idx_build_finish(b);
-            assert!(!without.is_null());
+            let without = positionless(
+                spec,
+                &[&b"Colgate Total Toothpaste"[..], &b"Total Colgate Toothpaste"[..]],
+            );
             let q = b"Colgate Total";
             let qp = idx_alloc(q.len());
             std::ptr::copy_nonoverlapping(q.as_ptr(), qp, q.len());
@@ -4510,6 +4544,70 @@ mod tests {
             );
             idx_free(qp, q.len());
             idx_close(without);
+        }
+    }
+
+    /// The profstopick typeahead fixture, built EXACTLY as that consumer builds it: `idx_build_new`
+    /// with `"label:3:0.4"` and nothing else — no `idx_build_position`, no key. Before this, the
+    /// quoted phrase found nothing at prefix=0 and was ignored at prefix=1, and `-santos` was
+    /// ignored at prefix=1. Both are one symbol, `idx_search`, so a host cannot route around it.
+    #[test]
+    fn idx_search_runs_the_plan_at_both_prefix_settings_on_the_default_builder() {
+        const LABEL: [&str; 5] = [
+            "Cruz, Juan",
+            "Cruz, Maria Santos",
+            "Santos, Pedro",
+            "Dela Cruz, Ana",
+            "Reyes, Jose",
+        ];
+        unsafe {
+            let h = with_bytes(b"label:3:0.4", |p, n| {
+                let b = idx_build_new(p, n);
+                assert!(!b.is_null());
+                for row in LABEL {
+                    let added = with_bytes(row.as_bytes(), |rp, rn| idx_build_add(b, rp, rn));
+                    assert_ne!(added, u32::MAX);
+                }
+                idx_build_finish(b)
+            });
+            assert!(!h.is_null());
+            let run = |q: &str, prefix: u32| -> Vec<&str> {
+                let n = with_bytes(q.as_bytes(), |p, len| idx_search(h, p, len, 10, prefix));
+                assert_ne!(n, u32::MAX, "{q:?} errored");
+                let raw = std::slice::from_raw_parts(idx_result_ptr(h), idx_result_len(h));
+                raw.chunks_exact(HIT_BYTE)
+                    .map(|c| LABEL[u32::from_le_bytes(c[..4].try_into().unwrap()) as usize])
+                    .collect()
+            };
+            for prefix in [0, 1] {
+                let mut ex = run("cruz -santos", prefix);
+                ex.sort_unstable();
+                assert_eq!(
+                    ex,
+                    ["Cruz, Juan", "Dela Cruz, Ana"],
+                    "prefix={prefix}: -santos must drop both Santos rows"
+                );
+                assert_eq!(
+                    run("\"dela cruz\"", prefix),
+                    ["Dela Cruz, Ana"],
+                    "prefix={prefix}: the quoted phrase must find exactly its row"
+                );
+                assert_eq!(
+                    run("\"cruz, juan\"", prefix),
+                    ["Cruz, Juan"],
+                    "prefix={prefix}: a comma inside the quotes is punctuation, not a token"
+                );
+            }
+            // Typeahead still expands the word being typed, and only that word.
+            let mut cru = run("cru -santos", 1);
+            cru.sort_unstable();
+            assert_eq!(cru, ["Cruz, Juan", "Dela Cruz, Ana"]);
+            assert_eq!(run("\"dela cruz\" an", 1), ["Dela Cruz, Ana"]);
+            assert!(
+                run("\"dela cr\"", 1).is_empty(),
+                "a CLOSED quoted run is exact and is never prefix-expanded"
+            );
+            idx_close(h);
         }
     }
 }

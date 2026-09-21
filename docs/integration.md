@@ -23,9 +23,11 @@
 >
 > **Nothing is deployed.** All three live on throwaway git branches.
 
-`Index::search` / `Searcher::search` (and therefore every host that already calls `search`) execute
-`query::parse`: mixed phrase + exclude, exact-key rank-1, emoji tokens, Filipino `AliasTable` rows
-when the grocery table is loaded (WASM/`idx_build_new` and `index build` load it). See
+`Index::search` / `Searcher::search` and their typeahead twins `search_prefix` (so `idx_search`
+at `prefix` 0 **and** 1) execute `query::parse`: mixed phrase + exclude, exact-key rank-1, emoji
+tokens, Filipino `AliasTable` rows when the grocery table is loaded (WASM/`idx_build_new` and
+`index build` load it). In typeahead only a trailing unquoted term is prefix-expanded. The ABI
+builder records positions, so a quoted phrase answers on `idx_build_new` with no extra call. See
 [`bench/roadmap/p98-query-axis.md`](../bench/roadmap/p98-query-axis.md).
 
 ## The setup
