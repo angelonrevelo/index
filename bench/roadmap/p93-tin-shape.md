@@ -63,7 +63,9 @@ tail. Raw runs: `bench/runs/2026-09-17-tin-shape/`.
 ## Not done
 
 Stack Exchange corpus, RAM-capped cold-read runs, the ParadeDB bridge under matching Docker limits,
-concurrent updates, phrase COUNT.
+concurrent updates. Phrase COUNT is wired in `tin-shape` (`Index::count_phrase`); it is still the
+tail (20k-doc overlapping proxy: disjunction COUNT 566k QPS / 0.01 ms p99, mixed COUNT with phrase
+2.9k QPS / 6.3 ms p99). That proxy is not the 8.0 GB Wikipedia bar.
 
 ```sh
 hf download wikimedia/wikipedia --repo-type dataset \

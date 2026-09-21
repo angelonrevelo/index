@@ -98,7 +98,7 @@ fn run(ix: &Index, shape: Shape, kind: Kind, q: &str) -> usize {
         (Shape::Top10, Kind::Phrase) => ix.search_phrase(q, 10).len(),
         (Shape::Count, Kind::Or) => ix.count_any(q),
         (Shape::Count, Kind::And) => ix.count_all(q),
-        (Shape::Count, Kind::Phrase) => unreachable!("no phrase count"),
+        (Shape::Count, Kind::Phrase) => ix.count_phrase(q),
     }
 }
 
@@ -170,11 +170,12 @@ fn main() {
     );
 
     // ---- workloads, in the order of TIN's tables -------------------------------------------
-    let workload: [(&str, Shape, &[Kind]); 5] = [
+    let workload: [(&str, Shape, &[Kind]); 6] = [
         ("conjunction+disjunction+phrase; top-10", Shape::Top10, &[Kind::And, Kind::Or, Kind::Phrase]),
         ("conjunction+phrase; top-10", Shape::Top10, &[Kind::And, Kind::Phrase]),
         ("disjunction; top-10", Shape::Top10, &[Kind::Or]),
         ("conjunction+disjunction; COUNT", Shape::Count, &[Kind::And, Kind::Or]),
+        ("conjunction+disjunction+phrase; COUNT", Shape::Count, &[Kind::And, Kind::Or, Kind::Phrase]),
         ("disjunction; COUNT", Shape::Count, &[Kind::Or]),
     ];
     println!("| workload | queries | QPS | p50 ms | p99 ms | per kind: p99 ms (zero-result %) |");
