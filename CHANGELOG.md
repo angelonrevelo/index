@@ -6,6 +6,23 @@ All notable changes to `index`. The project is pre-release and unversioned, so e
 [ROADMAP.md](ROADMAP.md) for the tiered plan and [docs/roadmap-rejected.md](docs/roadmap-rejected.md)
 for what was deliberately ruled out.
 
+## p98 -- typeahead runs the plan; the ABI builder records positions (2026-09-21)
+
+`Index::search_prefix` / `search_prefix_with_stat` / `Searcher::search_prefix`, and so
+`idx_search(.., prefix=1)`, ran none of p98: `cruz -santos` returned both Santos rows. They now run
+the same `query::parse` plan as `search` (phrase, exclude, exact-key, emoji, alias, size;
+`typo_bucket` primary). Only a trailing UNQUOTED term is prefix-expanded
+(`query::typeahead_scoring_query`, typed order); a closed quote and an `-exclude` stay exact.
+A plain query (no quote, no `-` clause) is byte-identical: a Rust guard compares score bits
+against the pre-planner body over 2,253 course titles, and the shipped wasm returned 0 different
+result buffers out of 15,966 calls (7,983 plain queries x prefix 0/1) before vs after.
+`"dela cruz"` returned nothing on `idx_build_new("label:3:0.4")` at prefix=0: the builder
+stored no positions, and a phrase that cannot be verified is refused (p45). `idx_build_new`
+now records positions by default; `idx_build_position` is a no-op kept for hosts. Cost on 2,253
+short labels: 49,260 -> 67,540 serialized bytes (+37.1 %). The positionless refusal is
+still asserted in Rust through `idx_open`; JS/Python hosts cannot build a positionless index
+any more, so their refusal checks became default-answers checks. ABI stays 14 (no symbol changed).
+
 ## p98 -- query-axis planner (2026-09-21)
 
 Planner consumes query::parse in Index::search / Searcher::search.

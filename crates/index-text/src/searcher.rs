@@ -480,22 +480,25 @@ impl Searcher {
         // The planner lives in [`Index::search_planned`]: parse, mixed phrase/exclude, exact-key.
         // Stats are taken on the scoring string (quotes and exclude markers stripped) so a mixed
         // query does not expand `discontinued` as a positive term.
+        self.search_planned(query, k, false)
+    }
+
+    /// [`Searcher::search`] and [`Searcher::search_prefix`] are this, differing in `prefix_last`.
+    ///
+    /// The stat pass expands [`Index::scoring_plan`]'s string at ITS prefix setting — the same
+    /// pair each segment's planner derives — so a handed-over expansion always matches the query
+    /// the segment scores.
+    fn search_planned(&self, query: &str, k: usize, prefix_last: bool) -> Vec<Hit> {
         let parsed = crate::query::parse(query);
         if parsed.is_empty() {
             return Vec::new();
         }
-        let scoring_buf;
-        let scoring = if parsed.phrase.is_empty() && parsed.exclude.is_empty() {
-            query
-        } else {
-            scoring_buf = parsed.scoring_query();
-            scoring_buf.as_str()
-        };
-        let mut hit = match self.stat_for(scoring, false) {
-            Some((stat, ex)) => {
-                self.merge(k, |i, ix| ix.search_planned(query, k, Some(&ex[i]), Some(&stat)))
-            }
-            None => self.merge(k, |_i, ix| ix.search_planned(query, k, None, None)),
+        let (scoring, prefix) = Index::scoring_plan(query, &parsed, prefix_last);
+        let mut hit = match self.stat_for(&scoring, prefix) {
+            Some((stat, ex)) => self.merge(k, |i, ix| {
+                ix.search_planned(query, k, Some(&ex[i]), Some(&stat), prefix_last)
+            }),
+            None => self.merge(k, |_i, ix| ix.search_planned(query, k, None, None, prefix_last)),
         };
         self.promote_key(query, &mut hit, k);
         hit
@@ -780,13 +783,11 @@ impl Searcher {
         })
     }
 
+    /// [`Searcher::search`] with typeahead semantics on the last token — the same p98 plan, with
+    /// the prefix rules of [`Index::search_prefix`]. A plain query is byte-identical to the merge
+    /// this ran before the planner reached typeahead.
     pub fn search_prefix(&self, query: &str, k: usize) -> Vec<Hit> {
-        match self.stat_for(query, true) {
-            Some((stat, ex)) => self.merge(k, |i, ix| {
-                ix.search_prefix_expanded(query, &ex[i], k, &stat)
-            }),
-            None => self.merge(k, |_i, ix| ix.search_prefix(query, k)),
-        }
+        self.search_planned(query, k, true)
     }
 
     /// Whether this collection is large enough that fanning a per-segment pass across OS threads
@@ -2169,5 +2170,46 @@ mod tests {
             after.iter().all(|h| h.doc != 0),
             "deleted key is absent: {after:?}"
         );
+    }
+
+    /// p98 through [`Searcher::search_prefix`]: the multi-segment typeahead runs the same plan,
+    /// with collection-wide stats on, and a plain query is byte-identical to the pre-planner merge.
+    #[test]
+    fn searcher_search_prefix_runs_the_query_axis_plan() {
+        let mk = |row: &[&str]| {
+            let mut b = IndexBuilder::new(Schema::new(vec![Field::new("label", 3.0, 0.4)]))
+                .with_position();
+            for r in row {
+                b.add(&Doc::new([*r]));
+            }
+            b.build().unwrap()
+        };
+        let mut s = Searcher::new(mk(&["Cruz, Juan", "Cruz, Maria Santos", "Santos, Pedro"]));
+        s.push(mk(&["Dela Cruz, Ana", "Reyes, Jose"]));
+        let sorted = |h: Vec<Hit>| {
+            let mut d: Vec<u32> = h.iter().map(|x| x.doc).collect();
+            d.sort_unstable();
+            d
+        };
+        assert_eq!(sorted(s.search_prefix("cruz -santos", 10)), vec![0, 3]);
+        assert_eq!(sorted(s.search_prefix("cru -santos", 10)), vec![0, 3]);
+        assert_eq!(sorted(s.search_prefix("\"dela cruz\"", 10)), vec![3]);
+        assert_eq!(sorted(s.search_prefix("\"dela cruz\" an", 10)), vec![3]);
+        assert!(s.search_prefix("\"dela cr\"", 10).is_empty());
+        assert!(s.search_prefix("-cruz", 10).is_empty());
+
+        let bits = |h: &[Hit]| -> Vec<(u32, u32, u32)> {
+            h.iter().map(|x| (x.doc, x.score.to_bits(), x.typo_bucket)).collect()
+        };
+        for q in ["cru", "cruz", "cruz m", "dela c", "santos ped", "reyez", "c"] {
+            // The pre-planner body of `Searcher::search_prefix`, verbatim.
+            let legacy = match s.stat_for(q, true) {
+                Some((stat, ex)) => s.merge(10, |i, ix| {
+                    ix.search_prefix_expanded(q, &ex[i], 10, &stat)
+                }),
+                None => unreachable!("two segments with collection stats on"),
+            };
+            assert_eq!(bits(&s.search_prefix(q, 10)), bits(&legacy), "{q:?}");
+        }
     }
 }

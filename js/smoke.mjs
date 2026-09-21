@@ -559,10 +559,13 @@ e.idx_close(h);
     'a one-word phrase agrees with a one-word search',
   );
 
-  // The refusal that matters: no positions must mean NO phrase results, not a term search whose
-  // rows would be indistinguishable from phrase rows.
-  check(phrase(noPos, 'Ice Cream').length === 0, 'no positions, no phrase results');
+  // `idx_build_new` records positions by default now, so the builder that never called
+  // `idx_build_position` answers the same phrase. The refusal a POSITIONLESS index owes a phrase
+  // (0 rows, never a bag of words) is asserted in Rust through `idx_open`, because no ABI builder
+  // can produce such an index any more.
+  check(phrase(noPos, 'Ice Cream').join() === '0', 'the default builder answers a phrase');
   check(plain(noPos, 'Ice Cream').length === 4, 'its ordinary search is unaffected');
+  check(plain(noPos, '"Ice Cream"').join() === '0', 'idx_search answers a quoted run on the default builder');
 
   e.idx_close(withPos);
   e.idx_close(noPos);
@@ -604,8 +607,8 @@ e.idx_close(h);
   check(allCount(withPos, 'Colgate Total') === 2, 'count_all of the phrase fixture is 2 either way');
   check(phraseCount(withPos, 'Colgate Total') === 1, 'count_phrase(Colgate Total) is 1');
   check(phraseCount(withPos, 'Total Colgate') === 1, 'count_phrase(Total Colgate) is 1 — the reversed row, not 2');
-  check(phraseCount(noPos, 'Colgate Total') === 0, 'without positions count_phrase is 0, not count_all');
-  check(allCount(noPos, 'Colgate Total') === 2, 'without positions count_all is still 2');
+  check(phraseCount(noPos, 'Colgate Total') === 1, 'the default builder counts the phrase: 1, not count_all');
+  check(allCount(noPos, 'Colgate Total') === 2, 'count_all is still 2');
   e.idx_close(withPos);
   e.idx_close(noPos);
 }
@@ -713,14 +716,14 @@ e.idx_close(h);
   check(ix.searchClause('Toothpaste', [{ slot: 0, value: ['Colgate'], exclude: true }]).length === 4,
     'the shipped host: an all-unknown exclude removes nothing');
 
-  // The shipped host's own phrase path, including the build-time opt-in it has to pass through.
+  // The shipped host's own phrase path. The position flag is accepted; the builder records positions regardless.
   const px = await SearchIndex.build(wasm, field, row, { position: true });
   check(px.searchPhrase('Colgate Total').length === 1, 'the shipped host answers a phrase');
   check(px.searchPhrase('Total Colgate').length === 0, 'and refuses the words in the wrong order');
-  check(ix.searchPhrase('Colgate Total').length === 0, 'an index built without positions refuses it');
+  check(ix.searchPhrase('Colgate Total').length === 1, 'the default build (no position flag) answers it too');
   check(px.countPhrase('Colgate Total') === 1, 'the shipped host countPhrase(Colgate Total) is 1');
   check(px.countPhrase('Total Colgate') === 0, 'the shipped host countPhrase(Total Colgate) is 0');
-  check(ix.countPhrase('Colgate Total') === 0, 'the shipped host countPhrase without positions is 0');
+  check(ix.countPhrase('Colgate Total') === 1, 'the shipped host countPhrase on the default build is 1');
   px.close();
 
   let refused = false;

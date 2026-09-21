@@ -1,6 +1,6 @@
 # P98 — query-axis planner
 
-**Tier:** T3 · **Status: SHIPPED 2026-09-21.** Goal prompt:
+**Tier:** T3 · **Status: SHIPPED 2026-09-21** (typeahead + default-builder positions: same day, below). Goal prompt:
 [`docs/brainstorm/query-axis/GOAL.md`](../../docs/brainstorm/query-axis/GOAL.md).
 
 Indexing is one arm. Exact key, quoted phrase, alias, facet, emoji, Filipino gloss, and
@@ -45,3 +45,37 @@ new `.idx` format.
 | emoji | index and query of 😀 retrieve the row | **SHIPPED** |
 | Filipino alias | `bigas` retrieves the rice row via `AliasTable` | **SHIPPED** |
 | size negative | `300g` does not retrieve an 800g-only row | **SHIPPED** |
+| typeahead | `search_prefix` / `idx_search` prefix=1 runs the same plan; plain prefix queries unchanged | **SHIPPED** |
+| default builder phrase | `"dela cruz"` on `idx_build_new("label:3:0.4")` finds its row | **SHIPPED** |
+
+## Typeahead and the default builder (follow-up, same day)
+
+Measured through the shipped wasm on profstopick's label fixture (`label:3:0.4`,
+`Cruz, Juan` / `Cruz, Maria Santos` / `Santos, Pedro` / `Dela Cruz, Ana` / `Reyes, Jose`):
+
+| query | prefix | before | after |
+|---|---|---|---|
+| `cruz -santos` | 1 | Cruz Maria Santos, Cruz Juan, **Santos Pedro**, Dela Cruz Ana | Cruz Juan, Dela Cruz Ana |
+| `cruz -santos` | 0 | Cruz Juan, Dela Cruz Ana | same |
+| `"dela cruz"` | 1 | Dela Cruz Ana, Cruz Juan, Cruz Maria Santos (quotes ignored) | Dela Cruz Ana |
+| `"dela cruz"` | 0 | **nothing** | Dela Cruz Ana |
+
+Two causes. (1) `Index::search_prefix` called `search_opt(Scan { prefix_last: true, .. })`
+directly, never `search_planned`. (2) `idx_build_new` never set positions, and
+`resolve_query_phrase` refuses a phrase on an index without them (`p45`: empty, never a bag).
+Not punctuation, not fold: `"cruz, juan"` matched once positions existed.
+
+Fix: `search_planned` takes `prefix_last`; `Index::scoring_plan` keeps the raw string for a plain
+query (byte-identity) and otherwise uses `query::typeahead_scoring_query` — positive clauses in
+typed order, prefix only when the last one is an unquoted term. `idx_build_new` records
+positions. Tests: `search_prefix_runs_the_query_axis_plan`,
+`search_prefix_carries_key_emoji_alias_and_size`,
+`search_prefix_of_a_plain_query_is_byte_identical_to_the_pre_planner_path`,
+`searcher_search_prefix_runs_the_query_axis_plan`,
+`typeahead_scoring_keeps_typed_order_and_prefixes_only_an_open_term`,
+`idx_search_runs_the_plan_at_both_prefix_settings_on_the_default_builder`.
+
+Cost of positions by default: 2,253 course titles, one field, serialized **49,260 → 67,540 B
+(+37.1 %)** — higher than `p54`'s +15.9 % on 25,979 multi-field rows, because short labels are
+mostly single-occurrence postings. Plain queries: **0 of 15,966** wasm result buffers differ
+(7,983 typed prefixes of those titles, prefix 0 and 1, before vs after artifact).

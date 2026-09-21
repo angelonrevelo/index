@@ -1357,10 +1357,19 @@ def main() -> int:
             "a one-word phrase agrees with a one-word search",
         )
 
-    # Without positions the phrase is REFUSED, not silently answered as a term search.
-    with Index.build(lib, pf, phrase_row) as nopos:
-        check(nopos.search_phrase("Ice Cream") == [], "no positions, no phrase results")
-        check(len(nopos.search("Ice Cream")) == 4, "its ordinary search is unaffected")
+    # idx_build_new records positions by default, so a build that never asked for them answers
+    # the phrase. The refusal a POSITIONLESS index owes (0 rows, never a bag of words) is asserted
+    # in Rust through idx_open: no ABI builder can produce such an index any more.
+    with Index.build(lib, pf, phrase_row) as dflt:
+        check(
+            [h.doc for h in dflt.search_phrase("Ice Cream")] == [0],
+            "the default builder answers a phrase",
+        )
+        check(len(dflt.search("Ice Cream")) == 4, "its ordinary search is unaffected")
+        check(
+            [h.doc for h in dflt.search('"Ice Cream"')] == [0],
+            "idx_search answers a quoted run on the default builder",
+        )
 
     # Phrase COUNT(*). Both rows contain both words, so count_all is 2 either way; a phrase
     # count that fell back to bag-of-words would report 2 for the reversed order and 2 without
@@ -1385,12 +1394,12 @@ def main() -> int:
             [h.doc for h in cx.search_phrase("Total Colgate")] == [1],
             "search_phrase(Total Colgate) is the reversed row",
         )
-    with Index.build(lib, cf, pair) as nopos:
+    with Index.build(lib, cf, pair) as dflt:
         check(
-            nopos.count_phrase("Colgate Total") == 0,
-            "without positions count_phrase is 0, not count_all",
+            dflt.count_phrase("Colgate Total") == 1,
+            "the default builder counts the phrase: 1, not count_all",
         )
-        check(nopos.count_all("Colgate Total") == 2, "without positions count_all is still 2")
+        check(dflt.count_all("Colgate Total") == 2, "count_all is still 2")
 
     try:
         Index.build(lib, [("name", 3, 0.4)], [], facet=99)
@@ -1485,12 +1494,12 @@ def main() -> int:
             "a phrase is found at global ordinals in both segments",
         )
         check(len(live2.search("Ice Cream")) == 4, "the bag-of-words search still sees all four")
-        # A segment with no positions must contribute NOTHING rather than term matches, which
-        # would be indistinguishable from phrase matches once merged.
+        # A segment pushed from the default builder carries positions too, so it contributes.
+        # (A positionless segment contributing NOTHING is asserted in Rust, index-text searcher.)
         live2.push(Index.build(lib, pfield, [["Strawberry Ice Cream Cone"]]))
         check(
-            sorted(h.doc for h in live2.search_phrase("Ice Cream")) == [0, 2],
-            "only segments that CAN verify contribute to a phrase",
+            sorted(h.doc for h in live2.search_phrase("Ice Cream")) == [0, 2, 4],
+            "a default-built segment contributes its phrase row",
         )
 
     # ---- The image tier, from Python -------------------------------------------------------
