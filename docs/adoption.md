@@ -12,9 +12,9 @@
 
 | Repo | Branch | Worktree | What is on it |
 |---|---|---|---|
-| profstopick | `index-engine-eval` | `../profstopick-index-eval` | `src/lib/search-match-index.mjs` (adapter), `test/search-name-order-index.test.mjs` (their test, one import line changed) |
+| profstopick | `feat/index-engine-p98` | `../profstopick` | `src/lib/search-match-index.mjs` (ABI 14 adapter), `test/search-name-order-index.test.mjs` (their test, one import line). **9/9**. Production `/search` still uses `search-match.ts`. |
 | onegrid | `index-accel-eval` | `../onegrid-index-eval` | `packages/wasm/src/__tests__/differential.real-module.test.ts` (their property test, one line changed) |
-| presyo | `index-engine-eval` | `../presyo-index-eval` | `scripts/compare_index_engine.{sh,ts}` (comparison harness only — no app code touched) |
+| presyo | `index-engine-eval` | `../presyo-index-eval` | `scripts/compare_index_engine.{sh,ts}` (ABI 14). No API serve-from-artifact yet. |
 
 **Nothing on any `main` branch was modified, and no existing file in any app was edited.** Every
 branch adds files only.
@@ -30,12 +30,14 @@ match a surname-first index, in any order. The engine passes their nine-assertio
 **9/9**, including all three production failures and all six survival checks, and their full suite
 runs **1,922/1,958** with the same four failures their untouched `main` has.
 
-**The PR would contain**
-1. `src/lib/search-match-index.mjs` — the adapter (already written).
+**On `feat/index-engine-p98` today:** items 1 and 4. `/search` still uses `search-match.ts`.
+
+**Still to land before `/search` flips**
+1. `src/lib/search-match-index.mjs` — ABI 14 adapter (**on the branch**).
 2. A build step emitting `public/search-<school>-<hash>.idx` beside the existing JSON shard, from
    `script/build-search-index.ts`.
 3. `use-search-index.ts` fetching the `.idx` instead of the JSON, behind an env flag.
-4. `test/search-name-order-index.test.mjs` kept as a permanent second harness.
+4. `test/search-name-order-index.test.mjs` kept as a permanent second harness (**on the branch**, 9/9).
 
 **Gate.** `npm test` at 1,922/1,958 or better, and their three search tests green.
 
