@@ -6,6 +6,11 @@ All notable changes to `index`. The project is pre-release and unversioned, so e
 [ROADMAP.md](ROADMAP.md) for the tiered plan and [docs/roadmap-rejected.md](docs/roadmap-rejected.md)
 for what was deliberately ruled out.
 
+## p98 -- query-axis planner (spec) (2026-09-21)
+
+Compose exact-key, mixed phrase, emoji tokens, Filipino aliases instead of one BM25 walk.
+Goal: docs/brainstorm/query-axis/GOAL.md. Fixture: bench/roadmap/p98-query-axis.md. Not built.
+
 ## p97 -- stored COUNT df / page bits, concurrent snapshot, CRC footer (2026-09-20)
 
 Live count_any of an undeleted term no longer walks postings. Concurrent Searcher

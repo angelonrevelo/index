@@ -1454,3 +1454,36 @@ Python) plus TIN itself as the competitor this OBJECTIVE set.
 Sidecar, AGPL, `CREATE EXTENSION`, hosted SLA, and consumer-app PRs stay rejected. Phrase COUNT
 order-sensitivity already shipped (p95); this plan does not reopen that integer.
 
+---
+
+## 2026-09-21 — query axes: compose exact / typo / alias / facet / emoji / Filipino, do not grow the inverted index
+
+Discovered 11 (signals 8 · github/web 3: Algolia ranking criteria, Typesense exact-match and
+`num_typos=0` for part numbers) → **5 genuine** · **4 already-shipped (not new rows)** ·
+**2 rejected** · **0 triage**.
+
+Indexing is lossy. The engine already has most arms; it answers every query as BM25+typo.
+`query::parse` is unused. Goal prompt for a recursive one-axis loop:
+[`docs/brainstorm/query-axis/GOAL.md`](docs/brainstorm/query-axis/GOAL.md). Fixture:
+[`bench/roadmap/p98-query-axis.md`](bench/roadmap/p98-query-axis.md) (gate-excluded until built).
+
+Already shipped, not re-listed as work: typo FST + `typo_bucket`; `analyze::fold`; empty-capable
+`AliasTable`; `search_facet_all` / `search_filtered`; `search_phrase`; `fuse::rrf` (text+image).
+
+| Item | What it closes | Surface | Effort | Benchmark | Status |
+|---|---|---|---|---|---|
+| **Planner consumes `query::parse`** | Mixed `red "ice cream" -x` is parsed and then ignored. One inverted-index walk cannot be phrase + exclude + bag-of-words. | `Index::search` / `Searcher::search` execute `Query { term, phrase, exclude }` | M | T3 → fixture in `p98-query-axis.md`: in-order phrase ranks above reversed bag; unquoted search still matches today's bag-of-words. Gate-excluded until built. | **not started** |
+| **Exact-key arm** | SKU / application key is lookup-only. Bag-of-words buries the row whose key *is* the query. Typesense/Algolia treat verbatim / zero-typo as a separate criterion. | query equal to a live `doc_of_key` is rank-1 before BM25 | S | T3 → `search("K99")` returns the K99 row at rank-1 on a catalog where another row's name tokens would otherwise win. | **not started** |
+| **Emoji tokens** | Tokenizer drops non-alphanumeric Unicode (`analyze.rs` `tokenize_folded`). 😀 and 🇵🇭 in the demanding corpus never index. | same emoji in field and query retrieves the row | S | T3 → index `emoji 😀 name`, `search("😀")` hits; fold still used at both ends. | **not started** |
+| **Filipino↔English alias rows** | P4 listed `bigas`/`gatas`/`gamot sa ubo`/`sabon panlaba` as spec. No production Filipino stemmer; a few hundred curated rows beat Snowball. | existing `AliasTable`, loaded rows, no new crate | S | T3 → those four queries retrieve the rice/milk/cough-medicine/laundry-soap fixture rows without an LLM. | **not started** (P4 cell remains spec until this ships) |
+| **Size/unit negative stays** | P4: stripping size cost −4.6 pp; `300g` fuzzy-matching `800g` is a price-comparison bug. Numeric tokens already skip fuzzy. | keep the exemption; add the explicit negative if missing | S | T3 → `300g` does not retrieve an 800g-only row at any edit distance. | **partial** (fuzzy skip exists; canonical `1.5L ≡ 1500ml` still P4 spec) |
+
+Rejected this sweep (logged, do not rebuild):
+
+- **LLM / SPLADE synonyms in the hot path** — already rejected for v1 (`docs/roadmap-rejected.md`); inference-free query side is the reopening condition.
+- **A new FST or a second tokenizer** — fold rule 1; Peña-Reyes was the scar. Depend on `tantivy-fst` as today.
+
+New problem surfaced during validation: the planner is the compose point. Shipping emoji or Filipino aliases as extra `search_*` methods without an executor repeats the COUNT-was-Rust-only failure.
+
+Tier split: 5 Tier 3 · 0 Tier 2 · 0 Tier 1. Rows with a named surface: 5/5.
+
