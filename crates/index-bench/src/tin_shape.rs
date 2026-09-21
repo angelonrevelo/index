@@ -102,6 +102,14 @@ fn run(ix: &Index, shape: Shape, kind: Kind, q: &str) -> usize {
     }
 }
 
+fn count_byte(ix: &Index, kind: Kind, q: &str) -> usize {
+    match kind {
+        Kind::Or => ix.count_any_byte(q),
+        Kind::And => ix.count_all_byte(q),
+        Kind::Phrase => 0,
+    }
+}
+
 fn pct(sorted: &[u64], p: f64) -> f64 {
     if sorted.is_empty() {
         return f64::NAN;
@@ -178,8 +186,8 @@ fn main() {
         ("conjunction+disjunction+phrase; COUNT", Shape::Count, &[Kind::And, Kind::Or, Kind::Phrase]),
         ("disjunction; COUNT", Shape::Count, &[Kind::Or]),
     ];
-    println!("| workload | queries | QPS | p50 ms | p99 ms | per kind: p99 ms (zero-result %) |");
-    println!("|---|---|---|---|---|---|");
+    println!("| workload | queries | QPS | p50 ms | p99 ms | MB/query | per kind: p99 ms (zero-result %) |");
+    println!("|---|---|---|---|---|---|---|");
     for (name, shape, kinds) in workload {
         let query: Vec<(Kind, &str)> =
             sample.iter().flat_map(|q| kinds.iter().map(move |&k| (k, q.as_str()))).collect();
@@ -224,13 +232,20 @@ fn main() {
                 format!("{} {:.2} ({:.0} %)", k.label(), pct(&v, 0.99), 100.0 * z as f64 / sample.len() as f64)
             })
             .collect();
+        let mb = if shape == Shape::Count && !query.is_empty() {
+            let byte: usize = query.iter().map(|(k, q)| count_byte(&ix, *k, q)).sum();
+            format!("{:.4}", byte as f64 / query.len() as f64 / 1e6)
+        } else {
+            "—".into()
+        };
         println!(
-            "| {} | {} | {:.0} | {:.2} | {:.2} | {} |",
+            "| {} | {} | {:.0} | {:.2} | {:.2} | {} | {} |",
             name,
             query.len(),
             ns.len() as f64 / wall,
             pct(&ns, 0.50),
             pct(&ns, 0.99),
+            mb,
             per.join("; ")
         );
     }

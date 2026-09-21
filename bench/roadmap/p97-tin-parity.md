@@ -35,9 +35,10 @@ time stay flat as posting-list length grows on a holdable corpus, and the 8.0 GB
 with it. Fail while `count_any` / `count_all` still iterate postings for the answer.
 
 Holdable proof (2026-09-21): overlapping OR/AND and deleted COUNT visit 0 postings at 64 and 4096
-docs (`count_any_of_overlapping_or_deleted_terms_does_not_walk_postings`). Release proxy
-(`count_any_overlapping_qps_is_not_linear_in_postings --ignored`): 16x docs (4096 → 65536) is
-6.6x wall, visits stay 0 -- not linear in postings. That is **not** 10,260 QPS on 8.0 GB.
+docs (`count_any_of_overlapping_or_deleted_terms_does_not_walk_postings`). A live undeleted term
+reads **0 bytes** of pages as list length grows (`count_any_byte`). Overlapping COUNT reads 12
+bytes per occupied page, not the posting list. `tin-shape` prints that as MB/query. That is
+**not** 10,260 QPS / 1.7 MB/query on 8.0 GB.
 
 ## Reliability bar (in-process, not MVCC)
 

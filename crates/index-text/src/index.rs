@@ -4298,6 +4298,17 @@ impl Index {
         self.count_any_cost(query).0
     }
 
+    /// Bytes of sparse 64-doc page presence a disjunction COUNT reads. A live undeleted
+    /// single-term COUNT is stored df: 0 bytes of postings or pages. Overlapping COUNT reads
+    /// 12 bytes per occupied page of each query term (`u32` page id + `u64` bits), not the
+    /// posting list. TIN's 1.7 MB/query column is this number on a resident index.
+    pub fn count_any_byte(&self, query: &str) -> usize {
+        let mut id: Vec<u32> = self.count_token(query).into_iter().flatten().collect();
+        id.sort_unstable();
+        id.dedup();
+        self.count_union_byte(&id)
+    }
+
     /// `(count, posting_entry_visited)`. The page-presence path visits 0 postings.
     pub fn count_any_cost(&self, query: &str) -> (usize, usize) {
         let mut id: Vec<u32> = self.count_token(query).into_iter().flatten().collect();
@@ -4357,6 +4368,20 @@ impl Index {
             }
         }
         bits.count_ones()
+    }
+
+    /// 12 bytes per occupied 64-doc page of each term. Stored df of one live term is 0.
+    fn count_union_byte(&self, id: &[u32]) -> usize {
+        if id.is_empty() {
+            return 0;
+        }
+        if id.len() == 1 && self.deleted_count == 0 {
+            return 0;
+        }
+        id.iter()
+            .filter_map(|&t| self.term_page_slice(t))
+            .map(|(page, _)| page.len() * 12)
+            .sum()
     }
 
     /// Sparse page-presence COUNT of a disjunction. Handles overlap and deletions. `None` only
@@ -4493,6 +4518,21 @@ impl Index {
     /// from the dictionary makes the answer 0, which is what a conjunction means.
     pub fn count_all(&self, query: &str) -> usize {
         self.count_all_cost(query).0
+    }
+
+    /// Bytes of sparse page presence a conjunction COUNT reads. Same accounting as
+    /// [`Index::count_any_byte`].
+    pub fn count_all_byte(&self, query: &str) -> usize {
+        let tok = self.count_token(query);
+        if tok.is_empty() {
+            return 0;
+        }
+        let Some(mut id) = tok.into_iter().collect::<Option<Vec<u32>>>() else {
+            return 0;
+        };
+        id.sort_unstable();
+        id.dedup();
+        self.count_union_byte(&id)
     }
 
     /// `(count, posting_entry_visited)`. The page-presence path visits 0 postings.
@@ -5646,6 +5686,9 @@ mod tests {
             0,
             "must not walk the 4096-posting list"
         );
+        assert_eq!(small.count_any_byte("shared"), 0, "stored df reads no pages");
+        assert_eq!(large.count_any_byte("shared"), 0, "bytes-read stay 0 as the list grows");
+        assert_eq!(large.count_all_byte("shared"), 0);
         assert_eq!(large.count_all("shared"), 4096);
         // Disjoint terms live on disjoint pages (token0 only in doc 0, token4000 only in doc 4000).
         assert_eq!(large.count_any("token0 token4000"), 2);
@@ -5671,6 +5714,12 @@ mod tests {
             large.count_any_cost("shared even").1,
             0,
             "overlapping OR must not walk"
+        );
+        let byte = large.count_any_byte("shared even");
+        assert!(byte > 0, "overlapping COUNT reads page words");
+        assert!(
+            byte < n * 8,
+            "page words must be smaller than walking postings"
         );
         assert_eq!(large.count_all("shared even"), n / 2);
         assert_eq!(

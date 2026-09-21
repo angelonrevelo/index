@@ -15,6 +15,8 @@ presence; dense OR into a thread-local page bitmap). Not TIN 10260 QPS on 8.0 GB
 tin-shape phrase COUNT is Index::count_phrase
 (no longer unreachable!); 20k-doc overlapping proxy is not 8.0 GB Wikipedia.
 scripts/gate.sh is the local enterprise gate (same job as ci.yml); GitHub Actions not used.
+count_any_byte / count_all_byte: TIN 1.7 MB/query column on a resident index; stored-df COUNT is 0 bytes.
+Not TIN 10260 QPS on 8.0 GB.
 
 ## p93 — TIN's published workload, at the size this machine holds (2026-09-17)
 
