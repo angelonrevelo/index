@@ -985,10 +985,14 @@ mod tests {
 
     /// Readers during a push/delete must see a consistent collection: after the writer
     /// finishes, COUNT and live membership match a rebuild of the same final rows.
+    ///
+    /// The extra row carries a term the base does not (`uniqueextra`), and the deleted
+    /// row is addressed by its application key. A push+delete that nets the same
+    /// `count_any("toothpaste")` as a no-op Searcher is not this test.
     #[test]
     fn concurrent_mutation_and_count_match_a_rebuild() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::{Arc, RwLock};
+        use std::sync::{Arc, Mutex, RwLock};
         use std::thread;
         let schema = || {
             Schema::new(vec![
@@ -1001,24 +1005,31 @@ mod tests {
             base.add(&Doc::new([format!("row {i} toothpaste"), format!("K{i}")]));
         }
         let s = Arc::new(RwLock::new(Searcher::new(base.build().unwrap())));
+        assert_eq!(s.read().unwrap().count_any("toothpaste"), 32);
+        assert_eq!(s.read().unwrap().count_any("uniqueextra"), 0);
+        assert_eq!(s.read().unwrap().doc_of_key("K0"), Some(0));
         let stop = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(Mutex::new(Vec::<(usize, usize, usize)>::new()));
         let reader = {
             let s = s.clone();
             let stop = stop.clone();
+            let seen = seen.clone();
             thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     let g = s.read().unwrap();
-                    let _ = g.count_any("toothpaste");
-                    let _ = g.search("toothpaste", 5);
+                    let toothpaste = g.count_any("toothpaste");
+                    let extra = g.count_any("uniqueextra");
+                    let hit_count = g.search("uniqueextra", 8).len();
+                    seen.lock().unwrap().push((toothpaste, extra, hit_count));
                 }
             })
         };
         {
             let mut w = s.write().unwrap();
             let mut delta = IndexBuilder::new(schema()).with_key(1);
-            delta.add(&Doc::new(["row extra toothpaste", "K99"]));
+            delta.add(&Doc::new(["row extra uniqueextra", "K99"]));
             w.push(delta.build().unwrap());
-            w.delete(0);
+            assert!(w.delete_key("K0"), "the base row K0 must actually retire");
         }
         stop.store(true, Ordering::Relaxed);
         reader.join().unwrap();
@@ -1027,10 +1038,34 @@ mod tests {
         for i in 1..32u32 {
             whole.add(&Doc::new([format!("row {i} toothpaste"), format!("K{i}")]));
         }
-        whole.add(&Doc::new(["row extra toothpaste", "K99"]));
+        whole.add(&Doc::new(["row extra uniqueextra", "K99"]));
         let whole = whole.build().unwrap();
         assert_eq!(g.count_any("toothpaste"), whole.count_any("toothpaste"));
+        assert_eq!(
+            g.count_any("toothpaste"),
+            31,
+            "deleting K0 must drop the universal-term COUNT; 32 would be a no-op"
+        );
+        assert_eq!(g.count_any("uniqueextra"), 1);
+        assert_eq!(g.count_any("uniqueextra"), whole.count_any("uniqueextra"));
         assert_eq!(g.live_count(), whole.live_count());
+        assert_eq!(g.search("uniqueextra", 8).len(), 1);
+        assert_eq!(g.search("uniqueextra", 8)[0].doc, 32);
+        assert!(
+            g.doc_of_key("K0").is_none(),
+            "deleted application key must not resolve"
+        );
+        assert_eq!(g.doc_of_key("K99"), Some(32));
+        assert_eq!(g.key_of(32), Some("K99"));
+        let obs = seen.lock().unwrap();
+        assert!(!obs.is_empty(), "readers must have observed COUNT/search");
+        for &(toothpaste, extra, hit_count) in obs.iter() {
+            assert!(
+                (toothpaste == 32 && extra == 0 && hit_count == 0)
+                    || (toothpaste == 31 && extra == 1 && hit_count == 1),
+                "reader saw a torn or impossible snapshot: toothpaste={toothpaste} extra={extra} hit_count={hit_count}"
+            );
+        }
     }
 
     /// Two segments that intern the SAME label at DIFFERENT ids.
