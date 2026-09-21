@@ -14,7 +14,7 @@
 |---|---|---|---|
 | profstopick | `main` (`d59f8c3`, deployed 2026-09-21) | — | **Serving.** Typeahead is literal-first `matchFolded` + this engine (`public/search-engine.wasm`, ABI 14, `a3b4911`) with `prefix: true`, which now runs the p98 plan (`-word`, `"phrase"`); the URL is versioned by the module's sha256 (profstopick D191, D198). The `feat/index-engine-p98` adapter branch is an evaluation, superseded. |
 | onegrid | `index-accel-eval` | `../onegrid-index-eval` | `packages/wasm/src/__tests__/differential.real-module.test.ts` (their property test, one line changed) |
-| presyo | `main` (`be6b3414`, deployed 2026-09-21) | — | **Built, flag OFF.** `PRODUCT_SEARCH_ENGINE=index` serves `/api/product/search` from the artifact in-process via WASM + a 20-id keyed hydrate, SQL fallback on any failure. Judged 88 queries: p@10 83.4% → 93.1%, wrong-size 29.5% → 0.7%, p50 14.6 ms vs 466 ms. Not flipped: the pilot view fell to 331 rows and the nightly build refuses below 20,000. See presyo `docs/INDEX_EVAL.md`. |
+| presyo | `main` (`be6b3414`, deployed 2026-09-21) | — | **Built, flag OFF.** `PRODUCT_SEARCH_ENGINE=index` serves `/api/product/search` from the artifact in-process via WASM + a 20-id keyed hydrate, SQL fallback on any failure. Judged 88 queries: p@10 83.4% → 93.1%, wrong-size 29.5% → 0.7%, p50 14.6 ms vs 466 ms. Not flipped: the pilot view fell to 331 rows and the nightly build refuses below 20,000. Engine p99 (grocery recall) is vendored on presyo branch `feat/engine-recall`, unmerged: p@10 93.0% → 94.8% on the same replica, 8 SQL-lost queries → 4. See presyo `docs/INDEX_EVAL.md`. |
 
 The evaluation branches added files only. profstopick and presyo have since adopted the engine on `main` (rows above); onegrid has not.
 

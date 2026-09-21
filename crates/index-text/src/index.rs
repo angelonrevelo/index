@@ -441,6 +441,38 @@ pub const EXPANSION_DISTANCE: u8 = 1;
 /// the last of six reported size violations to survive, and the only one that was a real defect.
 pub const MISSING_QUANTITY_PENALTY: u32 = 16;
 
+/// What a query group is, which decides what a document that misses it pays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GroupKind {
+    /// An ordinary word: missing it costs [`MISSING_TERM_PENALTY`].
+    Term,
+    /// A physical size: missing it costs [`MISSING_QUANTITY_PENALTY`].
+    Quantity,
+    /// A [connective](crate::analyze::is_connective) beside content words: matching it still
+    /// scores, missing it costs nothing -- the catalogue spells `and` as `&` or leaves it out.
+    Optional,
+}
+
+impl GroupKind {
+    fn of(is_quantity: bool) -> Self {
+        if is_quantity {
+            GroupKind::Quantity
+        } else {
+            GroupKind::Term
+        }
+    }
+
+    /// The bucket penalty for missing group `g`; an unknown group is an ordinary word.
+    #[inline]
+    fn missing_penalty(kind: &[GroupKind], g: usize) -> u32 {
+        match kind.get(g) {
+            Some(GroupKind::Quantity) => MISSING_QUANTITY_PENALTY,
+            Some(GroupKind::Optional) => 0,
+            _ => MISSING_TERM_PENALTY,
+        }
+    }
+}
+
 /// Postings per block for the block-max skip metadata.
 ///
 /// 128 is the classic choice (Ding & Suel's BMW uses it) and the one variable-block work measures
@@ -1739,6 +1771,25 @@ impl<'a> FacetClause<'a> {
     }
 }
 
+/// Which query tokens are optional [connectives](crate::analyze::is_connective) (`and`, `sa`, …).
+///
+/// None when the query has no content word -- a query made only of connectives still asks for
+/// them. The word still being typed is never optional: `salt and` may be the start of
+/// `salt anderson`.
+fn optional_connective(tok: &[Token], prefix_last: bool) -> Vec<bool> {
+    let n = tok.len();
+    let flag: Vec<bool> = tok
+        .iter()
+        .enumerate()
+        .map(|(i, t)| crate::analyze::is_connective(&t.text) && !(prefix_last && i + 1 == n))
+        .collect();
+    if tok.iter().any(|t| !crate::analyze::is_connective(&t.text)) {
+        flag
+    } else {
+        vec![false; n]
+    }
+}
+
 /// Everything one scan needs beyond the index itself.
 ///
 /// `search_opt` reached eight positional parameters, most of them empty slices whose meaning was
@@ -1756,6 +1807,12 @@ pub(crate) struct ExpansionEmit {
     pub group: u16,
     pub matches: Vec<(crate::dict::TermMatch, String)>,
     pub learned: bool,
+    /// The typed word (term id and text) whose IDF these matches may not exceed, or `None`.
+    ///
+    /// Set only on a word's [number forms](crate::analyze::number_form): `soaps` is evidence of
+    /// `soap`, never MORE discriminative than it, and without the ceiling one rare plural in the
+    /// catalogue outscored every row that spells the word the way it was asked.
+    pub ceiling: Option<(u32, String)>,
 }
 
 /// A fully expanded query, before the cap and the IDF weights are applied.
@@ -1774,7 +1831,7 @@ pub(crate) struct QueryExpansion {
     /// change which terms survive.
     pub emits: Vec<ExpansionEmit>,
     /// One entry per query group: whether the group is a physical quantity.
-    pub group_is_quantity: Vec<bool>,
+    pub group_kind: Vec<GroupKind>,
     /// Whether the learned-expansion branch fired, which widens the scoring pool.
     pub expanded: bool,
 }
@@ -2360,7 +2417,7 @@ impl Index {
         &self,
         doc: u32,
         term: &[QueryTerm],
-        group_is_quantity: &[bool],
+        group_kind: &[GroupKind],
         group_dist: &mut [u8],
         anchor: &[u32],
     ) -> Option<Hit> {
@@ -2382,7 +2439,7 @@ impl Index {
         if !any {
             return None;
         }
-        let bucket = Self::bucket_of(group_dist, group_is_quantity);
+        let bucket = Self::bucket_of(group_dist, group_kind);
         Some(Hit {
             doc,
             // The prior scales the relevance score; it deliberately does NOT touch `typo_bucket`,
@@ -2392,7 +2449,7 @@ impl Index {
             score: score as f32
                 * self.prior_of(doc)
                 * self.anchor_factor(doc, anchor)
-                * self.exact_field_factor(doc, bucket, group_is_quantity.len().max(1)),
+                * self.exact_field_factor(doc, bucket, group_kind.len().max(1)),
             typo_bucket: bucket,
         })
     }
@@ -2462,7 +2519,7 @@ impl Index {
         query: &str,
         prefix_last: bool,
         cap: usize,
-    ) -> (Vec<QueryTerm>, Vec<bool>, bool) {
+    ) -> (Vec<QueryTerm>, Vec<GroupKind>, bool) {
         self.plan_stat(query, prefix_last, cap, None)
     }
 
@@ -2500,7 +2557,7 @@ impl Index {
         prefix_last: bool,
         cap: usize,
         stat: Option<&CollectionStat>,
-    ) -> (Vec<QueryTerm>, Vec<bool>, bool) {
+    ) -> (Vec<QueryTerm>, Vec<GroupKind>, bool) {
         let ex = self.expand_query(query, prefix_last, stat.is_some());
         self.weigh(&ex, cap, stat)
     }
@@ -2515,12 +2572,19 @@ impl Index {
         ex: &QueryExpansion,
         cap: usize,
         stat: Option<&CollectionStat>,
-    ) -> (Vec<QueryTerm>, Vec<bool>, bool) {
+    ) -> (Vec<QueryTerm>, Vec<GroupKind>, bool) {
         let mut out: Vec<QueryTerm> = Vec::new();
         for e in &ex.emits {
-            self.emit(&mut out, e.matches.clone(), e.group, cap, stat);
+            let ceiling = e.ceiling.as_ref().map(|(id, text)| {
+                let df = self.posting[*id as usize].len();
+                match stat {
+                    Some(s) => s.idf(text, df),
+                    None => self.idf(df),
+                }
+            });
+            self.emit(&mut out, e.matches.clone(), e.group, cap, stat, ceiling);
         }
-        (out, ex.group_is_quantity.clone(), ex.expanded)
+        (out, ex.group_kind.clone(), ex.expanded)
     }
 
     /// The expand phase of planning: everything up to per-group match lists, with **no cap and no
@@ -2537,8 +2601,33 @@ impl Index {
         prefix_last: bool,
         want_text: bool,
     ) -> QueryExpansion {
+        self.expand_query_mode(query, prefix_last, want_text, false)
+    }
+
+    /// [`Index::expand_query`], or with `superset` its FETCH plan: every term the real expansion
+    /// could name once posting lists are present.
+    ///
+    /// Only [`Index::correct_in_context`] reads postings while expanding, so only it differs: a
+    /// superset admits every candidate neighbour instead of the ones that co-occur. A range-tier
+    /// host plans on an image whose lists are all empty, fetches the superset, and the answering
+    /// image then decides the correction exactly as a full open does.
+    fn expand_query_mode(
+        &self,
+        query: &str,
+        prefix_last: bool,
+        want_text: bool,
+        superset: bool,
+    ) -> QueryExpansion {
         let mut tok = tokenize(query);
-        apply_alias(&mut tok, &self.alias);
+        // Which tokens the alias table rewrote: only those get number forms (`add_number_form`).
+        let aliased: Vec<bool> = if self.alias.is_empty() {
+            vec![false; tok.len()]
+        } else {
+            let raw: Vec<String> = tok.iter().map(|t| t.text.clone()).collect();
+            apply_alias(&mut tok, &self.alias);
+            tok.iter().zip(&raw).map(|(t, r)| t.text != *r).collect()
+        };
+        let optional = optional_connective(&tok, prefix_last);
         // A group is a "quantity" group when its token parses as a real physical size. A bare
         // number that is not a size (a year, a model number) is an ordinary term.
 
@@ -2557,8 +2646,10 @@ impl Index {
         // "is this reachable by fuzzy?" and then expanded again, paying for two automaton
         // traversals on exactly the tokens that are most expensive to traverse.
         let n = tok.len();
-        let mut group_is_quantity: Vec<bool> = Vec::with_capacity(n);
+        let mut group_kind: Vec<GroupKind> = Vec::with_capacity(n);
         let mut emits: Vec<ExpansionEmit> = Vec::new();
+        // The query token each group came from; `None` for the halves of a compound split.
+        let mut source: Vec<Option<usize>> = Vec::with_capacity(n);
 
         for (ti, t) in tok.iter().enumerate() {
             let is_last = ti + 1 == n;
@@ -2569,29 +2660,54 @@ impl Index {
                 if let Some((a, b)) = self.split_compound(&t.text) {
                     for part in [a, b] {
                         let numeric = part.chars().any(|c| c.is_ascii_digit());
-                        let gi = group_is_quantity.len() as u16;
-                        group_is_quantity
-                            .push(numeric && crate::analyze::parse_quantity(&part).is_some());
+                        let gi = group_kind.len() as u16;
+                        group_kind.push(GroupKind::of(
+                            numeric && crate::analyze::parse_quantity(&part).is_some(),
+                        ));
                         let m = self.expand_pair(&part, numeric, false, want_text);
+                        source.push(None);
                         emits.push(ExpansionEmit {
                             group: gi,
                             matches: m,
                             learned: false,
+                            ceiling: None,
                         });
                     }
                     continue;
                 }
             }
 
-            let gi = group_is_quantity.len() as u16;
-            group_is_quantity
-                .push(t.is_numeric && crate::analyze::parse_quantity(&t.text).is_some());
+            let gi = group_kind.len() as u16;
+            group_kind.push(if optional[ti] {
+                GroupKind::Optional
+            } else {
+                GroupKind::of(t.is_numeric && crate::analyze::parse_quantity(&t.text).is_some())
+            });
+            source.push(Some(ti));
             emits.push(ExpansionEmit {
                 group: gi,
                 matches,
                 learned: false,
+                ceiling: None,
             });
         }
+
+        if source.len() >= 2 {
+            // The word each group could be corrected from: not a compound half, not a size, not
+            // shorter than three letters, not the word still being typed.
+            let word: Vec<Option<&str>> = source
+                .iter()
+                .map(|at| {
+                    let ti = (*at)?;
+                    let t = &tok[ti];
+                    let typing = prefix_last && ti + 1 == tok.len();
+                    (!t.is_numeric && !typing && t.text.chars().count() >= 3)
+                        .then_some(t.text.as_str())
+                })
+                .collect();
+            self.correct_in_context(&word, &group_kind, &mut emits, want_text, superset);
+        }
+        self.add_number_form(&tok, &aliased, &source, &mut emits, prefix_last, want_text);
 
         // --- learned expansion, fired STRICTLY.
         //
@@ -2635,11 +2751,12 @@ impl Index {
                         )
                     })
                     .collect();
-                for gi in 0..group_is_quantity.len() as u16 {
+                for gi in 0..group_kind.len() as u16 {
                     emits.push(ExpansionEmit {
                         group: gi,
                         matches: extra.clone(),
                         learned: true,
+                        ceiling: None,
                     });
                 }
                 expanded = true;
@@ -2648,9 +2765,202 @@ impl Index {
 
         QueryExpansion {
             emits,
-            group_is_quantity,
+            group_kind,
             expanded,
         }
+    }
+
+    /// Admit a one-edit correction for a word that exists but never appears with the rest of the
+    /// query, when the correction does.
+    ///
+    /// Two rules made a real word unreachable by its neighbour: the length gate gives a 3-letter
+    /// word no typo at all, and the lazy rule never fuzzes a word the dictionary holds. Both are
+    /// right in isolation -- `oat` must not become `cat` -- but together they let a rare dictionary
+    /// hit block a far stronger match: in `magic mee` the brand rows spell `me`, `mee` is a real
+    /// word elsewhere, and every brand row paid the missing-term penalty while the rarer word's IDF
+    /// handed rank-1 to a row with no `magic` in it.
+    ///
+    /// The evidence that the literal is the wrong reading is the query itself: NO live document
+    /// holds the literal together with every other group. A neighbour is admitted only if some
+    /// document holds IT together with every other group, and it enters at distance 1, so it can
+    /// never outrank an exact reading -- it can only beat a document that is missing a word.
+    /// Nothing changes for a one-word query, for a literal that does co-occur (`oat milk`), for a
+    /// word fuzzy already expanded, or for the word still being typed.
+    fn correct_in_context(
+        &self,
+        word: &[Option<&str>],
+        group_kind: &[GroupKind],
+        emits: &mut [ExpansionEmit],
+        want_text: bool,
+        superset: bool,
+    ) {
+        // The common case, decided once: some document already holds every word as read, so no
+        // word is weak evidence and nothing below can fire. Only a query whose literal reading
+        // matches no single document pays for the per-word search.
+        if !superset {
+            let all: Vec<Vec<&[Posting]>> = (0..word.len())
+                .filter(|&h| group_kind[h] != GroupKind::Optional)
+                .map(|h| self.list_of(&emits[h]))
+                .filter(|l| !l.is_empty())
+                .collect();
+            // Only when every required word is known: an UNKNOWN short word (no literal at all,
+            // below the typo gate) still needs the loop to find a neighbour that meets the rest.
+            let required = group_kind.iter().filter(|k| **k != GroupKind::Optional).count();
+            if all.len() >= 2 && all.len() == required && self.conjunction(&all) {
+                return;
+            }
+        }
+        for g in 0..word.len() {
+            let Some(text) = word[g] else { continue };
+            // A connective is never the word being corrected, nor a word the rest must meet.
+            if group_kind[g] == GroupKind::Optional {
+                continue;
+            }
+            // Fuzzy already ran and found something: the typo policy answered this word.
+            if emits[g].matches.iter().any(|(m, _)| m.distance > 0) {
+                continue;
+            }
+            if superset {
+                let admit: Vec<(crate::dict::TermMatch, String)> = self
+                    .dict
+                    .neighbour(text, want_text)
+                    .into_iter()
+                    .filter(|(m, _)| !emits[g].matches.iter().any(|(x, _)| x.term_id == m.term_id))
+                    .collect();
+                emits[g].matches.extend(admit);
+                continue;
+            }
+            let other: Vec<Vec<&[Posting]>> = (0..word.len())
+                .filter(|&h| h != g && group_kind[h] != GroupKind::Optional)
+                .map(|h| self.list_of(&emits[h]))
+                .filter(|l| !l.is_empty())
+                .collect();
+            // Correcting this word can only help if the REST already meet in some document; and
+            // it is not weak if its literal already meets them. Both are cheap next to building
+            // a Levenshtein automaton, so they go first.
+            if other.is_empty()
+                || (other.len() > 1 && !self.conjunction(&other))
+                || self.list_of(&emits[g]).iter().any(|l| self.cooccurs(l, &other))
+            {
+                continue;
+            }
+            let admit: Vec<(crate::dict::TermMatch, String)> = self
+                .dict
+                .neighbour(text, want_text)
+                .into_iter()
+                .filter(|(m, _)| {
+                    !emits[g].matches.iter().any(|(x, _)| x.term_id == m.term_id)
+                        && self.cooccurs(&self.posting[m.term_id as usize], &other)
+                })
+                .collect();
+            emits[g].matches.extend(admit);
+        }
+    }
+
+    /// Let a word the ALIAS TABLE produced also match its regular English number form
+    /// (`itlog` → `egg` ↔ `eggs`, `sardinas` → `sardines` ↔ `sardine`), as a near match.
+    ///
+    /// An alias canonical names a concept, not a spelling, and the catalogue spells a product in
+    /// whichever number its seller chose. No typo bridges that for a short word -- `egg` is below
+    /// the one-typo gate, and the lazy rule never fuzzes a word that exists -- so `itlog` reached
+    /// the egg pies and egg noodles and missed every carton labelled `Eggs`.
+    ///
+    /// **Alias-produced words only, and that is measured, not cautious.** Applied to every word,
+    /// the same rule cost `booted-schema` exact-name rank-1 99.8 % → 95.0 % and `alec-surface`
+    /// 100 → 98.3 %: a document holding BOTH forms (`users` beside `user`) sums two terms and
+    /// outscores the row whose name is exactly the query. A word the user typed verbatim is a
+    /// spelling; a word the table substituted is not.
+    ///
+    /// A number form enters at distance 1 -- the one-typo tier -- and with its IDF capped at the
+    /// typed word's ([`ExpansionEmit::ceiling`]). So it can add a document that had no reading of
+    /// the word and strengthen one that has both forms, but it never outranks a document that
+    /// spells the word as typed. The word still being typed is left to prefix expansion.
+    fn add_number_form(
+        &self,
+        tok: &[Token],
+        aliased: &[bool],
+        source: &[Option<usize>],
+        emits: &mut Vec<ExpansionEmit>,
+        prefix_last: bool,
+        want_text: bool,
+    ) {
+        for (g, &at) in source.iter().enumerate() {
+            let Some(ti) = at else { continue };
+            let t = &tok[ti];
+            if !aliased[ti] || t.is_numeric || (prefix_last && ti + 1 == tok.len()) {
+                continue;
+            }
+            let mut matches = Vec::new();
+            for form in crate::analyze::number_form(&t.text) {
+                let Some(id) = self.dict.exact(&form) else { continue };
+                if emits[g].matches.iter().any(|(m, _)| m.term_id == id) {
+                    continue;
+                }
+                let text = if want_text { form } else { String::new() };
+                matches.push((crate::dict::TermMatch { term_id: id, distance: 1 }, text));
+            }
+            if matches.is_empty() {
+                continue;
+            }
+            let ceiling = self
+                .dict
+                .exact(&t.text)
+                .map(|id| (id, if want_text { t.text.clone() } else { String::new() }));
+            emits.push(ExpansionEmit {
+                group: g as u16,
+                matches,
+                learned: false,
+                ceiling,
+            });
+        }
+    }
+
+    /// The non-empty posting lists of one expansion group.
+    fn list_of(&self, e: &ExpansionEmit) -> Vec<&[Posting]> {
+        e.matches
+            .iter()
+            .map(|(m, _)| self.posting[m.term_id as usize].as_slice())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    /// Whether some live document in `list` also appears in every group of `other`.
+    ///
+    /// Walks the CHEAPEST group (fewest postings) and binary-searches the rest, so the cost is
+    /// bounded by the rarest word in the query rather than by the word being tested -- which is
+    /// usually the common one, since a rare literal is the case this exists for.
+    fn cooccurs(&self, list: &[Posting], other: &[Vec<&[Posting]>]) -> bool {
+        let own = [list];
+        let mut group: Vec<&[&[Posting]]> = Vec::with_capacity(other.len() + 1);
+        group.push(&own);
+        group.extend(other.iter().map(Vec::as_slice));
+        self.conjunction_of(&group)
+    }
+
+    /// Whether some live document appears in every group (a group matches through any of its
+    /// posting lists).
+    fn conjunction(&self, group: &[Vec<&[Posting]>]) -> bool {
+        let group: Vec<&[&[Posting]]> = group.iter().map(Vec::as_slice).collect();
+        self.conjunction_of(&group)
+    }
+
+    fn conjunction_of(&self, group: &[&[&[Posting]]]) -> bool {
+        let cost = |g: &[&[Posting]]| g.iter().map(|l| l.len()).sum::<usize>();
+        let Some(driver) = (0..group.len()).min_by_key(|&i| cost(group[i])) else {
+            return false;
+        };
+        let contains = |g: &[&[Posting]], doc: u32| {
+            g.iter().any(|l| l.binary_search_by_key(&doc, |q| q.doc).is_ok())
+        };
+        group[driver].iter().any(|l| {
+            l.iter().any(|p| {
+                !self.is_deleted(p.doc)
+                    && group
+                        .iter()
+                        .enumerate()
+                        .all(|(i, g)| i == driver || contains(g, p.doc))
+            })
+        })
     }
 
     /// Number of learned facet values, or 0 when expansion was not learned.
@@ -2680,17 +2990,15 @@ impl Index {
 
     /// The bucket cost of a document, given the best edit distance it achieved per query group.
     #[inline]
-    fn bucket_of(group_dist: &[u8], group_is_quantity: &[bool]) -> u32 {
+    fn bucket_of(group_dist: &[u8], group_kind: &[GroupKind]) -> u32 {
         group_dist
             .iter()
             .enumerate()
             .map(|(g, &d)| {
                 if d != u8::MAX {
                     d as u32
-                } else if group_is_quantity.get(g).copied().unwrap_or(false) {
-                    MISSING_QUANTITY_PENALTY
                 } else {
-                    MISSING_TERM_PENALTY
+                    GroupKind::missing_penalty(group_kind, g)
                 }
             })
             .sum()
@@ -2710,6 +3018,7 @@ impl Index {
         gi: u16,
         cap: usize,
         stat: Option<&CollectionStat>,
+        ceiling: Option<f32>,
     ) {
         if matches.len() > cap {
             // Closest first; among equals, the rarer term is the more discriminative one.
@@ -2727,6 +3036,7 @@ impl Index {
                 Some(s) => s.idf(&text, df),
                 None => self.idf(df),
             };
+            let idf = ceiling.map_or(idf, |c| idf.min(c));
             let w = idf * self.schema.typo_penalty.powi(m.distance as i32);
             out.push(QueryTerm {
                 term_id: m.term_id,
@@ -3104,7 +3414,7 @@ impl Index {
             return Vec::new();
         };
 
-        let (term, group_is_quantity, _) = self.plan(query, false, MAX_EXPANSION);
+        let (term, group_kind, _) = self.plan(query, false, MAX_EXPANSION);
         if term.is_empty() {
             return Vec::new();
         }
@@ -3152,7 +3462,7 @@ impl Index {
                 k,
                 ascending,
                 &term,
-                &group_is_quantity,
+                &group_kind,
                 column,
                 &filter,
                 range,
@@ -3161,7 +3471,7 @@ impl Index {
                 k,
                 ascending,
                 &term,
-                &group_is_quantity,
+                &group_kind,
                 column,
                 &filter,
                 range,
@@ -3181,12 +3491,12 @@ impl Index {
         k: usize,
         ascending: bool,
         term: &[QueryTerm],
-        group_is_quantity: &[bool],
+        group_kind: &[GroupKind],
         column: &[f64],
         filter: &[(usize, Vec<u32>, bool)],
         range: &[(usize, f64, f64)],
     ) -> Vec<Hit> {
-        let group_count = group_is_quantity.len().max(1);
+        let group_count = group_kind.len().max(1);
         let mut acc: BTreeMap<u32, (f64, Vec<u8>)> = BTreeMap::new();
         for t in term {
             for p in &self.posting[t.term_id as usize] {
@@ -3219,7 +3529,7 @@ impl Index {
                     Hit {
                         doc,
                         score: score as f32,
-                        typo_bucket: Self::bucket_of(&gd, group_is_quantity),
+                        typo_bucket: Self::bucket_of(&gd, group_kind),
                     },
                 )
             })
@@ -3259,12 +3569,12 @@ impl Index {
         k: usize,
         ascending: bool,
         term: &[QueryTerm],
-        group_is_quantity: &[bool],
+        group_kind: &[GroupKind],
         column: &[f64],
         filter: &[(usize, Vec<u32>, bool)],
         range: &[(usize, f64, f64)],
     ) -> Vec<Hit> {
-        let group_count = group_is_quantity.len().max(1);
+        let group_count = group_kind.len().max(1);
         let mut hit: Vec<(f64, Hit)> = Vec::with_capacity(k + 1);
         let mut boundary: Option<f64> = None;
 
@@ -3314,7 +3624,7 @@ impl Index {
                 Hit {
                     doc,
                     score: score as f32,
-                    typo_bucket: Self::bucket_of(&group_dist, group_is_quantity),
+                    typo_bucket: Self::bucket_of(&group_dist, group_kind),
                 },
             ));
             // The `k`-th match fixes the boundary value; everything sharing it must still be seen.
@@ -3360,7 +3670,7 @@ impl Index {
         let Some(column) = self.numeric_value.get(slot) else {
             return Vec::new();
         };
-        let (term, group_is_quantity, _) = self.plan(query, false, MAX_EXPANSION);
+        let (term, group_kind, _) = self.plan(query, false, MAX_EXPANSION);
         if term.is_empty() {
             return Vec::new();
         }
@@ -3375,12 +3685,12 @@ impl Index {
                 k,
                 ascending,
                 &term,
-                &group_is_quantity,
+                &group_kind,
                 column,
                 &[],
                 &[],
             ),
-            false => self.sorted_by_scan(k, ascending, &term, &group_is_quantity, column, &[], &[]),
+            false => self.sorted_by_scan(k, ascending, &term, &group_kind, column, &[], &[]),
         }
     }
 
@@ -3873,6 +4183,14 @@ impl Index {
         self.expansion_stat(&ex)
     }
 
+    /// [`Index::term_stat`] for a range-tier FETCH plan: a superset that also names every term
+    /// a context correction could admit once posting lists are present. See
+    /// [`Index::expand_query_mode`].
+    pub fn plan_term_stat(&self, query: &str, prefix_last: bool) -> Vec<(String, usize)> {
+        let ex = self.expand_query_mode(query, prefix_last, true, true);
+        self.expansion_stat(&ex)
+    }
+
     /// The `(text, df)` pairs an already-built expansion contributes to a [`CollectionStat`].
     ///
     /// This is [`Index::term_stat`]'s body over a [`QueryExpansion`], so the stat pass and the
@@ -3982,7 +4300,7 @@ impl Index {
         if k == 0 {
             return Vec::new();
         }
-        let (mut term, group_is_quantity, expanded) = match pre {
+        let (mut term, group_kind, expanded) = match pre {
             Some(ex) => self.weigh(ex, cap, stat),
             None => self.plan_stat(query, prefix_last, cap, stat),
         };
@@ -3997,7 +4315,7 @@ impl Index {
         // "carmen" should find "DEL CARMEN" without penalty -- whereas a per-keystroke prefix
         // almost always is. Empty when the query is a single group, because then the prefix term
         // IS the whole query and anchoring adds nothing that scoring does not already say.
-        let anchor: Vec<u32> = match prefix_last && group_is_quantity.len() > 1 {
+        let anchor: Vec<u32> = match prefix_last && group_kind.len() > 1 {
             true => term
                 .iter()
                 .filter(|t| t.group == 0)
@@ -4041,7 +4359,7 @@ impl Index {
         };
         // Everything below still reads `pool` as "the scoring pool's capacity"; only its size and
         // the reason for that size have changed.
-        let group_count = group_is_quantity.len().max(1);
+        let group_count = group_kind.len().max(1);
 
         // MaxScore requires terms ordered by ascending maximum contribution.
         term.sort_by(|a, b| {
@@ -4078,11 +4396,7 @@ impl Index {
         }
         let mut bucket_floor = vec![0u32; term.len() + 1];
         for (g, &mi) in group_min.iter().enumerate() {
-            let pen = if group_is_quantity.get(g).copied().unwrap_or(false) {
-                MISSING_QUANTITY_PENALTY
-            } else {
-                MISSING_TERM_PENALTY
-            };
+            let pen = GroupKind::missing_penalty(&group_kind, g);
             // Group `g` is wholly inside `term[f..]` exactly while `f <= min index of g`.
             let upto = if mi == usize::MAX { term.len() } else { mi };
             for slot in bucket_floor.iter_mut().take(upto + 1) {
@@ -4154,7 +4468,7 @@ impl Index {
             for &at in self.champion[best.term_id as usize].iter().take(pool) {
                 let doc = list[at as usize].doc;
                 let Some(hit) =
-                    self.score_doc(doc, &term, &group_is_quantity, &mut group_dist, &anchor)
+                    self.score_doc(doc, &term, &group_kind, &mut group_dist, &anchor)
                 else {
                     continue;
                 };
@@ -4322,12 +4636,7 @@ impl Index {
                             let mut range_floor = 0u32;
                             for (g, &reachable) in group_reachable.iter().enumerate() {
                                 if !reachable {
-                                    range_floor +=
-                                        if group_is_quantity.get(g).copied().unwrap_or(false) {
-                                            MISSING_QUANTITY_PENALTY
-                                        } else {
-                                            MISSING_TERM_PENALTY
-                                        };
+                                    range_floor += GroupKind::missing_penalty(&group_kind, g);
                                 }
                             }
                             // Exact: a document in the range has `bucket >= range_floor` and
@@ -4396,7 +4705,7 @@ impl Index {
             // should and never discards a document it should have kept.
             // The bucket is needed BEFORE the score is finalised, because the exact-field factor
             // depends on it: only a document that matched every group can be "exactly the query".
-            let bucket = Self::bucket_of(&group_dist, &group_is_quantity);
+            let bucket = Self::bucket_of(&group_dist, &group_kind);
             let score = score as f32
                 * self.prior_of(candidate)
                 * self.anchor_factor(candidate, &anchor)
@@ -4847,8 +5156,8 @@ impl Index {
     /// `bench/roadmap/p21-pool-eviction.md` needs to test. It exists for differential testing and
     /// is O(all postings); do not put it in a query path.
     pub fn search_exhaustive_unpooled(&self, query: &str, k: usize) -> Vec<Hit> {
-        let (term, group_is_quantity, _) = self.plan(query, false, MAX_EXPANSION);
-        let group_count = group_is_quantity.len().max(1);
+        let (term, group_kind, _) = self.plan(query, false, MAX_EXPANSION);
+        let group_count = group_kind.len().max(1);
         let mut acc: BTreeMap<u32, (f64, Vec<u8>)> = BTreeMap::new();
         for t in &term {
             for p in &self.posting[t.term_id as usize] {
@@ -4866,7 +5175,7 @@ impl Index {
         let mut hit: Vec<Hit> = acc
             .into_iter()
             .map(|(doc, (score, gd))| {
-                let bucket = Self::bucket_of(&gd, &group_is_quantity);
+                let bucket = Self::bucket_of(&gd, &group_kind);
                 Hit {
                     doc,
                     score: score as f32
@@ -4882,8 +5191,8 @@ impl Index {
     }
 
     pub fn search_exhaustive(&self, query: &str, k: usize) -> Vec<Hit> {
-        let (term, group_is_quantity, _) = self.plan(query, false, MAX_EXPANSION);
-        let group_count = group_is_quantity.len().max(1);
+        let (term, group_kind, _) = self.plan(query, false, MAX_EXPANSION);
+        let group_count = group_kind.len().max(1);
         let mut acc: BTreeMap<u32, (f64, Vec<u8>)> = BTreeMap::new();
         for t in &term {
             for p in &self.posting[t.term_id as usize] {
@@ -4898,7 +5207,7 @@ impl Index {
         let mut hit: Vec<Hit> = acc
             .into_iter()
             .map(|(doc, (score, gd))| {
-                let bucket = Self::bucket_of(&gd, &group_is_quantity);
+                let bucket = Self::bucket_of(&gd, &group_kind);
                 Hit {
                     doc,
                     // No prior here by long-standing design (see this function's docs); the
@@ -6386,5 +6695,136 @@ mod tests {
             }
         }
         assert!(query.len() > 1000, "{} queries", query.len());
+    }
+
+    // ---- p99: grocery recall -------------------------------------------------------------------
+    //
+    // Generic fixtures for the four causes `bench/roadmap/p99-grocery-recall.md` diagnosed on
+    // presyo's judged set. None of them uses a judged query string.
+
+    fn grocery_of(row: &[&str]) -> Index {
+        let mut b = IndexBuilder::new(Schema::new(vec![Field::new("name", 1.0, 0.4)]))
+            .with_alias(crate::AliasTable::philippine_grocery());
+        for r in row {
+            b.add(&Doc::new([*r]));
+        }
+        b.build().unwrap()
+    }
+
+    /// Tagalog's linker `-ng` glues onto the word before it: `kape` → `kapeng barako`, `asin` →
+    /// `asing` (a final `n` becomes `ng`). A table keyed only on the bare form misses the ligated
+    /// one, so `kapeng` was an unknown word while `kape` meant coffee.
+    #[test]
+    fn a_filipino_ligature_form_resolves_like_its_base() {
+        let ix = grocery_of(&[
+            "Great Taste Coffee Barako 25g",
+            "Iodized Salt 500g",
+            "Bath Soap Floral 90g",
+            "Kapengbarako Mug",
+        ]);
+        let rank1 = |q: &str| ix.search(q, 5).first().map(|h| (h.doc, h.typo_bucket));
+        assert_eq!(rank1("kapeng barako"), Some((0, 0)), "kapeng → kape → coffee");
+        assert_eq!(rank1("asing"), Some((1, 0)), "asing → asin → salt");
+        assert_eq!(rank1("sabong panligo"), Some((2, 0)), "sabong → sabon → soap");
+        // Consonant-final rows other than `n` take no suffix: `gatas` has no `gatasng`.
+        let t = crate::AliasTable::philippine_grocery();
+        assert_eq!(t.get("gatasng"), None);
+        assert_eq!(t.get("kapeng"), t.get("kape"));
+        assert_eq!(t.get("inuming"), t.get("inumin"));
+    }
+
+    /// A connective (`and`, `of`, `sa`, …) the catalogue spells as `&` or leaves out must not
+    /// cost the rest of the query a missing-term penalty. It did: `salt and vinegr` put the one
+    /// row that is salt-and-vinegar (spelled `&`) BELOW a row that merely has `salt` and `and`,
+    /// because missing `and` (3) plus one typo (1) is worse than missing the actual product word (3).
+    #[test]
+    fn a_connective_missing_from_the_document_costs_nothing() {
+        let ix = grocery_of(&[
+            "Crispy Salt & Vinegar Chips 60g",
+            "Bread and Salt Crackers 200g",
+            "Spiced Vinegar 250ml",
+        ]);
+        let hit = ix.search("salt and vinegr", 5);
+        assert_eq!(hit[0].doc, 0, "salt & vinegar is the answer: {hit:?}");
+        assert_eq!(hit[0].typo_bucket, 1, "one typo, nothing missing: {hit:?}");
+        // A query made only of connectives still searches for them.
+        assert!(
+            ix.search("and", 5).iter().any(|h| h.doc == 1),
+            "an all-connective query is not emptied"
+        );
+        // Typeahead: the word being typed is never dropped (`and` may be the start of `anderson`).
+        assert!(ix.search_prefix("salt and", 5).iter().any(|h| h.doc == 1));
+    }
+
+    /// A short word that exists in the dictionary but never appears alongside the rest of the
+    /// query is weak evidence, and a one-edit neighbour that DOES appear alongside it is the
+    /// correction. Three letters is below the one-typo length gate, and the lazy rule never fuzzes
+    /// a word that exists, so `magic mee` used to tie the brand rows (missing `mee`) with the rows
+    /// that have only `mee` -- and the rarer word's IDF handed rank-1 to a prawn sauce.
+    #[test]
+    fn a_short_word_that_never_cooccurs_is_corrected_in_context() {
+        let ix = grocery_of(&[
+            "Magic Me Noodles Chicken 55g",
+            "Magic Me Noodles Beef 55g",
+            "Magic Me Pasta Carbonara 60g",
+            "Penang Prawn Mee Sauce 200g",
+            "Mee Goreng Paste 100g",
+            "Magic Sarap Seasoning 8g",
+        ]);
+        let hit = ix.search("magic mee", 10);
+        let top3 = sorted_doc(&hit[..3]);
+        assert_eq!(top3, vec![0, 1, 2], "the Magic Me rows lead: {hit:?}");
+        assert!(hit[..3].iter().all(|h| h.typo_bucket == 1), "{hit:?}");
+        // The literal is still exact on its own: `mee` alone ranks the mee rows first.
+        let alone = ix.search("mee", 10);
+        assert_eq!(sorted_doc(&alone[..2]), vec![3, 4], "{alone:?}");
+        assert!(alone[..2].iter().all(|h| h.typo_bucket == 0));
+    }
+
+    /// The guard: a short word that DOES co-occur with the rest of the query is what was meant,
+    /// and no neighbour is admitted.
+    #[test]
+    fn a_short_word_that_cooccurs_is_left_alone() {
+        let ix = grocery_of(&["Oat Milk Barista 1L", "Cat Milk Lactose Free 200ml", "Fresh Milk 1L"]);
+        let hit = ix.search("oat milk", 10);
+        assert_eq!(hit[0].doc, 0, "{hit:?}");
+        let cat = hit.iter().find(|h| h.doc == 1).expect("cat milk still matches milk");
+        assert_eq!(cat.typo_bucket, MISSING_TERM_PENALTY, "no oat→cat correction: {hit:?}");
+    }
+
+    /// An alias-produced word matches its regular English number form, one tier below. The alias
+    /// rewrote `sardinas` to `sardines`, and a can labelled `Sardine` was unreachable: the lazy
+    /// rule never fuzzes a word the dictionary holds.
+    #[test]
+    fn an_alias_word_matches_its_number_form_one_tier_below() {
+        let ix = grocery_of(&[
+            "Ligo Sardine in Tomato Sauce 155g",
+            "Mega Sardines Green 155g",
+            "Instant Noodles Beef 55g",
+            "Luxury Soaps Gift Set",
+            "Bath Soap Floral 90g",
+            "Bath Soap Citrus 90g",
+        ]);
+        let found = |q: &str, doc: u32| ix.search(q, 10).into_iter().find(|h| h.doc == doc);
+        assert!(found("sardinas", 0).is_some(), "sardinas → sardines ↔ sardine");
+        let sardinas = ix.search("sardinas", 10);
+        assert_eq!((sardinas[0].doc, sardinas[0].typo_bucket), (1, 0), "canonical first: {sardinas:?}");
+        assert_eq!(found("sardinas", 0).map(|h| h.typo_bucket), Some(1), "number form is one tier down");
+        // The rare plural is capped at the canonical's IDF and sits a tier down: it cannot
+        // outrank the rows that spell `soap`.
+        let soap = ix.search("sabon", 10);
+        assert_eq!(sorted_doc(&soap[..2]), vec![4, 5], "{soap:?}");
+        assert_eq!(soap[2].doc, 3, "{soap:?}");
+        // A word typed verbatim is a spelling and gets no number form: `soap` does not reach
+        // `soaps` (the rule applied to every word broke booted-schema's `user` vs `users`).
+        assert!(found("soap", 3).is_none(), "verbatim words are not inflected");
+    }
+
+    /// A short word the dictionary does not hold at all gets the same contextual correction.
+    #[test]
+    fn an_unknown_short_word_is_corrected_in_context() {
+        let ix = grocery_of(&["Magic Me Noodles Chicken 55g", "Magic Sarap Seasoning 8g"]);
+        let hit = ix.search("magic mex", 10);
+        assert_eq!((hit[0].doc, hit[0].typo_bucket), (0, 1), "{hit:?}");
     }
 }

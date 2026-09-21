@@ -670,11 +670,82 @@ impl AliasTable {
             ("chichirya", "snack"),
             ("paaralan", "school"),
         ];
-        for (s, c) in abbrev.into_iter().chain(filipino) {
+        for (s, c) in abbrev {
             t.insert(s, c);
+        }
+        for (s, c) in filipino {
+            t.insert(s, c);
+            // Tagalog's linker glues onto the word it follows (`kapeng barako`, `sabong panligo`),
+            // so a Filipino row is also reachable in its ligated form. The rule is the grammar's,
+            // applied to every Filipino row rather than to the ones a query happened to miss.
+            if let Some(ligated) = ligature(s) {
+                t.insert(&ligated, c);
+            }
         }
         t
     }
+}
+
+/// The ligated form of a Tagalog word, or `None` when its linker is the separate word `na`.
+///
+/// After a vowel the linker is the suffix `-ng` (`kape` → `kapeng`); after a final `n` the `n`
+/// becomes `ng` (`sabon` → `sabong`, `asin` → `asing`). After any other consonant the linker is
+/// the free word `na` (`gatas na`), which the tokenizer already splits off, so no suffixed form
+/// exists to alias.
+pub fn ligature(word: &str) -> Option<String> {
+    let last = word.chars().last()?;
+    if matches!(last, 'a' | 'e' | 'i' | 'o' | 'u') {
+        Some(format!("{word}ng"))
+    } else if last == 'n' {
+        Some(format!("{word}g"))
+    } else {
+        None
+    }
+}
+
+/// Function words a query may carry and a catalogue routinely omits or spells as a symbol.
+///
+/// `Head & Shoulders` tokenizes to `head shoulders` -- the `&` is punctuation -- so a query that
+/// spells the word out (`head and shoulders`) used to charge every such row the full
+/// missing-term penalty for `and`, and that one missing connective outweighed a genuine typo on
+/// the product word. The same holds for the Tagalog preposition and linker (`gamot sa ubo`,
+/// `bote ng gatas`). English and Filipino, because that is the corpus the alias table already
+/// serves; kept short on purpose -- a word here stops being able to demote a document, so a
+/// content word (or a surname: `ang`, `na`) must never be added.
+const CONNECTIVE: [&str; 8] = ["and", "at", "for", "of", "the", "with", "sa", "ng"];
+
+/// Whether a folded query token is a [connective](CONNECTIVE).
+pub fn is_connective(folded_token: &str) -> bool {
+    CONNECTIVE.contains(&folded_token)
+}
+
+/// The regular English number forms of a folded word: its plural if it looks singular, its
+/// singular if it looks plural. Irregular plurals (`mice`, `children`) are not guessed.
+pub fn number_form(word: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if word.len() < 3 || !word.bytes().all(|b| b.is_ascii_lowercase()) {
+        return out;
+    }
+    let b = word.as_bytes();
+    let last = b[b.len() - 1];
+    if let Some(stem) = word.strip_suffix("ies") {
+        out.push(format!("{stem}y"));
+    } else if let Some(stem) = word.strip_suffix("es") {
+        out.push(stem.to_string());
+        out.push(word[..word.len() - 1].to_string());
+    } else if last == b's' && !word.ends_with("ss") {
+        out.push(word[..word.len() - 1].to_string());
+    } else {
+        let consonant_y = last == b'y' && !matches!(b[b.len() - 2], b'a' | b'e' | b'i' | b'o' | b'u');
+        if consonant_y {
+            out.push(format!("{}ies", &word[..word.len() - 1]));
+        } else if word.ends_with("ch") || word.ends_with("sh") || matches!(last, b'x' | b'z' | b's' | b'o') {
+            out.push(format!("{word}es"));
+        }
+        out.push(format!("{word}s"));
+    }
+    out.retain(|w| w.len() >= 2);
+    out
 }
 
 /// Apply an alias table to an already-tokenized field, in place.
@@ -1101,6 +1172,26 @@ mod tests {
         let text: Vec<&str> = t.iter().map(|x| x.text.as_str()).collect();
         assert_eq!(text, vec!["lucky", "me", "pancit", "canton", "chilimansi"]);
         assert_eq!(t.iter().map(|x| x.position).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn number_form_is_the_regular_english_plural_or_singular() {
+        assert_eq!(number_form("egg"), vec!["eggs"]);
+        assert_eq!(number_form("eggs"), vec!["egg"]);
+        assert_eq!(number_form("box"), vec!["boxes", "boxs"]);
+        assert_eq!(number_form("boxes"), vec!["box", "boxe"]);
+        assert_eq!(number_form("berry"), vec!["berries", "berrys"]);
+        assert_eq!(number_form("berries"), vec!["berry"]);
+        assert_eq!(number_form("glass"), vec!["glasses", "glasss"]);
+        assert!(number_form("1500ml").is_empty(), "a size has no number form");
+        assert!(number_form("me").is_empty(), "too short to inflect");
+    }
+
+    #[test]
+    fn ligature_follows_the_tagalog_linker() {
+        assert_eq!(ligature("kape").as_deref(), Some("kapeng"));
+        assert_eq!(ligature("sabon").as_deref(), Some("sabong"));
+        assert_eq!(ligature("gatas"), None, "after other consonants the linker is `na`");
     }
 
     #[test]
