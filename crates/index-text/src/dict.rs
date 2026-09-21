@@ -258,6 +258,28 @@ impl TermDict {
         out
     }
 
+    /// Every term exactly ONE edit from `token`, whatever its length, with its text when
+    /// `want_text`.
+    ///
+    /// Outside the length gate on purpose: this is not the typo policy but the candidate list for
+    /// a correction the CALLER has already justified on other evidence (see
+    /// `Index::correct_in_context`, which only admits a candidate that co-occurs with the rest of
+    /// the query). The token itself is not returned.
+    pub fn neighbour(&self, token: &str, want_text: bool) -> Vec<(TermMatch, String)> {
+        let automaton = Dfa(self.lev1.build_dfa(token));
+        let mut out = Vec::new();
+        let mut stream = self.map.search(&automaton).into_stream();
+        while let Some((key, id)) = stream.next() {
+            let d = replay_distance(&automaton, key);
+            if d != 1 {
+                continue;
+            }
+            let text = if want_text { String::from_utf8_lossy(key).into_owned() } else { String::new() };
+            out.push((TermMatch { term_id: id as u32, distance: 1 }, text));
+        }
+        out
+    }
+
     /// The **lazy** expansion the production engines all use: try exact first, and only pay for
     /// fuzzy when the exact result set underdelivers.
     ///

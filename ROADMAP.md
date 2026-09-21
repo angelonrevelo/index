@@ -1488,3 +1488,33 @@ New problem surfaced during validation: the planner is the compose point. Shippi
 
 Tier split: 6 Tier 3 · 0 Tier 2 · 0 Tier 1. Rows with a named surface: 6/6.
 
+
+## 2026-09-22 — grocery recall: the judged losses, fixed as rules
+
+presyo's judged set ([`p99-grocery-recall.md`](bench/roadmap/p99-grocery-recall.md)) had 8 queries
+where the engine lost to SQL. Diagnosed one by one: **4 engine causes → 4 rules shipped · 4 not
+engine causes (left, reasons recorded) · 1 rule rejected as measured.** A presyo branch that mapped
+the judged strings to rewrites was rejected before this: it games the benchmark and helps no other
+query.
+
+| Item | What it closes | Surface | Benchmark | Status |
+|---|---|---|---|---|
+| **Tagalog linker forms** | `sabong panlaba`: the alias table keys `sabon`, the query and the catalogue say `sabong`. | `AliasTable::philippine_grocery` + `analyze::ligature` | `a_filipino_ligature_form_resolves_like_its_base` | **SHIPPED 2026-09-22** |
+| **Optional connectives** | `head and sholders`: `Head & Shoulders` has no `and` token, so every H&S row paid `MISSING_TERM_PENALTY` and lost to `Head and Body Wash`. | `GroupKind::Optional` (missing = 0) | `a_connective_missing_from_the_document_costs_nothing` | **SHIPPED 2026-09-22** |
+| **Context correction** | `lucky mee`: `mee` is a real word below the 4-letter gate and the lazy rule never fuzzes an existing word, so the brand rows tied at bucket 3 with the prawn-mee rows and lost on IDF. | `Index::correct_in_context`, `TermDict::neighbour`; range tier plans via `plan_term_stat` | `a_short_word_that_never_cooccurs_is_corrected_in_context`, guard `a_short_word_that_cooccurs_is_left_alone`, `an_unknown_short_word_is_corrected_in_context` | **SHIPPED 2026-09-22** |
+| **Number forms of alias words** | `itlog`: alias → `egg`; cartons say `Eggs`, below the typo gate and never fuzzed. | `Index::add_number_form`, `ExpansionEmit::ceiling` | `an_alias_word_matches_its_number_form_one_tier_below` | **SHIPPED 2026-09-22** (alias-produced words only) |
+
+Rejected this pass (measured, do not rebuild): **number forms for every word** — `booted-schema`
+exact-name rank-1 99.8 → 95.0 %, `alec-surface` 100 → 98.3 %; a document holding both `user` and
+`users` sums two terms. **Dropping connectives** instead of making them optional — `alec-surface`
+lost `city-of-marikina` rank-1, because `of` stopped scoring.
+
+Not engine causes, left open: `cdo corned beef` (the 10th row's search text really says
+`corned beef`; presyo's availability prior reorders bucket 0), `laundry detergent` (the judged
+regex excludes a detergent with `ActivBleach`), `milk` (single generic term, tf in
+`Milk Magic Milk Milk Chocolate`), `palmoliv` (the one catalogue row that spells the query exactly
+ranks first — exact beats typo, by design).
+
+Open: a document matching two expansions of one group SUMS them (the `sabon` −10: `Beauche Soaps`,
+both `sabon` and `soaps`). Group-level max scoring would fix it and touches every pruning bound;
+not attempted.

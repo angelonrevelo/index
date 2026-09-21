@@ -6,6 +6,44 @@ All notable changes to `index`. The project is pre-release and unversioned, so e
 [ROADMAP.md](ROADMAP.md) for the tiered plan and [docs/roadmap-rejected.md](docs/roadmap-rejected.md)
 for what was deliberately ruled out.
 
+## p99 -- grocery recall: linker forms, optional connectives, number forms, context correction (2026-09-22)
+
+presyo's 88-query judged set (Sep-18 pilot corpus, 34,102 rows, loopback replica) had the engine
+losing 8 queries to SQL. Four were engine causes, each fixed as a rule, none keyed on a query string:
+
+- **Tagalog linker.** `AliasTable::philippine_grocery` also inserts every Filipino row's ligated
+  form (`analyze::ligature`: vowel + `ng`, final `n` → `ng`): `sabong`, `kapeng`, `asing`. New
+  artifacts carry the rows; an artifact built before keeps its own table.
+- **Optional connectives.** `and at for of the with sa ng` beside a content word are a
+  `GroupKind::Optional` group: they still score, but missing one costs 0 instead of
+  `MISSING_TERM_PENALTY`. `Head & Shoulders` tokenizes without `and`, so every H&S row used to pay
+  3 and lose to `Head and Body Wash`. Dropping them outright was tried first and cost
+  `alec-surface` one exact-value rank-1 (`city-of-marikina`).
+- **Context correction** (`Index::correct_in_context`). A word (3+ letters, not being typed) whose
+  literal reading meets none of the other words in any live document admits the one-edit
+  neighbours (`TermDict::neighbour`) that do, at distance 1. Covers the 3-letter gate (`mee` →
+  `me`) and the lazy rule that never fuzzes an existing word. Skipped when the whole literal
+  query already co-occurs (one check), or when the other words do not meet each other.
+- **Number forms of alias words** (`Index::add_number_form`, `analyze::number_form`). A word the
+  alias table produced also matches its regular English plural/singular at distance 1, IDF capped at
+  the canonical's (`ExpansionEmit::ceiling`). Applied to every word it cost `booted-schema`
+  exact-name rank-1 99.8 → 95.0 % (`users` beside `user` sums two terms), so it is alias-only.
+
+The range tier plans with `Index::plan_term_stat`, a superset naming every candidate neighbour,
+because context correction is the one expansion step that reads postings.
+
+Judged (engine + hydrate, as served): p@10 93.0 → 94.8 %, typo hit@1 88.9 → 94.4 %, Filipino
+76.3 → 81.9 %, won/lost/tied vs SQL 18/8/62 → 20/4/64. Per-query: `lucky mee` 50 → 100,
+`sabong panlaba` 60 → 90, `itlog` 60 → 100, `head and sholders` 80 → 100, `gamot sa lagnat`
+30 → 60, `sabon` 100 → 90 (a bath soap named `Soaps` now ranks 1; the fixture regex is
+`\bsoap\b`). Still lost, not engine causes: `cdo corned beef`, `milk`, `laundry detergent`,
+`palmoliv`. Consumer benches flat or up (`blead-industry` held-out +3.3 pt from -1.5,
+`presyo-catalog` name-only p@10 61.7 → 62.6 %, `alec-surface` typo rank-1 86.3 → 90.7 %).
+Cost: `real-corpus` cross-store p99 ~21-23 → ~27 us on this Mac. ABI stays 14; `index.wasm`
+703,484 → 710,782 B. Tests: 9 new; the 6 behaviour tests fail on master, the
+`oat milk` guard passes on both, 2 are unit tests of the new helpers. Detail:
+[`bench/roadmap/p99-grocery-recall.md`](bench/roadmap/p99-grocery-recall.md).
+
 ## p98 -- typeahead runs the plan; the ABI builder records positions (2026-09-21)
 
 `Index::search_prefix` / `search_prefix_with_stat` / `Searcher::search_prefix`, and so

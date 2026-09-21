@@ -2212,4 +2212,36 @@ mod tests {
             assert_eq!(bits(&s.search_prefix(q, 10)), bits(&legacy), "{q:?}");
         }
     }
+
+    /// p99 through the multi-segment path: context correction, connectives, ligature and number
+    /// forms are all decided in `expand_query`, which each segment runs on its own dictionary.
+    /// Split so that no single segment holds both readings of `mee`.
+    #[test]
+    fn searcher_runs_the_grocery_recall_rules() {
+        let mk = |row: &[&str]| {
+            let mut b = IndexBuilder::new(Schema::new(vec![Field::new("name", 1.0, 0.4)]))
+                .with_alias(crate::AliasTable::philippine_grocery());
+            for r in row {
+                b.add(&Doc::new([*r]));
+            }
+            b.build().unwrap()
+        };
+        let mut s = Searcher::new(mk(&[
+            "Magic Me Noodles Chicken 55g",
+            "Magic Me Noodles Beef 55g",
+            "Crispy Salt & Vinegar Chips 60g",
+        ]));
+        s.push(mk(&[
+            "Penang Prawn Mee Sauce 200g",
+            "Bread and Salt Crackers 200g",
+            "Ligo Sardine in Tomato Sauce 155g",
+            "Bath Soap Floral 90g",
+        ]));
+        let top = |q: &str| s.search(q, 10).first().map(|h| (h.doc, h.typo_bucket));
+        assert_eq!(top("magic mee").map(|t| t.1), Some(1));
+        assert!(matches!(top("magic mee"), Some((0 | 1, 1))), "{:?}", s.search("magic mee", 10));
+        assert_eq!(top("salt and vinegr"), Some((2, 1)));
+        assert_eq!(top("sardinas"), Some((5, 1)));
+        assert_eq!(top("sabong panligo"), Some((6, 0)));
+    }
 }

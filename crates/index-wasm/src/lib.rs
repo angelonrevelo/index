@@ -2253,6 +2253,11 @@ pub unsafe extern "C" fn idx_image_free(h: *mut ImageHandle) {
 // the assembled index and returns `u32::MAX` if any term it would scan was not fetched. A host that
 // sees that sentinel falls back to a full open. Answering from a term set that is silently missing
 // a list is the failure this refuses to have.
+//
+// The one expansion step that reads postings is p99's context correction (a short or existing word
+// that never co-occurs with the rest of the query admits a one-edit neighbour that does). The
+// planner therefore asks for `plan_term_stat`, which names EVERY candidate neighbour; the answering
+// image, holding those lists, makes the co-occurrence decision a full open would make.
 
 /// Bytes a reader needs from the head of a file to learn where all eighteen sections live:
 /// `MAGIC.len()` plus eighteen spans of two little-endian `u64`.
@@ -2656,8 +2661,10 @@ pub unsafe extern "C" fn idx_range_plan_query(
     // Two sources, and both are decided by structures that are already resident, which is why a
     // plan can be exact: the dictionary FST decides the expansions, and the learned-expansion table
     // decides the rest. Neither consults a posting list.
+    // One exception reads postings -- a context correction (`Index::correct_in_context`) -- so
+    // the plan is its superset, `plan_term_stat`, and the answering image decides it exactly.
     let mut term: Vec<u32> = index
-        .term_stat(query, prefix != 0)
+        .plan_term_stat(query, prefix != 0)
         .into_iter()
         .filter_map(|(text, _)| index.term_id_of(&text))
         .collect();
