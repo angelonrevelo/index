@@ -287,10 +287,12 @@ this file**: Apple M5 (4P + 6E), 8 client threads, Wikipedia `20231101.en`.
 
 **Read it this way:**
 
-- **Only the Wikipedia COUNT row can be compared, and only by extrapolation.** Count cost is linear
-  in postings: 2.6x the corpus costs 2.6x the QPS and 2.55x the p99. At 8.0 GB that projects to about
-  870 QPS at a ~26 ms p99, **~12x behind TIN**. That figure is unmeasured. TIN ANDs and ORs page
-  bitmaps and reads exact per-term counts; this engine walks every posting.
+- **Only the Wikipedia COUNT row can be compared, and only by extrapolation.** The 2026-09-17
+  `tin-shape` run walked postings: 2.6x the corpus cost 2.6x the QPS and 2.55x the p99, projecting
+  about 870 QPS at a ~26 ms p99 at 8.0 GB, **~12x behind TIN**. COUNT now ORs/ANDs sparse 64-doc
+  page presence and does not walk postings (holdable overlapping proxy: 16x docs -> 6.6x wall,
+  visits=0). That projection is stale; a new 8.0 GB number is unmeasured (`INDEX_TIN_TSV` unset).
+  Do not read the codec change as 10,260 QPS.
 - **The top-10 rows say where the cost is, not who is faster.** TIN's run over 46–120x more text,
   with an index 1.6x larger than RAM, through Postgres. These runs are resident and in process.
 - **Phrase is the tail**: its p99 is 4x the conjunction p99 at both sizes.

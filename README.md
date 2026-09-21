@@ -547,13 +547,15 @@ production corpora. **`index-core` remains dependency-free.**
   offsets, columnar doc lengths, width-coded facets) — together −45.5 % of the presyo file this session,
   latency at parity. DocID reordering is built and ships opt-in (`p90`, default off on measurement); SIMD block decode was
   built, measured and reverted (`p92`: the bit-loop was never the load cost — the negative result is recorded).
-- **Against TIN's published workload this engine is ~12x behind on counts, and the comparison is
-  partial.** Only TIN's Wikipedia disjunction `COUNT(*)` row (10,260 QPS / 2 ms p99 on 8.0 GB) is
-  comparable. At 1.84 GB this engine measures 3,774 QPS / 6.0 ms, and cost is linear in postings, so
-  8.0 GB projects to ~870 QPS / ~26 ms. Building the full 8.0 GB corpus needs ~28 GB of peak memory,
-  more than this 24 GB Mac has. Phrase queries are the slowest kind, at 4x the conjunction p99.
-  COUNT is on the ABI/CLI (`p94`/`p95`); the Wikipedia COUNT **gap is still ~12x**. The still-open
-  plan is [`p97-tin-parity.md`](bench/roadmap/p97-tin-parity.md). See [`docs/benchmarks.md`](docs/benchmarks.md) §7.
+- **Against TIN's published workload the last like-for-like COUNT is ~12x behind, and that
+  comparison is partial.** Only TIN's Wikipedia disjunction `COUNT(*)` row (10,260 QPS / 2 ms p99 on
+  8.0 GB) is comparable. At 1.84 GB this engine measured 3,774 QPS / 6.0 ms (2026-09-17) **while
+  COUNT still walked postings**. COUNT now answers from stored df / sparse 64-doc page presence
+  (overlapping OR/AND and deletions included; visits=0). That retires the linear-in-postings
+  projection; it does **not** replace it with 10,260 QPS. Building the full 8.0 GB corpus needs
+  ~28 GB of peak memory, more than this 24 GB Mac has, and `INDEX_TIN_TSV` is unset here. Phrase
+  queries are the slowest kind, at 4x the conjunction p99. The still-open speed/CI plan is
+  [`p97-tin-parity.md`](bench/roadmap/p97-tin-parity.md). See [`docs/benchmarks.md`](docs/benchmarks.md) §7.
 - **Nothing is deployed.** All four integrations are measurements on throwaway worktree branches; no
   `main` was modified and no PR opened. [`docs/adoption.md`](docs/adoption.md) has the per-app plan,
   gate, cost and rollback so that becomes one decision rather than an investigation.

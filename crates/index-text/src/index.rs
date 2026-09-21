@@ -76,6 +76,12 @@ thread_local! {
     static FORCE_SERIAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+thread_local! {
+    /// Scratch bitmap for dense COUNT OR, reused across queries on this thread so a disjunction
+    /// does not allocate `doc_count / 8` bytes every time.
+    static COUNT_ACC: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Evaluate `f` at every index in `0..n`, spreading the indices over threads when `work` says it
 /// is worth it, and return the results **in index order**.
 ///
@@ -1243,8 +1249,9 @@ impl IndexBuilder {
             key_order: Vec::new(),
             collection_size: None,
             term_df: Vec::new(),
-            term_page: Vec::new(),
-            term_page_word: 0,
+            term_page_off: Vec::new(),
+            term_page_id: Vec::new(),
+            term_page_bit: Vec::new(),
         };
         ix.rebuild_meta();
         Ok(ix)
@@ -1413,11 +1420,13 @@ pub struct Index {
     /// Stored document frequency per term (`posting[t].len()` at build). COUNT of a live,
     /// undeleted term is this integer — it does not walk the list.
     term_df: Vec<u32>,
-    /// Page bitmaps for COUNT work-elision: `term_page_word` `u64`s per term, bit `doc / 64`.
-    /// Two terms whose page maps share no bits have disjoint documents, so a disjunction COUNT is
-    /// the sum of stored dfs.
-    term_page: Vec<u64>,
-    term_page_word: usize,
+    /// Sparse 64-doc page presence for COUNT. Term `t` owns
+    /// `term_page_id[term_page_off[t]..term_page_off[t + 1]]` (sorted page indexes) and the
+    /// matching 64-bit presence words in `term_page_bit`. A COUNT OR/AND is a merge of those
+    /// words plus an AND-NOT of `deleted`; it does not walk postings. Derived, never serialized.
+    term_page_off: Vec<u32>,
+    term_page_id: Vec<u32>,
+    term_page_bit: Vec<u64>,
     /// Per numeric slot, every document that HAS a finite value there, ascending by value.
     ///
     /// **Derived, never serialized**, exactly like `block_max`: it is a sort of a column the index
@@ -2186,8 +2195,9 @@ impl Index {
             avg_len,
             doc_count,
             term_df: Vec::new(),
-            term_page: Vec::new(),
-            term_page_word: 0,
+            term_page_off: Vec::new(),
+            term_page_id: Vec::new(),
+            term_page_bit: Vec::new(),
         };
         ix.rebuild_meta();
         Ok(ix)
@@ -2206,18 +2216,36 @@ impl Index {
             self.posting_base.push(acc);
         }
 
-        // Stored per-term COUNT + page bitmaps so a live COUNT does not walk postings.
-        let page = self.doc_count.div_ceil(64);
-        let word = page.div_ceil(64).max(1);
-        self.term_page_word = word;
+        // Stored per-term COUNT + sparse 64-doc presence so a live COUNT does not walk postings,
+        // including overlapping disjunction/conjunction and deletions (AND-NOT `deleted`).
         self.term_df = self.posting.iter().map(|l| l.len() as u32).collect();
-        self.term_page = vec![0u64; self.posting.len() * word];
-        for (t, list) in self.posting.iter().enumerate() {
-            let base = t * word;
+        let occupied: usize = self.posting.iter().map(|l| l.len()).sum();
+        self.term_page_off = Vec::with_capacity(self.posting.len() + 1);
+        self.term_page_id = Vec::with_capacity(occupied);
+        self.term_page_bit = Vec::with_capacity(occupied);
+        self.term_page_off.push(0);
+        for list in &self.posting {
+            let mut cur = u32::MAX;
+            let mut bits = 0u64;
             for p in list {
-                let pg = p.doc as usize / 64;
-                self.term_page[base + pg / 64] |= 1u64 << (pg % 64);
+                let pg = p.doc / 64;
+                let bit = 1u64 << (p.doc % 64);
+                if pg != cur {
+                    if cur != u32::MAX {
+                        self.term_page_id.push(cur);
+                        self.term_page_bit.push(bits);
+                    }
+                    cur = pg;
+                    bits = bit;
+                } else {
+                    bits |= bit;
+                }
             }
+            if cur != u32::MAX {
+                self.term_page_id.push(cur);
+                self.term_page_bit.push(bits);
+            }
+            self.term_page_off.push(self.term_page_id.len() as u32);
         }
 
         self.rebuild_key_order();
@@ -4263,18 +4291,19 @@ impl Index {
     /// expansion, no prefix, no ranking. Deleted documents are not counted.
     ///
     /// A count is a set question, so it skips everything [`Index::search`] exists for — scoring,
-    /// pools, the typo bucket — and reads posting lists only. Tokens absent from the dictionary
-    /// contribute nothing. Measured against TIN's published count row in `p93`.
+    /// pools, the typo bucket — and answers from stored df / sparse 64-doc page presence. Tokens
+    /// absent from the dictionary contribute nothing. Measured against TIN's published count row
+    /// in `p93`.
     pub fn count_any(&self, query: &str) -> usize {
         self.count_any_cost(query).0
     }
 
-    /// `(count, posting_entry_visited)`. The stored-df / disjoint-page path visits 0 postings.
+    /// `(count, posting_entry_visited)`. The page-presence path visits 0 postings.
     pub fn count_any_cost(&self, query: &str) -> (usize, usize) {
         let mut id: Vec<u32> = self.count_token(query).into_iter().flatten().collect();
         id.sort_unstable();
         id.dedup();
-        if let Some(n) = self.count_union_stored(&id) {
+        if let Some(n) = self.count_union_page(&id) {
             return (n, 0);
         }
         let list = self.count_list(query);
@@ -4306,54 +4335,179 @@ impl Index {
         (n, total)
     }
 
-    /// Stored-df / disjoint-page COUNT. `None` when deletions or overlapping pages force a walk.
-    fn count_union_stored(&self, id: &[u32]) -> Option<usize> {
-        if self.deleted_count != 0 {
+    fn term_page_slice(&self, t: u32) -> Option<(&[u32], &[u64])> {
+        let t = t as usize;
+        let off = &self.term_page_off;
+        if t + 1 >= off.len() {
             return None;
         }
+        let a = off[t] as usize;
+        let b = off[t + 1] as usize;
+        if b > self.term_page_id.len() || b > self.term_page_bit.len() {
+            return None;
+        }
+        Some((&self.term_page_id[a..b], &self.term_page_bit[a..b]))
+    }
+
+    #[inline]
+    fn page_live(&self, page: u32, mut bits: u64) -> u32 {
+        if !self.deleted.is_empty() {
+            if let Some(&d) = self.deleted.get(page as usize) {
+                bits &= !d;
+            }
+        }
+        bits.count_ones()
+    }
+
+    /// Sparse page-presence COUNT of a disjunction. Handles overlap and deletions. `None` only
+    /// when the derived maps are missing (before `rebuild_meta`).
+    fn count_union_page(&self, id: &[u32]) -> Option<usize> {
         if id.is_empty() {
             return Some(0);
         }
         if self.term_df.len() != self.posting.len() {
             return None;
         }
-        if id.len() == 1 {
+        if id.len() == 1 && self.deleted_count == 0 {
             return Some(self.term_df[id[0] as usize] as usize);
         }
-        let w = self.term_page_word;
-        if w == 0 || self.term_page.len() != self.posting.len() * w {
+        if self.term_page_off.len() != self.posting.len() + 1 {
             return None;
         }
-        let mut acc = vec![0u64; w];
-        let mut page_sum = 0u32;
+        let mut slice: Vec<(&[u32], &[u64])> = Vec::with_capacity(id.len());
         for &t in id {
-            let sl = &self.term_page[t as usize * w..][..w];
-            for (a, b) in acc.iter_mut().zip(sl) {
-                *a |= *b;
-            }
-            page_sum += sl.iter().map(|x| x.count_ones()).sum::<u32>();
+            slice.push(self.term_page_slice(t)?);
         }
-        let or_pages: u32 = acc.iter().map(|x| x.count_ones()).sum();
-        if or_pages != page_sum {
+        if slice.len() == 1 {
+            let (page, bit) = slice[0];
+            let mut n = 0usize;
+            for i in 0..page.len() {
+                n += self.page_live(page[i], bit[i]) as usize;
+            }
+            return Some(n);
+        }
+        let page_count = self.doc_count.div_ceil(64);
+        let occupied_count: usize = slice.iter().map(|(page, _)| page.len()).sum();
+        // Dense OR into a corpus-sized page bitmap when the terms cover enough pages that a
+        // k-way merge would thrash. TIN's Wikipedia COUNT is this shape: 2–15 overlapping
+        // terms, page bits OR'd, popcount. Scratch is thread-local so the alloc is once.
+        if page_count > 0 && occupied_count > page_count / 8 {
+            return Some(self.count_union_dense(&slice, page_count));
+        }
+        let mut at = vec![0usize; slice.len()];
+        let mut n = 0usize;
+        loop {
+            let mut min_page = u32::MAX;
+            for (i, (page, _)) in slice.iter().enumerate() {
+                if at[i] < page.len() {
+                    min_page = min_page.min(page[at[i]]);
+                }
+            }
+            if min_page == u32::MAX {
+                break;
+            }
+            let mut bits = 0u64;
+            for (i, (page, bit)) in slice.iter().enumerate() {
+                if at[i] < page.len() && page[at[i]] == min_page {
+                    bits |= bit[at[i]];
+                    at[i] += 1;
+                }
+            }
+            n += self.page_live(min_page, bits) as usize;
+        }
+        Some(n)
+    }
+
+    fn count_union_dense(&self, slice: &[(&[u32], &[u64])], page_count: usize) -> usize {
+        COUNT_ACC.with(|cell| {
+            let mut acc = cell.borrow_mut();
+            if acc.len() < page_count {
+                acc.resize(page_count, 0);
+            } else {
+                acc[..page_count].fill(0);
+            }
+            for (page, bit) in slice {
+                for i in 0..page.len() {
+                    acc[page[i] as usize] |= bit[i];
+                }
+            }
+            let live = &mut acc[..page_count];
+            if !self.deleted.is_empty() {
+                for (a, d) in live.iter_mut().zip(self.deleted.iter()) {
+                    *a &= !*d;
+                }
+            }
+            live.iter().map(|w| w.count_ones() as usize).sum()
+        })
+    }
+
+    /// Sparse page-presence COUNT of a conjunction. `None` only when the derived maps are missing.
+    fn count_intersect_page(&self, id: &[u32]) -> Option<usize> {
+        if id.is_empty() {
+            return Some(0);
+        }
+        if id.len() == 1 {
+            return self.count_union_page(id);
+        }
+        if self.term_page_off.len() != self.posting.len() + 1 {
             return None;
         }
-        Some(id.iter().map(|&t| self.term_df[t as usize] as usize).sum())
+        let mut slice: Vec<(&[u32], &[u64])> = Vec::with_capacity(id.len());
+        for &t in id {
+            let s = self.term_page_slice(t)?;
+            if s.0.is_empty() {
+                return Some(0);
+            }
+            slice.push(s);
+        }
+        slice.sort_unstable_by_key(|(page, _)| page.len());
+        let (head_page, head_bit) = slice[0];
+        let rest = &slice[1..];
+        let mut n = 0usize;
+        for i in 0..head_page.len() {
+            let page = head_page[i];
+            let mut bits = head_bit[i];
+            let mut miss = false;
+            for (pg, bit) in rest {
+                match pg.binary_search(&page) {
+                    Ok(j) => bits &= bit[j],
+                    Err(_) => {
+                        miss = true;
+                        break;
+                    }
+                }
+                if bits == 0 {
+                    miss = true;
+                    break;
+                }
+            }
+            if miss || bits == 0 {
+                continue;
+            }
+            n += self.page_live(page, bits) as usize;
+        }
+        Some(n)
     }
 
     /// **`COUNT(*)` of documents containing EVERY query token**, exactly as written. A token absent
     /// from the dictionary makes the answer 0, which is what a conjunction means.
     pub fn count_all(&self, query: &str) -> usize {
+        self.count_all_cost(query).0
+    }
+
+    /// `(count, posting_entry_visited)`. The page-presence path visits 0 postings.
+    pub fn count_all_cost(&self, query: &str) -> (usize, usize) {
         let tok = self.count_token(query);
         if tok.is_empty() {
-            return 0;
+            return (0, 0);
         }
         let Some(mut id) = tok.into_iter().collect::<Option<Vec<u32>>>() else {
-            return 0;
+            return (0, 0);
         };
         id.sort_unstable();
         id.dedup();
-        if self.deleted_count == 0 && id.len() == 1 && self.term_df.len() == self.posting.len() {
-            return self.term_df[id[0] as usize] as usize;
+        if let Some(n) = self.count_intersect_page(&id) {
+            return (n, 0);
         }
         let mut list: Vec<&[Posting]> = id
             .iter()
@@ -4379,7 +4533,7 @@ impl Index {
                 n += 1;
             }
         }
-        n
+        (n, head.len())
     }
 
     /// **`COUNT(*)` of documents containing the query's tokens consecutive and in order in one
@@ -5482,12 +5636,110 @@ mod tests {
         let large = mk(4096);
         assert_eq!(small.count_any("shared"), 64);
         assert_eq!(large.count_any("shared"), 4096);
-        assert_eq!(small.count_any_cost("shared").1, 0, "must not walk the 64-posting list");
-        assert_eq!(large.count_any_cost("shared").1, 0, "must not walk the 4096-posting list");
+        assert_eq!(
+            small.count_any_cost("shared").1,
+            0,
+            "must not walk the 64-posting list"
+        );
+        assert_eq!(
+            large.count_any_cost("shared").1,
+            0,
+            "must not walk the 4096-posting list"
+        );
         assert_eq!(large.count_all("shared"), 4096);
         // Disjoint terms live on disjoint pages (token0 only in doc 0, token4000 only in doc 4000).
         assert_eq!(large.count_any("token0 token4000"), 2);
         assert_eq!(large.count_any_cost("token0 token4000").1, 0);
+    }
+
+    /// Overlapping pages and deletions used to force a posting walk. Sparse 64-doc presence
+    /// answers both without visiting a posting; the integer still matches a brute-force set.
+    #[test]
+    fn count_any_of_overlapping_or_deleted_terms_does_not_walk_postings() {
+        let mk = |n: usize| {
+            let mut b = IndexBuilder::new(Schema::new(vec![Field::new("name", 1.0, 0.4)]));
+            for i in 0..n {
+                let extra = if i % 2 == 0 { "even" } else { "odd" };
+                b.add(&Doc::new([format!("token{i} shared {extra}")]));
+            }
+            b.build().unwrap()
+        };
+        let n = 4096usize;
+        let large = mk(n);
+        assert_eq!(large.count_any("shared even"), n);
+        assert_eq!(
+            large.count_any_cost("shared even").1,
+            0,
+            "overlapping OR must not walk"
+        );
+        assert_eq!(large.count_all("shared even"), n / 2);
+        assert_eq!(
+            large.count_all_cost("shared even").1,
+            0,
+            "overlapping AND must not walk"
+        );
+        assert_eq!(large.count_any("even odd"), n);
+        assert_eq!(large.count_any_cost("even odd").1, 0);
+        assert_eq!(large.count_all("even odd"), 0);
+        assert_eq!(large.count_all_cost("even odd").1, 0);
+
+        let mut gone = mk(n);
+        for d in (0..n as u32).step_by(3) {
+            gone.delete(d);
+        }
+        let live: Vec<usize> = (0..n).filter(|i| i % 3 != 0).collect();
+        let any_shared_even = live.len();
+        let all_shared_even = live.iter().filter(|i| *i % 2 == 0).count();
+        assert_eq!(gone.count_any("shared"), any_shared_even);
+        assert_eq!(
+            gone.count_any_cost("shared").1,
+            0,
+            "deleted COUNT must not walk"
+        );
+        assert_eq!(gone.count_any("shared even"), any_shared_even);
+        assert_eq!(gone.count_any_cost("shared even").1, 0);
+        assert_eq!(gone.count_all("shared even"), all_shared_even);
+        assert_eq!(gone.count_all_cost("shared even").1, 0);
+        assert_eq!(gone.count_any("even odd"), any_shared_even);
+        assert_eq!(gone.count_all("even odd"), 0);
+    }
+
+    /// Holdable proxy for TIN's disjunction COUNT: overlapping OR must stay 0 posting visits
+    /// as the list grows, so cost tracks occupied 64-doc pages rather than postings. Run
+    /// `--ignored --release` to print QPS. Does not stand in for 10,260 QPS on 8.0 GB.
+    #[test]
+    #[ignore]
+    fn count_any_overlapping_qps_is_not_linear_in_postings() {
+        use std::time::Instant;
+        for n in [4_096usize, 16_384, 65_536] {
+            let mut b = IndexBuilder::new(Schema::new(vec![Field::new("name", 1.0, 0.4)]));
+            for i in 0..n {
+                let extra = if i % 2 == 0 { "even" } else { "odd" };
+                b.add(&Doc::new([format!("token{i} shared {extra}")]));
+            }
+            let ix = b.build().unwrap();
+            assert_eq!(ix.count_any_cost("shared even").1, 0);
+            assert_eq!(ix.count_any("shared even"), n);
+            let warm = 64;
+            for _ in 0..warm {
+                let _ = ix.count_any("shared even");
+            }
+            let want = 8_192;
+            let t0 = Instant::now();
+            for _ in 0..want {
+                let _ = ix.count_any("shared even");
+            }
+            let dt = t0.elapsed();
+            let qps = want as f64 / dt.as_secs_f64();
+            let p99_ms = dt.as_secs_f64() / want as f64 * 1e3;
+            eprintln!(
+                "n={n} postings~{} qps={:.0} mean_ms={:.4} visits={}",
+                n + n / 2,
+                qps,
+                p99_ms,
+                ix.count_any_cost("shared even").1
+            );
+        }
     }
 
     fn colgate_pair(position: bool) -> Index {
@@ -5538,7 +5790,8 @@ mod tests {
     /// consecutive in reverse, so `"Total Colgate"` is 0. A `count_all` fallback would be 2.
     #[test]
     fn count_phrase_of_a_gapped_reverse_is_zero() {
-        let mut b = IndexBuilder::new(Schema::new(vec![Field::new("name", 1.0, 0.4)])).with_position();
+        let mut b =
+            IndexBuilder::new(Schema::new(vec![Field::new("name", 1.0, 0.4)])).with_position();
         b.add(&Doc::new(["Colgate Total Toothpaste"]));
         b.add(&Doc::new(["Total Toothpaste Colgate"]));
         let ix = b.build().unwrap();

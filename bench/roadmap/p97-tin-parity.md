@@ -1,9 +1,9 @@
 # P97 — TIN parity and in-process enterprise grade (not built)
 
 **Tier:** T3 · **candidate-tier: expected-red until built** · **gate-excluded** until an engine
-change lands. **Status: partial.** Efficiency (stored df / disjoint-page COUNT) and concurrent-snapshot
-reliability and CRC integrity shipped 2026-09-20. Speed (10,260 QPS on 8.0 GB) and observed
-GitHub check-run are **not** shipped.
+change lands. **Status: partial.** Efficiency (stored df / sparse 64-doc page presence for
+overlapping OR/AND and deletions) and concurrent-snapshot reliability and CRC integrity shipped
+2026-09-20/21. Speed (10,260 QPS on 8.0 GB) and observed GitHub check-run are **not** shipped.
 
 This is **not** a claim the bars are met. p93 measured the gap. p94/p95 exported COUNT. This file
 is the acceptance for closing the gap and for in-process reliability/CI — without becoming a
@@ -33,6 +33,11 @@ and **page-level work elision** (AND/OR of page bitmaps). Pass when a COUNT's by
 time stay flat as posting-list length grows on a holdable corpus, and the 8.0 GB projection moves
 with it. Fail while `count_any` / `count_all` still iterate postings for the answer.
 
+Holdable proof (2026-09-21): overlapping OR/AND and deleted COUNT visit 0 postings at 64 and 4096
+docs (`count_any_of_overlapping_or_deleted_terms_does_not_walk_postings`). Release proxy
+(`count_any_overlapping_qps_is_not_linear_in_postings --ignored`): 16x docs (4096 → 65536) is
+6.6x wall, visits stay 0 -- not linear in postings. That is **not** 10,260 QPS on 8.0 GB.
+
 ## Reliability bar (in-process, not MVCC)
 
 TIN's concurrent-write bar, translated: readers stay correct and do not stall while writers run.
@@ -54,8 +59,8 @@ Not in this row: SLA, SSO, SOC2, multi-tenant, 99.9% uptime, `CREATE EXTENSION`.
 
 | bar | pass | status |
 |---|---|---|
-| efficiency | COUNT does not walk every posting of a live undeleted term | **SHIPPED** (`count_any_cost` visits 0) |
-| speed | holdable `tin-shape` COUNT + linear projection no longer ~12x behind 10,260 QPS / 2 ms / 1.7 MB/query | **not built** |
+| efficiency | COUNT does not walk every posting of a live undeleted term, including overlapping OR/AND and deletions | **SHIPPED** (`count_any_cost` / `count_all_cost` visits 0) |
+| speed | holdable `tin-shape` COUNT + linear projection no longer ~12x behind 10,260 QPS / 2 ms / 1.7 MB/query | **not built** (`INDEX_TIN_TSV` absent; do not substitute the 65 536-doc proxy) |
 | reliability | concurrent apply + query matches rebuilt snapshot | **SHIPPED** |
 | enterprise grade | corrupt `.idx` refused; GitHub check-run observed | **integrity SHIPPED; CI not observed** |
 
