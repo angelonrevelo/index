@@ -12,12 +12,11 @@
 
 | Repo | Branch | Worktree | What is on it |
 |---|---|---|---|
-| profstopick | `feat/index-engine-p98` | `../profstopick` | `src/lib/search-match-index.mjs` (ABI 14 adapter), `test/search-name-order-index.test.mjs` (their test, one import line). **9/9**. Production `/search` still uses `search-match.ts`. |
+| profstopick | `main` (`d59f8c3`, deployed 2026-09-21) | — | **Serving.** Typeahead is literal-first `matchFolded` + this engine (`public/search-engine.wasm`, ABI 14, `a3b4911`) with `prefix: true`, which now runs the p98 plan (`-word`, `"phrase"`); the URL is versioned by the module's sha256 (profstopick D191, D198). The `feat/index-engine-p98` adapter branch is an evaluation, superseded. |
 | onegrid | `index-accel-eval` | `../onegrid-index-eval` | `packages/wasm/src/__tests__/differential.real-module.test.ts` (their property test, one line changed) |
-| presyo | `index-engine-eval` | `../presyo-index-eval` | `scripts/compare_index_engine.{sh,ts}` (ABI 14). No API serve-from-artifact yet. |
+| presyo | `main` (`be6b3414`, deployed 2026-09-21) | — | **Built, flag OFF.** `PRODUCT_SEARCH_ENGINE=index` serves `/api/product/search` from the artifact in-process via WASM + a 20-id keyed hydrate, SQL fallback on any failure. Judged 88 queries: p@10 83.4% → 93.1%, wrong-size 29.5% → 0.7%, p50 14.6 ms vs 466 ms. Not flipped: the pilot view fell to 331 rows and the nightly build refuses below 20,000. See presyo `docs/INDEX_EVAL.md`. |
 
-**Nothing on any `main` branch was modified, and no existing file in any app was edited.** Every
-branch adds files only.
+The evaluation branches added files only. profstopick and presyo have since adopted the engine on `main` (rows above); onegrid has not.
 
 ---
 
@@ -141,14 +140,12 @@ REQUIRED — the schema maps by column name, and without it the build reports
 trusts the exit code ships an empty index. And `--schema` caps at 4 fields
 (`index: 5 fields, at most 4 are supported`), which is not in the CLI's own usage text.
 
-**Still not done, and not claimed:** presyo's API does not yet SERVE from the artifact, `apply` has
-never been run against their change stream, and no typo/recall benchmark was reproduced on the real
-corpus.
+**Since 2026-09-21:** presyo's API can SERVE from the artifact behind `PRODUCT_SEARCH_ENGINE=index` (default off), and a judged typo/size/Filipino benchmark was run on the real corpus (presyo `docs/INDEX_EVAL.md`). **Still not done:** `apply` has never run against their change stream — the nightly full rebuild is the update path, and a multi-segment artifact is refused.
 
 **Honest caveat.** The 260 K comparison is 1,940 real rows plus recombined distractors. It does not
 populate their `search_text` column or their ~296 K aliases, and their input contract
 (`productSearchToken('Coca-Cola 1.5L') === ['coca','cola','1.5l']`) is deliberately unsatisfied —
-the analyzer produces `1500ml`, which is worth **+4.6 pp recall** by presyo's own measurement.
+the analyzer produces `1500ml`, which is worth **+4.6 pp recall** by presyo's own measurement. *(Measured 2026-09-21 on the real corpus: the engine folds `1.5L`/`1.5 l`/`1500ml` identically on both sides, so the gap closes without a presyo-side rewrite — `coca cola 1500ml` 0% → 90% p@10.)*
 
 ---
 
