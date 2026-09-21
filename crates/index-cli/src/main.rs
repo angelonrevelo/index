@@ -33,7 +33,7 @@
 //! truth; `stat` tells you when that is worth doing.
 
 use index_cli::{collection, row, sql};
-use index_text::{Doc, Field, IndexBuilder, Schema};
+use index_text::{AliasTable, Doc, Field, IndexBuilder, Schema};
 use row::{Format, Record, RowReader};
 use sql::SqlDumpReader;
 use std::collections::HashMap;
@@ -62,6 +62,8 @@ BUILD  reads rows and writes a fresh collection (replacing any existing one).
   --reorder         reorder document ids by graph bisection at build time (smaller posting
                     lists, ties may flip; see bench/roadmap/p90-docid-reorder.md).
   --position        record token positions, enabling phrase queries. Costs bytes.
+                    Filipino grocery aliases (bigas/gatas/…) load on every build,
+                    matching idx_build_new.
 
 APPLY  reads change records and updates the collection in place.
   --op PATH         path holding the operation. Default 'op'.
@@ -402,7 +404,8 @@ fn cmd_build(o: &Opt) -> Result<(), String> {
     let schema = parse_schema(spec)?;
     let path = mapping(&schema, &o.field);
 
-    let mut b = IndexBuilder::new(Schema::new(schema.iter().map(|(_, f)| f.clone()).collect()));
+    let mut b = IndexBuilder::new(Schema::new(schema.iter().map(|(_, f)| f.clone()).collect()))
+        .with_alias(AliasTable::philippine_grocery());
     if let Some(k) = &o.key {
         let slot = slot_of(k, &schema)?;
         if !b.set_key_field(slot) {
@@ -642,7 +645,8 @@ fn cmd_apply(o: &Opt) -> Result<(), String> {
     // irrelevant by construction rather than by careful sequencing, and it also means a thousand
     // updates to one row build one document instead of a thousand.
     let (change, collapsed) = collapse(&change);
-    let mut b = IndexBuilder::new(Schema::new(schema.iter().map(|(_, f)| f.clone()).collect()));
+    let mut b = IndexBuilder::new(Schema::new(schema.iter().map(|(_, f)| f.clone()).collect()))
+        .with_alias(AliasTable::philippine_grocery());
     if !b.set_key_field(key_slot) {
         return Err("could not mirror the base key field".into());
     }

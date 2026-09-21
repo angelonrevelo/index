@@ -16,7 +16,7 @@
 //!
 //!   INDEX_PRESYO_CSV=/var/lib/presyo/idx/live/corpus.csv cargo run --release -p index-bench --bin presyo_search
 
-use index_text::{Doc, Field, IndexBuilder, Schema};
+use index_text::{AliasTable, Doc, Field, IndexBuilder, Schema};
 use std::time::Instant;
 
 mod timer;
@@ -107,7 +107,8 @@ fn main() {
         Field::new("product_name", 3.0, 0.4),
         Field::new("brand_name", 1.0, 0.6),
         Field::new("search_text", 1.0, 0.4),
-    ]));
+    ]))
+    .with_alias(AliasTable::philippine_grocery());
     let mut n = 0usize;
     for r in row.iter().skip(1) {
         if r.len() <= c_text {

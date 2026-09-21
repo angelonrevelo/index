@@ -157,7 +157,7 @@ export class SearchIndex {
   }
 
   /**
-   * Run a query.
+   * Run a query. Parses mixed `term` / `"phrase"` / `-exclude`; a live application key is rank-1.
    * @param {string} query
    * @param {{k?: number, prefix?: boolean}} opt  `prefix` enables typeahead on the last token.
    * @returns {{doc: number, score: number, typoBucket: number, label: string|null}[]}

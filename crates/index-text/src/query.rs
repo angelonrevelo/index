@@ -8,11 +8,12 @@
 //!
 //! It is a larger decision because a query language is a contract with everything downstream: a
 //! planner has to decide what a phrase means next to a term, what an exclusion means next to a
-//! facet clause, and which of them wins when they disagree. So this module is deliberately only
-//! the half of that decision that can be settled without an index: it turns a string into a
-//! [`Query`] and touches nothing else — no dictionary, no postings, no `Index`. **Nothing in the
-//! engine consumes [`Query`] yet**; the planner that will is a separate decision, and is left
-//! undone rather than guessed at.
+//! facet clause, and which of them wins when they disagree. This module is the half of that
+//! decision that can be settled without an index: it turns a string into a [`Query`] and touches
+//! nothing else — no dictionary, no postings, no `Index`. [`crate::Index::search`] and
+//! [`crate::Searcher::search`] consume [`Query`]: unquoted terms stay bag-of-words BM25, each
+//! `phrase` is an adjacency filter, `exclude` drops documents that contain those tokens, and a
+//! query equal to a live application key is rank-1.
 //!
 //! # Four rules, each the safe direction of a rule this repo already has
 //!
@@ -61,6 +62,27 @@ pub struct Query {
     pub phrase: Vec<Vec<String>>,
     /// Tokens a matching document must **not** contain.
     pub exclude: Vec<String>,
+}
+
+impl Query {
+    /// No positive constraint. An exclude-only parse is empty in this sense, so search returns
+    /// nothing rather than everything-minus-those-tokens.
+    pub fn is_empty(&self) -> bool {
+        self.term.is_empty() && self.phrase.is_empty()
+    }
+
+    /// Analyzer tokens the bag-of-words arm scores: unquoted terms plus every phrase token.
+    /// Exclude tokens are absent — they filter, they do not rank.
+    pub fn scoring_query(&self) -> String {
+        let mut out = String::new();
+        for t in self.term.iter().chain(self.phrase.iter().flatten()) {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(t);
+        }
+        out
+    }
 }
 
 /// Parse a query string into [`Query`].
@@ -163,7 +185,13 @@ mod tests {
     fn nothing_to_parse_parses_to_nothing() {
         for s in ["", " ", "   \t ", "\"\"", "-", "\""] {
             assert_eq!(parse(s), Query::default(), "parse({s:?}) should be empty");
+            assert!(parse(s).is_empty());
         }
+        let mixed = parse("red \"ice cream\" -discontinued");
+        assert!(!mixed.is_empty());
+        assert_eq!(mixed.scoring_query(), "red ice cream");
+        assert!(parse("-discontinued").is_empty());
+        assert_eq!(parse("-discontinued").scoring_query(), "");
     }
 
     /// Rule 2. `red "ice` is the state of `red "ice cream"` between two keystrokes, so it has to

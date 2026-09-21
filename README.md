@@ -32,7 +32,10 @@ index build -d data/ --sql --table product   --schema 'sku:0:0.6,name:3:0.4,bran
 index search -d data/ 'colgaye tothpaste'  # typo-corrected, from the shell
 index search -d data/ --count any toothpaste
 index search -d data/ --count phrase 'colgate total'   # needs --position at build
+index search -d data/ 'red "ice cream" -discontinued'  # mixed phrase + exclude
 ```
+
+`search` composes the query rather than ranking every string as bag-of-words BM25. Unquoted terms stay BM25 with typo buckets (exact still beats typo). A quoted run is an adjacency filter (`--position` at build). A leading `-` drops documents that contain that token. A query equal to a live `--key` is rank-1. Emoji in a field is retrievable by the same emoji. Filipino grocery aliases (`bigas` → rice, `gatas` → milk) load with the C ABI / WASM builder and with `index build`. Numeric sizes are never fuzzy: `300g` does not retrieve an 800g-only row. An empty query returns nothing. Hosts already calling `search` (C ABI, JS, CLI, Python) pick this up without a new symbol.
 
 **Keep it current from whatever already emits changes**, rather than rebuilding:
 

@@ -1794,6 +1794,10 @@ struct Scan<'a> {
     range: &'a [(usize, f64, f64)],
     /// Term ids that must appear as consecutive tokens of one field. Empty means no constraint.
     phrase: &'a [u32],
+    /// Phrases from a parsed mixed query. Each inner vec is one quoted run; all must hold.
+    query_phrase: &'a [Vec<u32>],
+    /// Term ids a matching document must not contain. Unknown ids are dropped before they get here.
+    exclude_term: &'a [u32],
     /// Collection-wide statistics, when this segment is one of several. See [`CollectionStat`].
     stat: Option<&'a CollectionStat>,
     /// A pre-computed expansion from [`Index::expand_query`], handed over by [`crate::Searcher`]
@@ -1812,6 +1816,8 @@ impl<'a> Scan<'a> {
             facet: &[],
             range: &[],
             phrase: &[],
+            query_phrase: &[],
+            exclude_term: &[],
             stat: None,
             pre: None,
         }
@@ -2763,8 +2769,98 @@ impl Index {
     /// with 1 typo", Meilisearch) is then applied to the candidate set. Folding the bucket into the
     /// score instead would break MaxScore's upper bounds; filtering on it would discard recall.
     /// So the candidate pool is deliberately over-fetched before the bucket sort is applied.
+    ///
+    /// The query string is parsed ([`crate::query::parse`]) before that walk. Unquoted terms stay
+    /// this bag-of-words BM25. A quoted run is an adjacency filter on the same scorer (empty, not
+    /// bag, when the index has no positions). A leading `-` clause drops documents that contain
+    /// those tokens. A query equal to a live application key is rank-1 and is not fused away.
     pub fn search(&self, query: &str, k: usize) -> Vec<Hit> {
-        self.search_opt(Scan::new(query, k))
+        self.search_planned(query, k, None, None)
+    }
+
+    /// [`Index::search`] with an optional pre-built expansion and collection-wide IDF.
+    ///
+    /// `pre` must be the expansion of the **scoring** query (unquoted terms plus phrase tokens,
+    /// exclude tokens stripped). [`crate::Searcher`] computes that string, stats it, and hands
+    /// each segment's expansion back here so the weigh phase is not walked twice.
+    pub(crate) fn search_planned(
+        &self,
+        query: &str,
+        k: usize,
+        pre: Option<&QueryExpansion>,
+        stat: Option<&CollectionStat>,
+    ) -> Vec<Hit> {
+        let parsed = crate::query::parse(query);
+        if parsed.is_empty() {
+            return Vec::new();
+        }
+        let scoring_buf;
+        let scoring = if parsed.phrase.is_empty() && parsed.exclude.is_empty() {
+            query
+        } else {
+            scoring_buf = parsed.scoring_query();
+            scoring_buf.as_str()
+        };
+        if scoring.is_empty() {
+            return Vec::new();
+        }
+        let Some(query_phrase) = self.resolve_query_phrase(&parsed) else {
+            return Vec::new();
+        };
+        let exclude_term = self.resolve_exclude_term(&parsed);
+        let mut hit = if query_phrase.is_empty() && exclude_term.is_empty() {
+            // Same scorer, no extra filter: the existing BM25 walk, including the handed-over
+            // expansion [`crate::Searcher`] already paid for.
+            match (pre, stat) {
+                (Some(ex), Some(s)) => self.search_expanded(scoring, ex, k, s),
+                _ => self.search_opt(Scan {
+                    query: scoring,
+                    k,
+                    pre,
+                    stat,
+                    ..Scan::new(scoring, k)
+                }),
+            }
+        } else {
+            self.search_opt(Scan {
+                query: scoring,
+                k,
+                pre,
+                stat,
+                query_phrase: &query_phrase,
+                exclude_term: &exclude_term,
+                ..Scan::new(scoring, k)
+            })
+        };
+        self.promote_key(query, &mut hit, k);
+        hit
+    }
+
+    /// Move a live keyed document to rank-1 when the raw query string equals its key.
+    fn promote_key(&self, query: &str, hit: &mut Vec<Hit>, k: usize) {
+        if !self.has_key() || query.is_empty() {
+            return;
+        }
+        let Some(doc) = self.doc_of_key(query) else {
+            return;
+        };
+        if self.is_deleted(doc) {
+            return;
+        }
+        if let Some(at) = hit.iter().position(|h| h.doc == doc) {
+            let h = hit.remove(at);
+            hit.insert(0, h);
+        } else {
+            hit.insert(
+                0,
+                Hit {
+                    doc,
+                    score: 0.0,
+                    typo_bucket: 0,
+                },
+            );
+        }
+        hit.truncate(k);
     }
 
     /// **Opt-in bounded-error search.** Identical to [`Index::search`] but caps how many dictionary
@@ -3417,6 +3513,36 @@ impl Index {
         self.position.get(lo..hi)
     }
 
+    /// Does `doc` contain none of `exclude_term`?
+    ///
+    /// Unknown terms never reach this slice (they are dropped at resolve). An empty slice is
+    /// vacuously true, matching an exclude nobody can fire.
+    fn exclude_allows(&self, doc: u32, exclude_term: &[u32]) -> bool {
+        exclude_term.iter().all(|&t| {
+            self.posting
+                .get(t as usize)
+                .map(|list| list.binary_search_by_key(&doc, |p| p.doc).is_err())
+                .unwrap_or(true)
+        })
+    }
+
+    /// Facet, range, phrase, mixed-query phrase, and exclude, as one predicate.
+    fn filter_allows(
+        &self,
+        doc: u32,
+        facet: &[(usize, Vec<u32>, bool)],
+        range: &[(usize, f64, f64)],
+        phrase: &[u32],
+        query_phrase: &[Vec<u32>],
+        exclude_term: &[u32],
+    ) -> bool {
+        self.facet_allows(doc, facet)
+            && self.range_allows(doc, range)
+            && self.phrase_allows(doc, phrase)
+            && query_phrase.iter().all(|p| self.phrase_allows(doc, p))
+            && self.exclude_allows(doc, exclude_term)
+    }
+
     /// Does `doc` contain `phrase` as CONSECUTIVE tokens of a single field?
     ///
     /// Anchored on the phrase's **rarest** term rather than its first: the loop is
@@ -3612,6 +3738,61 @@ impl Index {
         tok.iter().map(|t| self.dict.exact(&t.text)).collect()
     }
 
+    /// Resolve each parsed phrase run to term ids, or `None` when a run cannot match.
+    ///
+    /// A quoted run is exact: unknown tokens empty the query (never bag-of-words), and an index
+    /// without positions cannot verify adjacency so it also returns `None`.
+    fn resolve_query_phrase(&self, parsed: &crate::query::Query) -> Option<Vec<Vec<u32>>> {
+        if parsed.phrase.is_empty() {
+            return Some(Vec::new());
+        }
+        if !self.has_position() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(parsed.phrase.len());
+        for run in &parsed.phrase {
+            let id = self.phrase_term_of(run)?;
+            if id.is_empty() {
+                return None;
+            }
+            out.push(id);
+        }
+        Some(out)
+    }
+
+    /// Analyzer tokens (already folded by [`crate::query::parse`]) to exact dictionary ids.
+    fn phrase_term_of(&self, token: &[String]) -> Option<Vec<u32>> {
+        let mut tok: Vec<Token> = token
+            .iter()
+            .map(|t| Token {
+                text: t.clone(),
+                position: 0,
+                is_numeric: t.as_bytes().iter().any(u8::is_ascii_digit),
+            })
+            .collect();
+        apply_alias(&mut tok, &self.alias);
+        tok.iter().map(|t| self.dict.exact(&t.text)).collect()
+    }
+
+    /// Exclude tokens present in this segment's dictionary. Unknown tokens drop out — excluding
+    /// a word nobody indexed removes nothing.
+    fn resolve_exclude_term(&self, parsed: &crate::query::Query) -> Vec<u32> {
+        if parsed.exclude.is_empty() {
+            return Vec::new();
+        }
+        let mut tok: Vec<Token> = parsed
+            .exclude
+            .iter()
+            .map(|t| Token {
+                text: t.clone(),
+                position: 0,
+                is_numeric: t.as_bytes().iter().any(u8::is_ascii_digit),
+            })
+            .collect();
+        apply_alias(&mut tok, &self.alias);
+        tok.iter().filter_map(|t| self.dict.exact(&t.text)).collect()
+    }
+
     /// **Phrase query**: the query's tokens, consecutive and in order, within one field.
     ///
     /// Requires an index built with [`IndexBuilder::with_position`]; without positions there is
@@ -3766,6 +3947,8 @@ impl Index {
             facet,
             range,
             phrase,
+            query_phrase,
+            exclude_term,
             stat,
             pre,
         } = scan;
@@ -3957,10 +4140,7 @@ impl Index {
                 seeded.push(doc);
                 // Seeded documents enter the pools directly, so the filter applies here too.
                 // `seeded` still records the document: the main loop must skip it either way.
-                if !self.facet_allows(doc, facet)
-                    || !self.range_allows(doc, range)
-                    || !self.phrase_allows(doc, phrase)
-                {
+                if !self.filter_allows(doc, facet, range, phrase, query_phrase, exclude_term) {
                     continue;
                 }
                 let c = Candidate {
@@ -4230,10 +4410,7 @@ impl Index {
             // The phrase constraint joins them here for the same reason and with the same cost
             // shape: it is a predicate on an already-scored document, so it narrows the result
             // without touching a single pruning bound.
-            if !self.facet_allows(candidate, facet)
-                || !self.range_allows(candidate, range)
-                || !self.phrase_allows(candidate, phrase)
-            {
+            if !self.filter_allows(candidate, facet, range, phrase, query_phrase, exclude_term) {
                 continue;
             }
             let c = Candidate {
@@ -5873,6 +6050,137 @@ mod tests {
             ix.count_all("Colgate Total"),
             1,
             "the surviving row still has both words"
+        );
+    }
+
+    /// p98 planner: an unquoted query is still today's bag-of-words, and an empty query is
+    /// empty (never everything). Drives [`Index::search`] on the query string.
+    #[test]
+    fn planner_unquoted_bag_of_words_and_empty_query() {
+        let mut b =
+            IndexBuilder::new(Schema::new(vec![Field::new("name", 1.0, 0.4)])).with_position();
+        b.add(&Doc::new(["red ice cream"]));
+        b.add(&Doc::new(["red cream ice"]));
+        let ix = b.build().unwrap();
+        let bag = ix.search("red ice cream", 10);
+        assert_eq!(bag.len(), 2, "unquoted query keeps both bags: {bag:?}");
+        let key: Vec<u32> = bag.iter().map(|h| h.doc).collect();
+        assert!(key.contains(&0) && key.contains(&1), "{key:?}");
+        assert!(ix.search("", 10).is_empty(), "empty query is empty");
+        assert!(ix.search("   \t ", 10).is_empty());
+        assert!(ix.search("-discontinued", 10).is_empty(), "exclude-only is empty");
+    }
+
+    /// p98 exact-key: the live key beats a longer field that would otherwise win BM25.
+    #[test]
+    fn exact_key_is_rank_one_even_when_bm25_prefers_a_longer_field() {
+        let mut b = IndexBuilder::new(Schema::new(vec![
+            Field::new("sku", 1.0, 0.4),
+            Field::new("name", 3.0, 0.4),
+        ]))
+        .with_key(0);
+        b.add(&Doc::new(["K99", "short"]));
+        b.add(&Doc::new([
+            "OTHER",
+            "K99 K99 K99 deluxe extra matching product name",
+        ]));
+        let mut ix = b.build().unwrap();
+        let hit = ix.search("K99", 5);
+        assert!(!hit.is_empty(), "{hit:?}");
+        assert_eq!(
+            hit[0].doc, 0,
+            "the keyed row must be rank-1, BM25 longer field lost: {hit:?}"
+        );
+        ix.delete(0);
+        let after = ix.search("K99", 5);
+        assert!(
+            after.iter().all(|h| h.doc != 0),
+            "a deleted key is not returned: {after:?}"
+        );
+    }
+
+    /// p98 mixed phrase + exclude through `search`, not `search_phrase`.
+    #[test]
+    fn mixed_phrase_and_exclude_run_through_search() {
+        let mut b =
+            IndexBuilder::new(Schema::new(vec![Field::new("name", 1.0, 0.4)])).with_position();
+        b.add(&Doc::new(["red ice cream"]));
+        b.add(&Doc::new(["red cream ice"]));
+        b.add(&Doc::new(["red ice cream discontinued"]));
+        let ix = b.build().unwrap();
+        let hit = ix.search("red \"ice cream\" -discontinued", 10);
+        let key: Vec<u32> = hit.iter().map(|h| h.doc).collect();
+        assert!(
+            key.contains(&0),
+            "in-order phrase must hit: {key:?}"
+        );
+        assert_eq!(key[0], 0, "in-order phrase is rank-1 over the reversed bag: {key:?}");
+        assert!(!key.contains(&1), "reversed bag must not steal the phrase: {key:?}");
+        assert!(!key.contains(&2), "exclude must drop discontinued: {key:?}");
+    }
+
+    /// p98 emoji: the same codepoint in the field and the query retrieves the row.
+    #[test]
+    fn emoji_in_the_query_retrieves_the_emoji_document() {
+        let mut b = IndexBuilder::new(Schema::new(vec![Field::new("name", 1.0, 0.4)]));
+        b.add(&Doc::new(["plain soap"]));
+        b.add(&Doc::new(["happy \u{1f600} soap"]));
+        let ix = b.build().unwrap();
+        let hit = ix.search("\u{1f600}", 5);
+        assert_eq!(
+            hit.iter().map(|h| h.doc).collect::<Vec<_>>(),
+            vec![1],
+            "emoji query must retrieve the emoji row: {hit:?}"
+        );
+    }
+
+    /// p98 Filipino alias rows on the existing table, no stemmer, no LLM.
+    #[test]
+    fn filipino_alias_rows_resolve_the_p4_fixture_strings() {
+        let mut b = IndexBuilder::new(Schema::new(vec![Field::new("name", 1.0, 0.4)]))
+            .with_alias(crate::AliasTable::philippine_grocery());
+        b.add(&Doc::new(["Jasmine Rice 5kg"]));
+        b.add(&Doc::new(["Bear Brand Powdered Milk 300g"]));
+        b.add(&Doc::new(["Solmux Cough Medicine 120ml"]));
+        b.add(&Doc::new(["Tide Laundry Soap 1000g"]));
+        let ix = b.build().unwrap();
+        let rank1 = |q: &str| {
+            let hit = ix.search(q, 5);
+            assert!(!hit.is_empty(), "{q} retrieved nothing");
+            hit[0].doc
+        };
+        assert_eq!(rank1("bigas"), 0, "bigas → rice");
+        assert_eq!(rank1("gatas"), 1, "gatas → milk");
+        assert_eq!(rank1("gamot sa ubo"), 2, "gamot sa ubo → cough medicine");
+        assert_eq!(rank1("sabon panlaba"), 3, "sabon panlaba → laundry soap");
+    }
+
+    /// p98 size negative: 300g never retrieves an 800g-only row. Exact still beats typo.
+    #[test]
+    fn three_hundred_g_does_not_match_eight_hundred_g_and_exact_beats_typo() {
+        let mut b = IndexBuilder::new(Schema::new(vec![Field::new("name", 1.0, 0.4)]));
+        b.add(&Doc::new(["Bear Brand Powdered Milk 800g"]));
+        b.add(&Doc::new(["Bear Brand Powdered Milk 300g"]));
+        b.add(&Doc::new(["Nescafe Classic Reseal 200g"]));
+        let ix = b.build().unwrap();
+        let hit = ix.search("300g", 10);
+        assert!(
+            hit.iter().all(|h| h.doc != 0),
+            "300g must not retrieve the 800g-only row: {hit:?}"
+        );
+        assert!(
+            hit.iter().any(|h| h.doc == 1),
+            "300g must retrieve the 300g row: {hit:?}"
+        );
+        let exact = ix.search("nescafe", 5);
+        let typo = ix.search("nescafee", 5);
+        assert!(!exact.is_empty() && !typo.is_empty());
+        assert_eq!(exact[0].doc, 2);
+        assert_eq!(typo[0].doc, 2);
+        assert_eq!(exact[0].typo_bucket, 0, "exact match is bucket 0: {exact:?}");
+        assert!(
+            typo[0].typo_bucket > 0,
+            "a typo query is a worse bucket: {typo:?}"
         );
     }
 }

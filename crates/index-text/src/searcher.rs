@@ -476,10 +476,50 @@ impl Searcher {
         // whichever segment holds the row. See `CollectionStat` for the measurement that forced it.
         // The expansions the stat pass produced are handed back to the segment that built them, so
         // the weigh phase re-derives nothing (`p52`'s recovered second expansion).
-        match self.stat_for(query, false) {
-            Some((stat, ex)) => self.merge(k, |i, ix| ix.search_expanded(query, &ex[i], k, &stat)),
-            None => self.merge(k, |_i, ix| ix.search(query, k)),
+        //
+        // The planner lives in [`Index::search_planned`]: parse, mixed phrase/exclude, exact-key.
+        // Stats are taken on the scoring string (quotes and exclude markers stripped) so a mixed
+        // query does not expand `discontinued` as a positive term.
+        let parsed = crate::query::parse(query);
+        if parsed.is_empty() {
+            return Vec::new();
         }
+        let scoring_buf;
+        let scoring = if parsed.phrase.is_empty() && parsed.exclude.is_empty() {
+            query
+        } else {
+            scoring_buf = parsed.scoring_query();
+            scoring_buf.as_str()
+        };
+        let mut hit = match self.stat_for(scoring, false) {
+            Some((stat, ex)) => {
+                self.merge(k, |i, ix| ix.search_planned(query, k, Some(&ex[i]), Some(&stat)))
+            }
+            None => self.merge(k, |_i, ix| ix.search_planned(query, k, None, None)),
+        };
+        self.promote_key(query, &mut hit, k);
+        hit
+    }
+
+    /// Rank-1 for a live application key, after the merge. Exact-key is not fused with BM25.
+    fn promote_key(&self, query: &str, hit: &mut Vec<Hit>, k: usize) {
+        let Some(doc) = self.doc_of_key(query) else {
+            return;
+        };
+        if let Some(at) = hit.iter().position(|h| h.doc == doc) {
+            let h = hit.remove(at);
+            hit.insert(0, h);
+        } else {
+            hit.insert(
+                0,
+                Hit {
+                    doc,
+                    score: 0.0,
+                    typo_bucket: 0,
+                },
+            );
+        }
+        hit.truncate(k);
     }
 
     /// [`Searcher::search`] with typeahead semantics on the last token.
@@ -2070,5 +2110,64 @@ mod tests {
                 "learn={learn}: the expansion hand-off must not move the df sums"
             );
         }
+    }
+
+    /// p98: [`Searcher::search`] consumes the same parse plan as [`Index::search`].
+    #[test]
+    fn searcher_search_runs_the_query_axis_plan() {
+        let mk = |row: &[&str], position: bool, key: bool| {
+            let mut b = IndexBuilder::new(Schema::new(vec![
+                Field::new("sku", 1.0, 0.4),
+                Field::new("name", 3.0, 0.4),
+            ]));
+            if position {
+                b = b.with_position();
+            }
+            if key {
+                b = b.with_key(0);
+            }
+            for r in row {
+                let (sku, name) = r.split_once('\t').unwrap_or(("", r));
+                b.add(&Doc::new([sku, name]));
+            }
+            b.build().unwrap()
+        };
+
+        // Mixed phrase + exclude, two segments, collection-wide stats on.
+        let mut phrase = Searcher::new(mk(
+            &["a\tred ice cream", "b\tred cream ice"],
+            true,
+            false,
+        ));
+        phrase.push(mk(&["c\tred ice cream discontinued"], true, false));
+        let hit = phrase.search("red \"ice cream\" -discontinued", 10);
+        let key: Vec<u32> = hit.iter().map(|h| h.doc).collect();
+        assert_eq!(key.first().copied(), Some(0), "in-order is rank-1: {key:?}");
+        assert!(!key.contains(&1), "reversed bag must not win: {key:?}");
+        assert!(!key.contains(&2), "exclude drops discontinued: {key:?}");
+        assert!(phrase.search("", 5).is_empty());
+        let bag = phrase.search("red ice cream", 10);
+        assert!(
+            bag.iter().any(|h| h.doc == 1),
+            "unquoted bag still matches the reversed row: {bag:?}"
+        );
+
+        // Exact-key across segments: live key is rank-1; deleted key is gone.
+        let mut keyed = Searcher::new(mk(
+            &[
+                "K99\tshort",
+                "OTHER\tK99 K99 K99 deluxe extra matching product name",
+            ],
+            false,
+            true,
+        ));
+        let hit = keyed.search("K99", 5);
+        assert_eq!(hit[0].doc, 0, "live key is rank-1: {hit:?}");
+        keyed.delete_key("K99");
+        let after = keyed.search("K99", 5);
+        assert!(
+            after.iter().all(|h| h.doc != 0),
+            "deleted key is absent: {after:?}"
+        );
     }
 }

@@ -310,6 +310,12 @@ pub fn tokenize_span(text: &str) -> Vec<(Token, usize, usize)> {
         {
             last = i;
             cur.push('.');
+        } else if is_emoji_token(c) {
+            flush(&mut cur, &mut out, &mut position, &mut first, last);
+            first = Some(i);
+            last = i;
+            cur.push(c);
+            flush(&mut cur, &mut out, &mut position, &mut first, last);
         } else {
             flush(&mut cur, &mut out, &mut position, &mut first, last);
         }
@@ -370,6 +376,23 @@ pub fn tokenize_into(text: &str, buf: &mut Vec<Token>) -> usize {
         fold_into(text, &mut folded);
         tokenize_folded(&folded, buf)
     })
+}
+
+/// True when `ch` is kept as its own token rather than treated as a separator.
+///
+/// Alphanumeric runs are tokens; ASCII punctuation is a separator (except a `.` / `,` / `-`
+/// between digits). Emoji is neither: dropping it made 😀 and 🇵🇭 unsearchable even when they
+/// sat in the field. Index and query share this predicate, so the same codepoint that was stored
+/// is the one a typed query resolves.
+pub(crate) fn is_emoji_token(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200D}'
+            | '\u{2600}'..='\u{27BF}'
+            | '\u{2B50}'..='\u{2B55}'
+            | '\u{FE0F}'
+            | '\u{1F1E6}'..='\u{1FAFF}'
+    )
 }
 
 /// Split an ALREADY-FOLDED string into tokens.
@@ -445,6 +468,19 @@ fn tokenize_folded(folded: &str, out: &mut Vec<Token>) -> usize {
                     start = Some(i);
                     sep = false;
                 }
+            } else if is_emoji_token(ch) {
+                flush(folded, &mut start, i, sep, out, &mut n, &mut position);
+                start = Some(i);
+                sep = false;
+                flush(
+                    folded,
+                    &mut start,
+                    i + ch.len_utf8(),
+                    false,
+                    out,
+                    &mut n,
+                    &mut position,
+                );
             } else {
                 flush(folded, &mut start, i, sep, out, &mut n, &mut position);
             }
@@ -674,7 +710,7 @@ mod tests {
     /// engine. Compared against the live one by `fast_tokenizer_matches_the_legacy_one`. If a rule
     /// ever legitimately changes, this copy changes with it in the same commit, deliberately.
     mod legacy {
-        use crate::analyze::{strip_diacritic, BaseUnit, Quantity, Token};
+        use crate::analyze::{is_emoji_token, strip_diacritic, BaseUnit, Quantity, Token};
 
         pub fn fold(s: &str) -> String {
             let mut out = String::with_capacity(s.len());
@@ -768,6 +804,10 @@ mod tests {
                     && bytes.get(i + 1).is_some_and(|n| n.is_ascii_digit())
                 {
                     cur.push('.');
+                } else if is_emoji_token(c) {
+                    flush(&mut cur, &mut out, &mut position);
+                    cur.push(c);
+                    flush(&mut cur, &mut out, &mut position);
                 } else {
                     flush(&mut cur, &mut out, &mut position);
                 }
@@ -956,6 +996,7 @@ mod tests {
             "MATH 30-23 section",
             "Cafe\u{301} Espan\u{303}ol nin\u{303}o",
             "Nesc\u{e1}fe 3-in-1",
+            "emoji \u{1f600} between \u{1f1f5}\u{1f1ed} tokens",
             "500 ml bottle",
             "a,b.c-d",
             "\u{df}rasse 12,5 kg",
@@ -1087,5 +1128,25 @@ mod tests {
         let b = parse_quantity("100ml").unwrap();
         assert_eq!(a, b);
         assert_eq!(a.token(), "100ml");
+    }
+
+    /// Emoji is a token at both ends of the fold, so a field containing 😀 is reachable by
+    /// typing 😀. The fold itself is identity on these codepoints; the scar was treating them as
+    /// separators.
+    #[test]
+    fn emoji_is_kept_as_a_token() {
+        let grin: Vec<String> = tokenize("\u{1f600}").iter().map(|t| t.text.clone()).collect();
+        assert_eq!(grin, vec!["\u{1f600}"]);
+        let field: Vec<String> = tokenize("soap \u{1f600} name")
+            .iter()
+            .map(|t| t.text.clone())
+            .collect();
+        assert_eq!(field, vec!["soap", "\u{1f600}", "name"]);
+        let flag: Vec<String> = tokenize("\u{1f1f5}\u{1f1ed}")
+            .iter()
+            .map(|t| t.text.clone())
+            .collect();
+        assert_eq!(flag, vec!["\u{1f1f5}", "\u{1f1ed}"]);
+        assert_eq!(fold("\u{1f600}"), "\u{1f600}");
     }
 }

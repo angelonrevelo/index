@@ -23,6 +23,11 @@
 >
 > **Nothing is deployed.** All three live on throwaway git branches.
 
+`Index::search` / `Searcher::search` (and therefore every host that already calls `search`) execute
+`query::parse`: mixed phrase + exclude, exact-key rank-1, emoji tokens, Filipino `AliasTable` rows
+when the grocery table is loaded (WASM/`idx_build_new` and `index build` load it). See
+[`bench/roadmap/p98-query-axis.md`](../bench/roadmap/p98-query-axis.md).
+
 ## The setup
 
 **Nothing on `profstopick`'s `main` branch was touched.** The evaluation lives in a git worktree on

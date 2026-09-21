@@ -6,10 +6,15 @@ All notable changes to `index`. The project is pre-release and unversioned, so e
 [ROADMAP.md](ROADMAP.md) for the tiered plan and [docs/roadmap-rejected.md](docs/roadmap-rejected.md)
 for what was deliberately ruled out.
 
-## p98 -- query-axis planner (spec) (2026-09-21)
+## p98 -- query-axis planner (2026-09-21)
 
-Compose exact-key, mixed phrase, emoji tokens, Filipino aliases instead of one BM25 walk.
-Goal: docs/brainstorm/query-axis/GOAL.md. Fixture: bench/roadmap/p98-query-axis.md. Not built.
+Planner consumes query::parse in Index::search / Searcher::search.
+Exact-key: a live application key is rank-1 even when BM25 prefers a longer field.
+Mixed phrase: red "ice cream" -discontinued ranks in-order and drops discontinued.
+Emoji is a token at index and query (same fold).
+Filipino AliasTable rows resolve bigas/gatas/gamot sa ubo/sabon panlaba.
+300g does not retrieve an 800g-only row; typo_bucket stays primary.
+`index build` / `apply` load AliasTable::philippine_grocery, matching idx_build_new.
 
 ## p97 -- stored COUNT df / page bits, concurrent snapshot, CRC footer (2026-09-20)
 
