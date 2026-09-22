@@ -30,15 +30,21 @@ to make. Full table: [`bench/runs/2026-09-08-revalidate/`](bench/runs/2026-09-08
 Gate: 72 Rust tests, 0 clippy warnings, two WASM artifacts, and `smoke` / `demo` / `browser` /
 `real-corpus` / `sisia-catalog` all passing. Adoption plans per app: [`docs/adoption.md`](docs/adoption.md).
 
-**Two things this session could not settle, and neither is unblocked by more engineering here:**
+**Superseded on 2026-09-22.** Item 1 below said nothing was deployed. Two of the four apps have
+since adopted the engine on their own `main`, so the sentence is kept only to date the change:
 
-1. **Nothing is deployed.** Everything lives on throwaway worktree branches; no `main` was modified
-   and no PR opened, because four shipping repositories are not this project's to change
-   unilaterally. `docs/adoption.md` reduces that to a single decision per app.
+1. ~~**Nothing is deployed.** Everything lives on throwaway worktree branches; no `main` was
+   modified and no PR opened~~ — **false since 2026-09-21.** **profstopick serves from it**
+   (`public/search-engine.wasm`, ABI 14, deployed; now on index `5640ab2`), and **presyo has it
+   built on `main` behind `PRODUCT_SEARCH_ENGINE=index`, default off**, over the full 247,701-row
+   catalogue in a worker thread. onegrid and sisia-app are still evaluation-only. Per-app state:
+   [`docs/adoption.md`](docs/adoption.md).
 2. **Billion-query scale is not testable on this machine.** The largest honest corpus available is
    61,467 real rows; everything above is recombination, labelled as such. At 1 M documents the p99
    varies **±0.9 ms across identical runs**, so the 5 ms bar is below this harness's resolution.
-   Real scale evidence requires production traffic, which requires (1).
+   Real scale evidence requires production traffic — profstopick now supplies some (9,449
+   real-corpus queries per engine take); presyo's flag is still off, so its path is host-measured,
+   not production traffic.
 
 **The blocking engineering item is now built.** `index-text::searcher` adds multi-segment search:
 new documents go into a small segment that is cheap to build, queries run across all segments and
