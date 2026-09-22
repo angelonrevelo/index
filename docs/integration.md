@@ -1,5 +1,12 @@
 # Integration — the engine measured against applications' own contracts
 
+> **This file is a dated evidence record, not the current state.** Every measurement below was taken
+> on 2026-09-05 against evaluation worktrees, and its "their `main` is untouched" framing was true
+> then. It is no longer: profstopick and presyo have both adopted the engine on their own `main`
+> since 2026-09-21. For what each app runs *today*, read
+> [`adoption.md`](adoption.md); this file is kept unedited so the numbers stay attached to the
+> conditions that produced them.
+>
 > 2026-09-05. Evidence for the claim that this engine can replace hand-written code in real
 > applications, rather than merely score well on their exported data.
 >
