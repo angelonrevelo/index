@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>index vs typical app search</title>
+<style>
+  :root {
+    --bg: #0e1014;
+    --ink: #f4efe4;
+    --mute: #8a8478;
+    --before: #c45c3a;
+    --after: #3dba8b;
+    --line: #2a2d33;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.4 "IBM Plex Sans", "Segoe UI", sans-serif;
+  }
+  main { max-width: 920px; margin: 0 auto; padding: 48px 28px 80px; }
+  h1 { font-size: 28px; font-weight: 600; letter-spacing: -0.03em; margin: 0 0 8px; }
+  .lede { color: var(--mute); max-width: 40em; margin: 0 0 40px; }
+  h2 { font-size: 13px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--mute); margin: 48px 0 16px; }
+  .row { display: grid; grid-template-columns: 180px 1fr 72px 72px; gap: 10px 16px; align-items: center; margin: 0 0 14px; }
+  .label { color: var(--ink); font-size: 14px; }
+  .track { height: 22px; background: #1a1d22; border-radius: 2px; overflow: hidden; display: flex; flex-direction: column; gap: 2px; padding: 2px; }
+  .bar { height: 8px; border-radius: 1px; }
+  .bar.before { background: var(--before); }
+  .bar.after { background: var(--after); }
+  .n { font-variant-numeric: tabular-nums; font-size: 13px; text-align: right; }
+  .n.before { color: var(--before); }
+  .n.after { color: var(--after); }
+  .legend { display: flex; gap: 20px; font-size: 13px; color: var(--mute); margin: 0 0 24px; }
+  .sw { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: middle; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--mute); font-weight: 500; font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; }
+  td.num { font-variant-numeric: tabular-nums; text-align: right; }
+  .good { color: var(--after); }
+  .bad { color: var(--before); }
+  footer { margin-top: 48px; color: var(--mute); font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Typical app search → index</h1>
+  <p class="lede">Same queries, same rows. “Before” is what the apps already ship: prefix/substring matching (profstopick) and Postgres <code>pg_trgm</code> (presyo). “After” is <code>index</code> <code>search()</code> with the p98 planner. Measured on this machine, <code>real-corpus</code> bin.</p>
+
+  <div class="legend">
+    <span><i class="sw" style="background:#c45c3a"></i>before — shipped matcher / trigram SQL</span>
+    <span><i class="sw" style="background:#3dba8b"></i>after — index engine</span>
+  </div>
+
+  <h2>profstopick · 1,322 Ateneo professors · the live miss rate was 40.8%</h2>
+
+  <div class="row">
+    <div class="label">Typo hit@10</div>
+    <div class="track">
+      <div class="bar before" style="width:14.9%"></div>
+      <div class="bar after" style="width:99.9%"></div>
+    </div>
+    <div class="n before">14.9%</div>
+    <div class="n after">99.9%</div>
+  </div>
+  <div class="row">
+    <div class="label">Typo hit@1</div>
+    <div class="track">
+      <div class="bar before" style="width:14.9%"></div>
+      <div class="bar after" style="width:99.7%"></div>
+    </div>
+    <div class="n before">14.9%</div>
+    <div class="n after">99.7%</div>
+  </div>
+  <div class="row">
+    <div class="label">Exact hit@1</div>
+    <div class="track">
+      <div class="bar before" style="width:99.8%"></div>
+      <div class="bar after" style="width:99.8%"></div>
+    </div>
+    <div class="n before">99.8%</div>
+    <div class="n after">99.8%</div>
+  </div>
+  <div class="row">
+    <div class="label">Empty results on typos</div>
+    <div class="track">
+      <div class="bar before" style="width:85.1%"></div>
+      <div class="bar after" style="width:0.1%"></div>
+    </div>
+    <div class="n before">85.1%</div>
+    <div class="n after">0.1%</div>
+  </div>
+
+  <h2>presyo · 1,940 gold listings · find the same product in another store</h2>
+
+  <div class="row">
+    <div class="label">Clean recall@10</div>
+    <div class="track">
+      <div class="bar after" style="width:100%"></div>
+    </div>
+    <div class="n before">—</div>
+    <div class="n after">100%</div>
+  </div>
+  <div class="row">
+    <div class="label">Typo recall@10</div>
+    <div class="track">
+      <div class="bar after" style="width:100%"></div>
+    </div>
+    <div class="n before">—</div>
+    <div class="n after">100%</div>
+  </div>
+  <div class="row">
+    <div class="label">Typo hit@1</div>
+    <div class="track">
+      <div class="bar after" style="width:99%"></div>
+    </div>
+    <div class="n before">—</div>
+    <div class="n after">99.0%</div>
+  </div>
+  <div class="row">
+    <div class="label">Wrong size returned</div>
+    <div class="track">
+      <div class="bar after" style="width:0%"></div>
+    </div>
+    <div class="n before">—</div>
+    <div class="n after">0</div>
+  </div>
+
+  <h2>Full scoreboard</h2>
+  <table>
+    <thead>
+      <tr><th>Question</th><th>Typical implementation</th><th class="num">Before</th><th class="num">After (index)</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Misspelled professor name, top 10</td>
+        <td>Prefix / substring, no edit distance</td>
+        <td class="num bad">14.9%</td>
+        <td class="num good">99.9%</td>
+      </tr>
+      <tr>
+        <td>That query returns nothing</td>
+        <td>Same matcher</td>
+        <td class="num bad">85.1%</td>
+        <td class="num good">0.1%</td>
+      </tr>
+      <tr>
+        <td>Correctly spelled name, rank 1</td>
+        <td>Same matcher</td>
+        <td class="num">99.8%</td>
+        <td class="num">99.8%</td>
+      </tr>
+      <tr>
+        <td>Typo latency p99</td>
+        <td>In-process scan of 1,322 rows</td>
+        <td class="num">—</td>
+        <td class="num good">0.24 ms</td>
+      </tr>
+      <tr>
+        <td>Cross-store product, clean recall@10</td>
+        <td>Engine vs held-out listing</td>
+        <td class="num">—</td>
+        <td class="num good">100%</td>
+      </tr>
+      <tr>
+        <td>Same, with a typo</td>
+        <td>Engine vs held-out listing</td>
+        <td class="num">—</td>
+        <td class="num good">100%</td>
+      </tr>
+      <tr>
+        <td><code>300g</code> retrieves an 800g-only row</td>
+        <td>Fuzzy on numeric tokens</td>
+        <td class="num bad">easy to leak</td>
+        <td class="num good">0 leaks / 478</td>
+      </tr>
+      <tr>
+        <td><code>bigas</code> / <code>gatas</code> / <code>sabon</code> / <code>gamot sa ubo</code></td>
+        <td>Trigram “sabon” ≈ “sabor”</td>
+        <td class="num bad">SQL ~20% on sabon</td>
+        <td class="num good">rank-1 all four</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <footer>
+    Source: <code>cargo run -p index-bench --release --bin real-corpus</code> (this machine).
+    Filipino rank-1 from WASM <code>search()</code> grocery fixture.
+    <br>
+    Measured at <code>p98</code> (2026-09-21) and not re-run since; <code>p99</code> moved the
+    grocery numbers further (see <code>bench/roadmap/p99-grocery-recall.md</code>).
+    <strong>Status 2026-09-22:</strong> profstopick's typeahead now runs the after column in
+    production; presyo's API still serves the before column — the engine is built on its
+    <code>main</code> behind <code>PRODUCT_SEARCH_ENGINE=index</code>, default off.
+  </footer>
+</main>
+</body>
+</html>

@@ -6,8 +6,10 @@ browser, a server, an edge worker and a database.
 
 See [ROADMAP.md](ROADMAP.md) for the plan, [docs/adoption.md](docs/adoption.md) for what shipping it
 into each app would take, [CHANGELOG.md](CHANGELOG.md) for what shipped,
-[docs/research/](docs/research/) for the evidence every roadmap row rests on, and
-[docs/roadmap-rejected.md](docs/roadmap-rejected.md) for what was deliberately ruled out.
+[docs/research/](docs/research/) for the evidence every roadmap row rests on,
+[docs/roadmap-rejected.md](docs/roadmap-rejected.md) for what was deliberately ruled out, and
+[docs/p98-before-after.html](docs/p98-before-after.html) for the same numbers as a one-page
+before/after scoreboard (measured at `p98`, 2026-09-21).
 
 ## Any database, over a pipe
 
